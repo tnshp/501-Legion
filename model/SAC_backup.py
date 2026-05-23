@@ -232,10 +232,10 @@ class Q_network(nn.Module):
             value: [batch_size] or [1] (scalar if unbatched)
         """
         #true for seq length upto max_planets
-        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        planets_mask = torch.zeros(state.shape[0], state.shape[1])
         planets_mask[:, :self.max_planets] = 1
 
-        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        fleets_mask = torch.zeros(state.shape[0], state.shape[1])
         fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
 
         # print(planets_mask[0]) 
@@ -311,10 +311,10 @@ class V_network(nn.Module):
 
     def forward(self, state):  
         
-        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        planets_mask = torch.zeros(state.shape[0], state.shape[1])
         planets_mask[:, :self.max_planets] = 1
 
-        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        fleets_mask = torch.zeros(state.shape[0], state.shape[1])
         fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
 
         planets = self.P(state[:, :, :10] * planets_mask.unsqueeze(-1))     
@@ -378,50 +378,32 @@ class P_network(nn.Module):
         self.d_model = d_model
         self.action_dim = action_dim
 
-    def forward(self, state):
-        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+    def forward(self, state):  
+        planets_mask = torch.zeros(state.shape[0], state.shape[1])
         planets_mask[:, :self.max_planets] = 1
 
-        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        fleets_mask = torch.zeros(state.shape[0], state.shape[1])
         fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
 
-        planets = self.P(state[:, :, :10] * planets_mask.unsqueeze(-1))
+        planets = self.P(state[:, :, :10] * planets_mask.unsqueeze(-1))     
         fleets = self.F(state[:, :, :10] * fleets_mask.unsqueeze(-1))
-
+        
         time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
         pos = state[:, :, 11:13]  # Assuming position is at indices 11 and 12
         pos_encoding = get_pos_encoding(pos, time_step, self.d_model)
 
         state = planets + fleets
         state = state + pos_encoding
-
+    
         # Process through transformer
         src = state  # [batch_size, seq_len, d_model]
         out_ = self.transformer(src)  # [batch_size, seq_len, d_model]
-
+        
         #only pass num planets tokens through heads, as action is only for planets
-        mu = self.mu_head(out_[:, :self.max_planets, :])
-        sigma = F.softplus(self.sigma_head(out_[:, :self.max_planets, :])) + 1e-5
-
+        mu = self.mu_head(out_[:, :self.max_planets, :])  
+        sigma = F.softplus(self.sigma_head(out_[:, :self.max_planets, :])) + 1e-5  
+        
         return mu, sigma
-
-    def sample(self, state):
-        """
-        Sample action via reparameterisation and return log π(a|s).
-
-        Returns:
-            action   : [B, max_planets, action_dim]
-            log_prob : [B, 1]
-        """
-        mu, sigma = self.forward(state)
-        eps = torch.randn_like(sigma)
-        action = mu + eps * sigma
-        log_prob = (
-            -0.5 * ((action - mu) / sigma) ** 2
-            - sigma.log()
-            - 0.5 * math.log(2.0 * math.pi)
-        ).sum(dim=(-2, -1), keepdim=True).squeeze(-1)  # [B, 1]
-        return action, log_prob
     
 class ActionDecoder(nn.Module):
     def __init__(self, 
