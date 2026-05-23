@@ -7,6 +7,11 @@ import numpy as np
 from utils.pos_encoding import get_pos_encoding
 
 class Encoder:
+    # planets - [id, owner, x, y, radius, ships, production]
+    # out - [owner[4], radius, ships, production, moving/static, angular_velocity, comet, is_planet, x, y, time_step]
+    # fleets - [id, owner, x, y, angle, from_planet_id, ships] or empty array
+    # out - [owner[4], angle, ships, speed, dummy[3], is_planet, x, y, time_step] or empty array
+    
     def __init__(self, max_planets=40, max_fleets=100, max_comet_planet_ids=10, max_speed=6.0):  
         self.max_planets = max_planets
         self.max_fleets = max_fleets 
@@ -47,10 +52,7 @@ class Encoder:
         return padded_arr, mask
 
     def encode(self, planets, fleets, initial_planets, angular_velocity, comet_planet_ids, time_step, apply_padding=True):
-        # planets - [id, owner, x, y, radius, ships, production]
-        # out - [owner, radius, ships, production, moving/static, angular_velocity, comet]
-        # fleets - [id, owner, x, y, angle, from_planet_id, ships] or empty array
-        # out - [owner, angle, from_planet_id, ships, speed] or empty
+       
         
         #assert the shape of planets
         assert planets.shape[-1] == 7, f"Expected planets to have 7 features, but got {planets.shape[-1]}"
