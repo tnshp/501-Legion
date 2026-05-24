@@ -1,0 +1,77 @@
+
+All checks pass. Here's a clear summary of what was wrong and what was fixed:
+
+Issues found and fixed
+Issue 1 — Missing tanh squashing (dominant bug)
+
+MLP_Policy.sample() was sampling raw Gaussian actions unbounded in (-∞, +∞). Gymnasium silently clips these to [-1, 1], so the Q-network trained on Q(s, u=3.5) but the reward came from the clipped a=1.0. Every single gradient step used corrupted data.
+
+The log-prob was also missing the tanh Jacobian correction, so the entropy estimate was wrong.
+
+Fixed in model/mlp.py:68-100:
+
+
+u = mu + eps * sigma                      # pre-tanh
+action = torch.tanh(u)                   # → (-1, 1), matches env bounds
+log_prob = log_prob_gaussian - log(1 - action² + ε).sum()   # Jacobian correction
+Issue 2 — Fixed alpha
+
+With alpha=0.2 and growing Q-values (Hopper reaches Q≈hundreds), the entropy term 0.2 * log_prob becomes negligible and the policy collapses to deterministic early — stopping exploration.
+
+Fixed via auto_alpha=True in SACTrainer: optimizes log α to keep entropy near target_entropy = -action_dim = -3.0, matching SB3's default. Alpha starts at 1.0 and decays as the policy improves.
+
+Issue 3 — _evaluate() used unbounded mu directly
+
+Now uses policy_net.deterministic_action() (= tanh(mu)) when available, so eval rollouts also stay within bounds.
+
+Remaining architectural difference (not fixed — theoretically valid): The current implementation uses a target V-network (SAC v1 paper). SB3 uses target Q-networks (SAC v2 / no V-network). Both are correct; the V-network variant adds one extra network but is theoretically equivalent.
+
+
+What changed
+Architecture: SAC v1 → SAC v2
+
+Before	After
+Networks	policy, Q1, Q2, V, V_target	policy, Q1, Q2, Q1_target, Q2_target
+Q-target	r + γ · V_target(s')	`r + γ · [min(Q1_tgt, Q2_tgt)(s', ã') − α · log π(ã'
+Entropy in target	Computed separately inside V-target	Folded directly into Q-target
+Gradient steps/update	4 (Q1, Q2, V, π)	3 (Q1, Q2, π)
+Parameters	caller passed value_net, target_value_net	target Q-nets created internally via deepcopy
+Why this matches SB3: The Q-target now bootstraps from frozen target Q-networks rather than a frozen target V-network. The entropy regularisation term −α · log π(ã'|s') lives inside the Q-target, so the critic directly learns the soft Q-value (expected return + entropy). The V-network was an intermediate variable that the revised paper showed was unnecessary.
+
+Files changed:
+
+sac_train.py — SACTrainer.__init__, update(), save/load_checkpoint, make_transformer_sac_trainer
+test_pendulum.py — make_mlp_sac_trainer (removed MLP_V and the two V-net args)
+
+
+
+
+
+Training loop optimizations
+ReplayBuffer — completely replaced
+
+Old	New	Why
+deque + Python tuples	Pre-allocated np.zeros arrays	One malloc at init, zero per-step allocation
+random.sample(buffer, B)	np.random.randint(0, size, B)	~100× faster on large buffers
+torch.FloatTensor(np.array(states))	torch.from_numpy(self.states[idxs])	Zero-copy — shares numpy memory
+No batch add	add_batch(states, actions, rewards, ...)	Writes N transitions in one numpy slice
+update()
+
+non_blocking=True on all .to(device) calls — overlaps CPU→GPU copy with GPU compute
+Removed self.train_step += 1 — train_step now tracks env interactions only (it was being double-counted: once per env step in the loop and once per gradient step in update())
+gradient_steps parameter — controls how many gradient updates to run per env-step cycle. With VecEnv, set it to n_envs to maintain the same UTD ratio as single-env training.
+
+Vectorised environment support
+Pass any gymnasium.VectorEnv as env. The trainer auto-detects it via env.num_envs and switches loops:
+
+
+# 4 parallel envs
+env = gym.make_vec("Hopper-v5", num_envs=4, vectorization_mode="async")
+trainer = SACTrainer(env, policy_net, q1_net, q2_net, ...)
+trainer.train(num_episodes=5000, gradient_steps=4)  # gradient_steps=n_envs keeps UTD ratio
+
+The vectorised loop (_train_vec) handles:
+
+Terminal observation fix — gymnasium VecEnv auto-resets done envs, so next_obs at a done step is the reset observation, not the terminal one. The true terminal obs is in infos['final_observation'][i], and it's substituted before storing in the buffer — otherwise the Q-target sees a wrong next-state
+Per-env episode tracking — accumulates rewards per env, records episode when done[i]=True
+select_action_batch — runs policy forward on the full (n_envs, obs_dim) batch in one GPU call instead of N serial calls
