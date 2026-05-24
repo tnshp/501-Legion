@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import numpy as np 
+import numpy as np
 
 from utils.pos_encoding import get_pos_encoding
 
@@ -12,7 +12,7 @@ class Encoder:
     # fleets - [id, owner, x, y, angle, from_planet_id, ships] or empty array
     # out - [owner[4], angle, ships, speed, dummy[3], is_planet, x, y, time_step] or empty array
     
-    def __init__(self, max_planets=40, max_fleets=100, max_comet_planet_ids=10, max_speed=6.0):  
+    def __init__(self, max_planets=40, max_fleets=200, max_comet_planet_ids=10, max_speed=6.0):  
         self.max_planets = max_planets
         self.max_fleets = max_fleets 
         self.max_comet_planet_ids = max_comet_planet_ids
@@ -23,6 +23,7 @@ class Encoder:
         self.max_time_step = 500
     
     def get_speed(self, ships):
+        ships = np.maximum(ships, 1)
         return 1.0 + (self.max_speed - 1.0) * (np.log(ships) / np.log(1000)) ** 1.5
     
     def get_planet_mapping(self, initial_planets):
@@ -66,26 +67,24 @@ class Encoder:
         planets_owner = planets[:, 1].astype(int)
         planet_pos = planets[:, 2:4]
         
-        angular_velocity = np.array([angular_velocity for _ in range(planets.shape[0])]).reshape(-1, 1)
-        
+        angular_velocity = np.full((planets.shape[0], 1), angular_velocity, dtype=np.float64)
+
         # Handle empty comet_planet_ids
         if comet_planet_ids.size == 0:
             comet_planet = np.zeros((planets.shape[0], 1))
         else:
-            comet_planet = np.array([1 if planet_id in comet_planet_ids else 0 for planet_id in planets[:, 0]]).reshape(-1, 1)
-        
+            comet_planet = np.isin(planets[:, 0], comet_planet_ids).astype(np.float64).reshape(-1, 1)
+
         planets_mapping = self.get_planet_mapping(initial_planets)
         moving_planets = np.array([planets_mapping.get(planet_id, 0) for planet_id in planets[:, 0]]).reshape(-1, 1)
-        #replace nan with 0
         moving_planets = np.nan_to_num(moving_planets)
 
         planets_owner_one_hot = np.zeros((planets_owner.shape[0], 4))
-        for i in range(planets_owner.shape[0]):
-            if planets_owner[i] != -1:
-                planets_owner_one_hot[i] = np.eye(4)[planets_owner[i]]
-        
+        valid = planets_owner >= 0
+        planets_owner_one_hot[valid] = np.eye(4)[planets_owner[valid]]
+
         #adding time step as feature to planets and fleets
-        times_step_array = np.array([time_step for _ in range(planets.shape[0])]).reshape(-1, 1)
+        times_step_array = np.full((planets.shape[0], 1), time_step, dtype=np.float64)
         is_planet = np.zeros((planets.shape[0], 1))
         planets_encoded = np.hstack((planets_owner_one_hot, planets[:, 4:], moving_planets, angular_velocity, 
                              comet_planet, is_planet, planet_pos,  times_step_array))
@@ -100,17 +99,16 @@ class Encoder:
             fleets_angle = fleets[:, 4].reshape(-1, 1)
             # fleets_from_planet_id = fleets[:, 5].reshape(-1, 1)
             fleets_ships = fleets[:, 6].reshape(-1, 1)
-            fleets_speed = np.array([self.get_speed(ships) for ships in fleets_ships[:, 0]]).reshape(-1, 1)
+            fleets_speed = self.get_speed(fleets_ships[:, 0]).reshape(-1, 1)
 
             fleets_owner_one_hot = np.zeros((fleets_owner.shape[0], 4))
-            for i in range(fleets_owner.shape[0]):
-                if fleets_owner[i] != -1:
-                    fleets_owner_one_hot[i] = np.eye(4)[fleets_owner[i]]
+            valid_f = fleets_owner >= 0
+            fleets_owner_one_hot[valid_f] = np.eye(4)[fleets_owner[valid_f]]
 
             dummy = np.zeros((fleets.shape[0], 3))
             is_fleet = np.ones((fleets.shape[0], 1))
             fleet_pos = fleets[:, 2:4]
-            times_step_array_fleet = np.array([time_step for _ in range(fleets.shape[0])]).reshape(-1, 1)
+            times_step_array_fleet = np.full((fleets.shape[0], 1), time_step, dtype=np.float64)
 
             fleets_encoded = np.hstack((fleets_owner_one_hot, fleets_angle, fleets_ships, fleets_speed, dummy,
                                 is_fleet,  fleet_pos, times_step_array_fleet))
@@ -224,55 +222,35 @@ class Q_network(nn.Module):
         self.d_model = d_model
     
 
-    def forward(self, state, action):  
+    def forward(self, state, action):
         """
         Args:
-            state: [batch_size, state_seq_len, d_model] or [state_seq_len, d_model]
-            action: [batch_size, action_seq_len, d_model] or [action_seq_len, d_model]
-        
+            state:  [B, max_planets+max_fleets, state_dim]
+            action: [B, max_planets, action_dim]
         Returns:
-            value: [batch_size] or [1] (scalar if unbatched)
+            value: [B]
         """
-        #true for seq length upto max_planets
-        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
-        planets_mask[:, :self.max_planets] = 1
+        p_end = self.max_planets
+        f_end = p_end + self.max_fleets
 
-        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
-        fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
+        # Project each token type separately — avoids allocating mask tensors on GPU
+        p_embed = self.P(state[:, :p_end,        :10].contiguous())  # [B, P, d]
+        f_embed = self.F(state[:, p_end:f_end,   :10].contiguous())  # [B, F, d]
+        state_embed = torch.cat([p_embed, f_embed], dim=1)           # [B, P+F, d]
 
-        # print(planets_mask[0]) 
-        # print(fleets_mask[0])
+        pos_encoding = get_pos_encoding(state[:, :, 11:13], state[:, :, -1], self.d_model)
+        state_embed = state_embed + pos_encoding
 
-        # print(f"planets mask shape {planets_mask.shape}, fleets mask shape {fleets_mask.shape}")
-        #Usable dimension upto 10 
-        planets = self.P(state[:, :, :10] * planets_mask.unsqueeze(-1))     
-        fleets = self.F(state[:, :, :10] * fleets_mask.unsqueeze(-1))
+        action_embed = self.A(action)  # [B, P, d]
 
-        time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
-        pos = state[:, :, 11:13]  # Assuming position is at indices 11 and 12
-        pos_encoding = get_pos_encoding(pos, time_step, self.d_model)
-
-        action = self.A(action)
-
-        state = planets + fleets
-        state = state + pos_encoding
-
-        batch_size = state.shape[0]
-        # state_n = state.shape[1]
-        # action_n = action.shape[1]
-
-        # Expand cls and sep tokens for batch
-        cls_token = self.cls_token.expand(batch_size, -1, -1)  # [1, batch_size, d_model]
-        sep_token = self.sep_token.expand(batch_size, -1, -1)  # [1, batch_size, d_model]
-
-        # Concatenate: [batch_size, seq_len, d_model]
-        src = torch.cat((cls_token, state,  sep_token, action), dim=1)
+        batch_size = state_embed.shape[0]
+        cls_token = self.cls_token.expand(batch_size, -1, -1)
+        sep_token = self.sep_token.expand(batch_size, -1, -1)
+        src = torch.cat([cls_token, state_embed, sep_token, action_embed], dim=1)
 
         out_ = self.transformer(src)
-        out_cls = out_[:, 0, :]  # [batch_size, 1, d_model]
-        value = self.value_head(out_cls)  # [batch_size, 1]
-        
-        return value.squeeze(-1)  # [batch_size]
+        value = self.value_head(out_[:, 0, :])  # [B, 1]
+        return value.squeeze(-1)                # [B]
     
 
 class V_network(nn.Module):
@@ -311,34 +289,30 @@ class V_network(nn.Module):
         )
         self.d_model = d_model
 
-    def forward(self, state):  
-        
-        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
-        planets_mask[:, :self.max_planets] = 1
+    def forward(self, state):
+        """
+        Args:
+            state: [B, max_planets+max_fleets, state_dim]
+        Returns:
+            value: [B]
+        """
+        p_end = self.max_planets
+        f_end = p_end + self.max_fleets
 
-        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
-        fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
+        p_embed = self.P(state[:, :p_end,      :10].contiguous())  # [B, P, d]
+        f_embed = self.F(state[:, p_end:f_end, :10].contiguous())  # [B, F, d]
+        state_embed = torch.cat([p_embed, f_embed], dim=1)         # [B, P+F, d]
 
-        planets = self.P(state[:, :, :10] * planets_mask.unsqueeze(-1))     
-        fleets = self.F(state[:, :, :10] * fleets_mask.unsqueeze(-1))
+        pos_encoding = get_pos_encoding(state[:, :, 11:13], state[:, :, -1], self.d_model)
+        state_embed = state_embed + pos_encoding
 
-        time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
-        pos = state[:, :, 11:13]  # Assuming position is at indices 11 and 12
-        pos_encoding = get_pos_encoding(pos, time_step, self.d_model)
+        batch_size = state_embed.shape[0]
+        cls_token = self.cls_token.expand(batch_size, -1, -1)
 
-        state = planets + fleets
-        state = state + pos_encoding
-    
-        # Expand cls token for batch
-        batch_size = state.shape[0]
-        cls_token = self.cls_token.expand(batch_size, -1,  -1)  # [1, batch_size, d_model]
-
-        src = torch.cat((cls_token, state), dim=1)
+        src = torch.cat([cls_token, state_embed], dim=1)
         out_ = self.transformer(src)
-        out_cls = out_[:, 0, :]  # [batch_size, 1, d_model]
-        value = self.value_head(out_cls)  # [batch_size, 1]
-        
-        return value.squeeze(-1)  # [batch_size]
+        value = self.value_head(out_[:, 0, :])  # [B, 1]
+        return value.squeeze(-1)                # [B]
     
 
 class P_network(nn.Module):
@@ -381,30 +355,28 @@ class P_network(nn.Module):
         self.action_dim = action_dim
 
     def forward(self, state):
-        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
-        planets_mask[:, :self.max_planets] = 1
+        """
+        Args:
+            state: [B, max_planets+max_fleets, state_dim]
+        Returns:
+            mu:    [B, max_planets, action_dim]
+            sigma: [B, max_planets, action_dim]
+        """
+        p_end = self.max_planets
+        f_end = p_end + self.max_fleets
 
-        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
-        fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
+        p_embed = self.P(state[:, :p_end,      :10].contiguous())  # [B, P, d]
+        f_embed = self.F(state[:, p_end:f_end, :10].contiguous())  # [B, F, d]
+        state_embed = torch.cat([p_embed, f_embed], dim=1)         # [B, P+F, d]
 
-        planets = self.P(state[:, :, :10] * planets_mask.unsqueeze(-1))
-        fleets = self.F(state[:, :, :10] * fleets_mask.unsqueeze(-1))
+        pos_encoding = get_pos_encoding(state[:, :, 11:13], state[:, :, -1], self.d_model)
+        state_embed = state_embed + pos_encoding
 
-        time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
-        pos = state[:, :, 11:13]  # Assuming position is at indices 11 and 12
-        pos_encoding = get_pos_encoding(pos, time_step, self.d_model)
+        out_ = self.transformer(state_embed)  # [B, P+F, d]
 
-        state = planets + fleets
-        state = state + pos_encoding
-
-        # Process through transformer
-        src = state  # [batch_size, seq_len, d_model]
-        out_ = self.transformer(src)  # [batch_size, seq_len, d_model]
-
-        #only pass num planets tokens through heads, as action is only for planets
-        mu = self.mu_head(out_[:, :self.max_planets, :])
-        sigma = F.softplus(self.sigma_head(out_[:, :self.max_planets, :])) + 1e-5
-
+        planet_out = out_[:, :self.max_planets, :]          # [B, P, d]
+        mu    = self.mu_head(planet_out)                    # [B, P, action_dim]
+        sigma = F.softplus(self.sigma_head(planet_out)) + 1e-5
         return mu, sigma
 
     def sample(self, state):
@@ -443,8 +415,7 @@ class ActionDecoder(nn.Module):
         #softmax along rows to get probabilities of actions for each planet
         action = F.softmax(action, dim=1)
 
-        #mask diagnols
-        diag_mask = torch.eye(action.shape[0])
+        diag_mask = torch.eye(action.shape[0], device=action.device)
         action = action * (1 - diag_mask)
         
         if mask is not None:
