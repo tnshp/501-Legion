@@ -1,108 +1,161 @@
-import gymnasium as gym
+"""
+Orbit Wars kaggle environment utilities.
+
+Shared by sac_train.py, sac_train_kaggle.py, and any other training scripts.
+Provides observation encoding, action decoding, and reward shaping built on:
+  - model/SAC.py  Encoder
+  - env/training_loop.py  safe_angle / solve_intercept
+"""
+
+import math
 import numpy as np
-from gymnasium import spaces
-from stable_baselines3.common.env_checker import check_env
+
+from model.SAC import Encoder
+from env.training_loop import safe_angle, solve_intercept
+
+MAX_PLANETS  = 44
+MAX_FLEETS   = 500
+STATE_DIM    = 14
+ACTION_DIM   = 8
+SUN_X, SUN_Y = 50.0, 50.0
 
 
-class MatrixEnv(gym.Env):
-    """Custom Environment with n x s continuous state and action spaces."""
+# =============================================================================
+# Observation helpers
+# =============================================================================
 
-    metadata = {"render_modes": ["human"]}
+def _obs_to_arrays(obs):
+    """Return (planets_np [n,7], fleets_np [m,7], comet_ids [k], omega, step)."""
+    planets_np = np.array(obs.planets, dtype=np.float32)
 
-    def __init__(self, state_dim: int = 3, action_dim: int = 2, max_state: int = 144, max_action: int = 44):
-        super().__init__()
-        self.state_dim = state_dim
-        self.action_dim = action_dim
+    raw_fleets = obs.fleets if obs.fleets else []
+    fleets_np  = np.array(raw_fleets, dtype=np.float32) if raw_fleets else np.empty((0, 7), dtype=np.float32)
 
-        self.max_state = max_state
-        self.max_action = max_action
+    raw_comets = getattr(obs, "comet_planet_ids", None) or []
+    comet_ids  = np.array(raw_comets, dtype=np.float32)
 
-        # 1. Define the Action Space (Matrix of shape n x s)
-        # It is highly recommended to normalize continuous actions to [-1, 1]
-        self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(self.max_action, self.action_dim), dtype=np.float32
+    omega = float(getattr(obs, "angular_velocity", 0.03))
+    step  = int(getattr(obs, "step", 0))
+    return planets_np, fleets_np, comet_ids, omega, step
+
+
+def _swap_perspective(planets_np: np.ndarray, fleets_np: np.ndarray, player_id: int):
+    """
+    Relabel owner IDs so player_id appears as player 0 to the network.
+    Planet/fleet IDs and positions are unchanged, so decoded moves remain valid.
+    """
+    if player_id == 0:
+        return planets_np, fleets_np
+
+    p = planets_np.copy()
+    mask_zero = p[:, 1] == 0
+    mask_pid  = p[:, 1] == player_id
+    p[mask_zero, 1] = player_id
+    p[mask_pid,  1] = 0
+
+    if fleets_np.shape[0] > 0:
+        f = fleets_np.copy()
+        mask_fz = f[:, 1] == 0
+        mask_fp = f[:, 1] == player_id
+        f[mask_fz, 1] = player_id
+        f[mask_fp, 1] = 0
+    else:
+        f = fleets_np
+
+    return p, f
+
+
+def encode_obs_as_player(
+    encoder: Encoder, obs, initial_planets: np.ndarray, player_id: int = 0
+) -> np.ndarray:
+    """
+    Encode observation from player_id's perspective.
+    Owner IDs are swapped so the network always sees itself as player 0.
+    Returns float32 array of shape [MAX_PLANETS + MAX_FLEETS, STATE_DIM].
+    """
+    planets_np, fleets_np, comet_ids, omega, step = _obs_to_arrays(obs)
+    planets_np, fleets_np = _swap_perspective(planets_np, fleets_np, player_id)
+    state, _ = encoder.encode(
+        planets_np, fleets_np, initial_planets,
+        omega, comet_ids, step, apply_padding=True,
+    )
+    return state.astype(np.float32)
+
+
+def compute_reward_for_player(obs_prev, obs_next, player_id: int) -> float:
+    """Shaped reward: change in (ships + production*10) for player_id."""
+    def score(o):
+        return sum(
+            float(p[5]) + float(p[6]) * 10.0
+            for p in o.planets if int(p[1]) == player_id
         )
+    return score(obs_next) - score(obs_prev)
 
-        # 2. Define the Observation Space (Matrix of shape n x s)
-        # We assume arbitrary bounds for the state, e.g., [-100, 100]
-        self.observation_space = spaces.Box(
-            low=-100.0, high=100.0, shape=(self.max_state, self.state_dim), dtype=np.float32
+
+# =============================================================================
+# Action decoder
+# =============================================================================
+
+def decode_action(
+    action_np: np.ndarray,
+    planets_np: np.ndarray,
+    omega: float,
+    player_id: int = 0,
+    min_ships: int = 5,
+) -> list:
+    """
+    Decode raw policy output into a list of kaggle moves.
+
+      action[i, 0]  – send logit        (> 0 triggers launch from planet i)
+      action[i, 1]  – ship-fraction     (sigmoid → clamped to [0.1, 0.9])
+      action[i, 2:] – 6-dim target key  (dot-product attention picks target)
+
+    Args:
+        action_np  : [MAX_PLANETS, ACTION_DIM]  raw policy output
+        planets_np : [n, 7]  current observation, perspective-swapped so
+                     player_id's planets appear as owner 0
+    Returns:
+        [[planet_id, angle, ships_count], ...]
+    """
+    n = len(planets_np)
+    if n == 0:
+        return []
+
+    act    = action_np[:n]
+    keys   = act[:, 2:]
+    scores = keys @ keys.T
+    np.fill_diagonal(scores, -1e9)
+
+    # Softmax over ship-fraction logits: relative priority across all planets
+    logits = act[:, 1]
+    fracs  = np.exp(logits - logits.max())
+    fracs  /= fracs.sum()
+
+    moves = []
+    for i in range(n):
+        pid, owner, px, py, radius, ships, _prod = planets_np[i, :7]
+        if int(owner) != 0:
+            continue
+        if float(ships) < min_ships:
+            continue
+        if float(act[i, 0]) <= 0.0:
+            continue
+
+        frac      = min(1, float(fracs[i]))
+        num_ships = int(float(ships) * frac)
+        if num_ships < 1:
+            continue
+
+        j = int(np.argmax(scores[i]))
+        _tid, _t_owner, tx, ty, t_radius, _t_ships, _t_prod = planets_np[j, :7]
+
+        r = math.hypot(float(tx) - SUN_X, float(ty) - SUN_Y)
+        is_orbiting = (r + float(t_radius)) < 48.0
+        ix, iy, _ = solve_intercept(
+            float(px), float(py), float(tx), float(ty),
+            is_orbiting, omega, int(num_ships),
         )
+        angle = safe_angle(float(px), float(py), ix, iy)
+        moves.append([int(pid), angle, num_ships])
 
-        #linear project action dim to state dim
-        self.action_proj = np.random.rand(self.action_dim, self.state_dim).astype(np.float32)
-
-        # Initialize state variables
-        self.state = None
-        self.current_step = 0
-        self.max_steps = 50
-
-    def reset(self, seed=None, options=None):
-        # Handle the random seed for reproducibility
-        super().reset(seed=seed)
-
-        # Initialize a random starting state of shape (n, s)
-        self.state = self.np_random.uniform(
-            -1.0, 1.0, size=(self.max_state, self.state_dim)
-        ).astype(np.float32)
-        self.current_step = 0
-
-        # Gymnasium reset must return (observation, info)
-        info = {}
-        return self.state, info
-
-    def step(self, action):
-        # SB3 automatically ensures the action matches the space shape (n, s)
-        self.current_step += 1
-
-        # Dummy environment logic: transition state based on action
-        # For example: next_state = current_state + action
-        action_ = np.dot(action, self.action_proj)  # Project action to state dimension
-        #pad max action to max state
-        if action_.shape[0] < self.max_state:
-            padding = np.zeros((self.max_state - action_.shape[0], self.state_dim), dtype=np.float32)
-            action_ = np.vstack((action_, padding))
-
-        self.state = self.state + action_
-
-        # Clip state to keep it strictly within observation_space bounds
-        self.state = np.clip(
-            self.state, self.observation_space.low, self.observation_space.high
-        )
-
-        # Dummy reward function: minimize the absolute values in the matrix
-        reward = float(-np.sum(np.abs(self.state)))
-
-        # Check termination and truncation conditions
-        terminated = False
-        truncated = self.current_step >= self.max_steps
-
-        info = {}
-
-        # Gymnasium step must return (observation, reward, terminated, truncated, info)
-        return self.state, reward, terminated, truncated, info
-
-    def render(self):
-        print(f"Step: {self.current_step} | State Matrix:\n{self.state}")
-
-
-# ==========================================
-# Verification & SB3 Compatibility Check
-# ==========================================
-if __name__ == "__main__":
-    # Initialize env with custom matrix sizes (e.g., 5 x 2)
-    env = MatrixEnv(state_dim=14, action_dim=8, max_state=144, max_action=44)
-
-    print("Checking environment compatibility with SB3...")
-    # check_env will raise an error or warning if something is wrong
-    check_env(env, warn=True)
-    print("Environment is 100% compatible with Stable-Baselines3!")
-
-    # Quick test run
-    obs, info = env.reset()
-    print(f"\nInitial State Shape: {obs.shape}")
-
-    random_action = env.action_space.sample()
-    obs, reward, term, trunc, info = env.step(random_action)
-    print(f"Action Taken Shape: {random_action.shape}")
-    print(f"Next State Shape: {obs.shape}")
+    return moves

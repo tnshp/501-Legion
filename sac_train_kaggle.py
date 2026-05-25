@@ -166,7 +166,7 @@ def decode_action(
         x = float(act[i, 1])
         frac = 1.0 / (1.0 + math.exp(-x)) if x >= 0 else math.exp(x) / (1.0 + math.exp(x))
         frac = max(0.1, min(0.9, frac))
-        num_ships = max(1, int(float(ships) * frac))
+        num_ships = int(float(ships) * frac)
 
         # Target: highest-scoring other planet
         j = int(np.argmax(scores[i]))
@@ -424,6 +424,8 @@ def run_episode(agent: SACKaggle, warmup_steps: int, total_steps: int):
 
         # Add any terminal signal from the env
         env_r0 = step_results[0].reward
+        if env_r0 == 1:
+            env_r0 = 500
         env_r1 = step_results[1].reward if len(step_results) > 1 else None
         if env_r0 is not None:
             r_p0 += float(env_r0)
