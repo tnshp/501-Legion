@@ -711,7 +711,8 @@ if __name__ == "__main__":
         max_steps_per_episode=50,
         warmup_steps=500,
         gradient_steps=1,
-        log_interval=10,
+        profile=True,
+        log_interval=5,
     )
 
     trainer.save_checkpoint("sac_model.pt")

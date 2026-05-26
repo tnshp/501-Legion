@@ -1,0 +1,7 @@
+torch
+gymnasium 
+gymnasium[mujoco]
+kaggle_environments 
+stable_baselines3
+tensorboard
+tensorboardX

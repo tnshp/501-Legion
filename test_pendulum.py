@@ -40,10 +40,10 @@ if __name__ == "__main__":
         # SyncVectorEnv is simpler and sufficient for lightweight envs.
         env = gym.make_vec("Hopper-v5", num_envs=N_ENVS,
                            vectorization_mode="async")
-        log_dir = f"runs/hopper_v5_vec{N_ENVS}"
+        log_dir = f"runs/hopper_v5_run{N_ENVS}"
     else:
         env = gym.make("Hopper-v5")
-        log_dir = "runs/hopper_v5_single"
+        log_dir = f"runs/hopper_v5_run{N_ENVS}"
 
     eval_env = gym.make("Hopper-v5")
 
@@ -71,7 +71,7 @@ if __name__ == "__main__":
         gradient_steps=N_ENVS,        # maintain same UTD ratio as single-env
         log_interval=10,
         eval_env=eval_env,
-        profile=True,
+        profile=False,
         eval_interval=50,
         eval_episodes=5,
     )
