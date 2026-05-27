@@ -398,12 +398,15 @@ class SACTrainer:
     # Episode runner — rule-based opponent
     # =========================================================================
 
-    def run_episode_vs_rulebased(self, agent_fn: Callable, warmup_steps: int):
+    def run_episode_vs_rulebased(self, agent_fn: Callable, warmup_steps: int, opponent_noise: float = 0.0):
         """
         Run one episode where player 1 is driven by a rule-based agent callable.
 
         agent_fn receives the raw kaggle observation with obs.player == 1 and
         returns a list of moves [[planet_id, angle, ships], ...].
+
+        opponent_noise: probability [0, 1] that the rule-based agent's move is
+        replaced by a random decoded action, making it a weaker/noisier opponent.
 
         Only player 0's transitions are stored — the rule-based agent's raw moves
         can't be represented in the SAC action format.
@@ -439,8 +442,13 @@ class SACTrainer:
             swapped_p0, _ = _swap_perspective(planets_now, np.empty((0, 7), np.float32), player_id=0)
             moves_p0 = decode_action(action_p0, swapped_p0, omega)
 
-            # ── Player 1: rule-based agent ────────────────────────────────────
-            moves_p1 = agent_fn(obs_p1) or []
+            # ── Player 1: rule-based agent (with optional noise) ─────────────
+            if opponent_noise > 0.0 and np.random.random() < opponent_noise:
+                rand_action_p1 = np.random.randn(MAX_PLANETS, ACTION_DIM).astype(np.float32)
+                swapped_p1, _ = _swap_perspective(planets_now, np.empty((0, 7), np.float32), player_id=1)
+                moves_p1 = decode_action(rand_action_p1, swapped_p1, omega)
+            else:
+                moves_p1 = agent_fn(obs_p1) or []
 
             # ── Step environment ──────────────────────────────────────────────
             step_results = env.step(actions=[moves_p0, moves_p1])
@@ -451,7 +459,7 @@ class SACTrainer:
             r_p0   = compute_reward_for_player(obs_p0, new_obs_p0, player_id=0)
             env_r0 = step_results[0].reward
             if env_r0 is not None and abs(env_r0) == 1:
-                env_r0 *= 500
+                env_r0 *= 5000
             if env_r0 is not None:
                 r_p0 += float(env_r0)
 
@@ -486,14 +494,18 @@ class SACTrainer:
         render_interval: int     = 0,
         render_dir: str          = "renders",
         profile: bool            = False,
-        rule_based_ratio: float  = 0.5,
+        rule_based_ratio: float  = 1.0,
+        opponent_noise: float    = 0.3,
     ):
         """
         rule_based_ratio : fraction of episodes that use a rule-based opponent.
-            0.0 → pure self-play (same as sac_train.py)
-            0.5 → alternating (default when rule_based_agents are loaded)
-            1.0 → always rule-based
+            0.0 → pure self-play
+            1.0 → always rule-based (default)
         Has no effect if no rule_based_agents were provided at construction.
+
+        opponent_noise : probability that the rule-based opponent takes a random
+        action on any given step, making it a weaker/noisier training target.
+        0.0 → fully deterministic rule-based, 1.0 → fully random.
         """
         if render_interval > 0:
             os.makedirs(render_dir, exist_ok=True)
@@ -511,7 +523,7 @@ class SACTrainer:
             if use_rulebased:
                 agent_fn  = rb_agents[rb_cursor % len(rb_agents)]
                 rb_cursor += 1
-                transitions, ep_reward, ep_env = self.run_episode_vs_rulebased(agent_fn, warmup_steps)
+                transitions, ep_reward, ep_env = self.run_episode_vs_rulebased(agent_fn, warmup_steps, opponent_noise)
             else:
                 if sp_ep_count % self.opponent_update_interval == 0:
                     self.update_opponent()
@@ -558,7 +570,7 @@ class SACTrainer:
                     _ep_times.clear()
 
             if (ep + 1) % checkpoint_interval == 0:
-                self.save_checkpoint(checkpoint_path)
+                self.save_checkpoint(f"{ep+1}"+checkpoint_path)
 
             if render_interval > 0 and (ep + 1) % render_interval == 0:
                 render_path = os.path.join(render_dir, f"ep{ep+1:04d}.html")
@@ -651,7 +663,8 @@ if __name__ == "__main__":
         log_interval=10,
         render_interval=10,
         checkpoint_path="sac_model_dual.pt",
-        rule_based_ratio=0.5,  # every other episode uses a rule-based opponent
+        rule_based_ratio=1.0,   # exclusively rule-based opponents
+        opponent_noise=0.5,
     )
 
     trainer.close()
