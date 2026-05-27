@@ -42,14 +42,17 @@ class Encoder:
     def _pad_array(self, arr, max_size):
         current_size = arr.shape[0]
         feature_dim = arr.shape[1]
-        
+
+        if current_size > max_size:
+            arr = arr[:max_size]
+            current_size = max_size
+
         padded_arr = np.zeros((max_size, feature_dim))
         mask = np.zeros(max_size)
-        
-        # Copy real data
+
         padded_arr[:current_size] = arr
         mask[:current_size] = 1
-        
+
         return padded_arr, mask
 
     def encode(self, planets, fleets, initial_planets, angular_velocity, comet_planet_ids, time_step, apply_padding=True):
@@ -397,111 +400,72 @@ class P_network(nn.Module):
         ).sum(dim=(-2, -1), keepdim=True).squeeze(-1)  # [B, 1]
         return action, log_prob
     
-class ActionDecoder(nn.Module):
-    def __init__(self, 
-                 d_action=64):  
-        super(ActionDecoder, self).__init__()
-        self.d_action = d_action 
-
-    def sample_action(self, mu, sigma):
-        #gaussian sampling with reparameterization trick
-        eps = torch.randn_like(sigma)
-        action = mu + eps * sigma  # shape: [num_planets, action_dim]
-        return action
-    
-    def forward(self, mu, sigma, mask=None):
-        action = self.sample_action(mu, sigma)
-        action = torch.mm(action, action.T)  # shape: [num_planets, num_planets]
-        #softmax along rows to get probabilities of actions for each planet
-        action = F.softmax(action, dim=1)
-
-        diag_mask = torch.eye(action.shape[0], device=action.device)
-        action = action * (1 - diag_mask)
-        
-        if mask is not None:
-            action = action * mask
-
-
-        return action
+# class ActionDecoder(nn.Module):
+#     # Unused — action decoding is handled by decode_action() in env/dummy.py,
+#     # which integrates game physics (solve_intercept, safe_angle).
+#     def __init__(self, d_action=64):
+#         super(ActionDecoder, self).__init__()
+#         self.d_action = d_action
+#
+#     def sample_action(self, mu, sigma):
+#         eps = torch.randn_like(sigma)
+#         action = mu + eps * sigma
+#         return action
+#
+#     def forward(self, mu, sigma, mask=None):
+#         action = self.sample_action(mu, sigma)
+#         action = torch.mm(action, action.T)
+#         action = F.softmax(action, dim=1)
+#         diag_mask = torch.eye(action.shape[0], device=action.device)
+#         action = action * (1 - diag_mask)
+#         if mask is not None:
+#             action = action * mask
+#         return action
 
 
 # ============================================================
-# Minimal sb3 Compatibility Adapters (added for sb3 integration)
+# sb3 Compatibility Adapters (unused — sb3 integration was abandoned)
 # ============================================================
 
-class FlatStateToMatrixAdapter:
-    """
-    Utility adapter to convert flat states (from sb3) to matrix format for networks.
-    Used internally by the policy to reshape observations.
-    """
-    def __init__(self, max_planets: int, max_fleets: int, state_dim: int):
-        self.max_planets = max_planets
-        self.max_fleets = max_fleets
-        self.state_dim = state_dim
-    
-    @staticmethod
-    def reshape_flat_to_matrix(flat_state: torch.Tensor, max_planets: int, 
-                               max_fleets: int, state_dim: int) -> torch.Tensor:
-        """Convert flat state [batch_size, total_features] to matrix [batch_size, max_planets+max_fleets, state_dim]."""
-        batch_size = flat_state.shape[0] if flat_state.dim() > 1 else 1
-        total_seq = max_planets + max_fleets
-        matrix_state = flat_state.view(batch_size, total_seq, state_dim)
-        return matrix_state
-    
-    @staticmethod
-    def reshape_matrix_to_flat(matrix_state: torch.Tensor) -> torch.Tensor:
-        """Convert matrix state back to flat format."""
-        batch_size = matrix_state.shape[0]
-        flat_state = matrix_state.view(batch_size, -1)
-        return flat_state
+# class FlatStateToMatrixAdapter:
+#     def __init__(self, max_planets: int, max_fleets: int, state_dim: int):
+#         self.max_planets = max_planets
+#         self.max_fleets = max_fleets
+#         self.state_dim = state_dim
+#
+#     @staticmethod
+#     def reshape_flat_to_matrix(flat_state, max_planets, max_fleets, state_dim):
+#         batch_size = flat_state.shape[0] if flat_state.dim() > 1 else 1
+#         return flat_state.view(batch_size, max_planets + max_fleets, state_dim)
+#
+#     @staticmethod
+#     def reshape_matrix_to_flat(matrix_state):
+#         return matrix_state.view(matrix_state.shape[0], -1)
 
 
-class NetworkCompatibilityHelper:
-    """
-    Helper class to ensure custom networks are compatible with sb3's training loop.
-    Provides utility methods for device placement, gradient management, etc.
-    """
-    
-    @staticmethod
-    def ensure_batch_dimension(tensor: torch.Tensor, expected_batch_size: int = None) -> torch.Tensor:
-        """Ensure tensor has batch dimension."""
-        if tensor.dim() == 1:
-            tensor = tensor.unsqueeze(0)
-        return tensor
-    
-    @staticmethod
-    def prepare_state_for_network(state: torch.Tensor, max_planets: int, max_fleets: int, 
-                                  state_dim: int, device: torch.device) -> torch.Tensor:
-        """
-        Prepare state tensor for network forward pass.
-        Handles reshaping from flat sb3 format to matrix format expected by networks.
-        """
-        # Ensure batch dimension
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
-        
-        # Ensure on correct device
-        state = state.to(device)
-        
-        # Reshape to matrix format if needed
-        total_size = (max_planets + max_fleets) * state_dim
-        if state.shape[-1] == total_size:
-            state = state.view(state.shape[0], max_planets + max_fleets, state_dim)
-        
-        return state
-    
-    @staticmethod
-    def prepare_action_for_network(action: torch.Tensor, max_planets: int, 
-                                   action_dim: int, device: torch.device) -> torch.Tensor:
-        """Prepare action tensor for network forward pass."""
-        if action.dim() == 1:
-            action = action.unsqueeze(0)
-        
-        action = action.to(device)
-        
-        # Reshape to matrix format if needed
-        total_size = max_planets * action_dim
-        if action.shape[-1] == total_size:
-            action = action.view(action.shape[0], max_planets, action_dim)
-        
-        return action
+# class NetworkCompatibilityHelper:
+#     @staticmethod
+#     def ensure_batch_dimension(tensor, expected_batch_size=None):
+#         if tensor.dim() == 1:
+#             tensor = tensor.unsqueeze(0)
+#         return tensor
+#
+#     @staticmethod
+#     def prepare_state_for_network(state, max_planets, max_fleets, state_dim, device):
+#         if state.dim() == 1:
+#             state = state.unsqueeze(0)
+#         state = state.to(device)
+#         total_size = (max_planets + max_fleets) * state_dim
+#         if state.shape[-1] == total_size:
+#             state = state.view(state.shape[0], max_planets + max_fleets, state_dim)
+#         return state
+#
+#     @staticmethod
+#     def prepare_action_for_network(action, max_planets, action_dim, device):
+#         if action.dim() == 1:
+#             action = action.unsqueeze(0)
+#         action = action.to(device)
+#         total_size = max_planets * action_dim
+#         if action.shape[-1] == total_size:
+#             action = action.view(action.shape[0], max_planets, action_dim)
+#         return action

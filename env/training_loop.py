@@ -44,9 +44,9 @@ def predict_orbit(x: float, y: float, omega: float, dt: float):
 def solve_intercept(fx: float, fy: float, tx: float, ty: float, orbiting: bool, omega: float, ships: int, iterations: int = 25):
     if not orbiting:
         t = travel_time(fx, fy, tx, ty, ships)
-        return tx, ty, t
-    theta = math.atan2(ty - SUN_Y, tx - SUN_X)
-    r = math.hypot(tx - SUN_X, ty - SUN_Y)
+        return tx, ty, t, True
+    # theta = math.atan2(ty - SUN_Y, tx - SUN_X)
+    # r = math.hypot(tx - SUN_X, ty - SUN_Y)
     t = travel_time(fx, fy, tx, ty, ships)
     ix, iy = tx, ty
     for _ in range(iterations):
@@ -55,10 +55,29 @@ def solve_intercept(fx: float, fy: float, tx: float, ty: float, orbiting: bool, 
         if abs(t2 - t) < 0.05:
             break
         t = t2
+    valid = False
+    if not path_crosses_sun(fx, fy, ix, iy, margin=1.5):
+        valid = True
+    return ix, iy, t, valid
+
+def solve_intercept_at_all_costs(fx: float, fy: float, tx: float, ty: float, orbiting: bool, omega: float, ships: int, target_rad: float, time_limit: int = 50):
+    if not orbiting:
+        t = travel_time(fx, fy, tx, ty, ships)
+        return tx, ty, t
+    # theta = math.atan2(ty - SUN_Y, tx - SUN_X)
+    # r = math.hypot(tx - SUN_X, ty - SUN_Y)
+    t = travel_time(fx, fy, tx, ty, ships)
+    ix, iy = tx, ty
+    for _ in range(time_limit):
+        ix, iy = predict_orbit(tx, ty, omega, t)
+        time_taken = travel_time(fx, fy, ix, iy, ships)
+        if abs(t - time_taken) <= target_rad/fleet_speed(ships) and not path_crosses_sun(fx, fy, ix, iy, margin=1.5):
+            break
+        t+=1
     return ix, iy, t
 
 
-def safe_angle(x1: float, y1: float, x2: float, y2: float) -> float:
+def safe_angle(x1: float, y1: float, x2: float, y2: float, target_rad: float):
     direct = math.atan2(y2 - y1, x2 - x1)
     if not path_crosses_sun(x1, y1, x2, y2, margin=1.5):
         return direct
@@ -72,7 +91,12 @@ def safe_angle(x1: float, y1: float, x2: float, y2: float) -> float:
     def adiff(a):
         dd = (a - direct) % (2 * math.pi)
         return min(dd, 2 * math.pi - dd)
-    return cw if adiff(cw) < adiff(ccw) else ccw
+    safe =  cw if adiff(cw) < adiff(ccw) else ccw
+    d_target = math.hypot(x1 - x2, y1 - y2)
+    half_target = math.asin(min(1.0, (target_rad) / d_target))
+    if adiff(safe) > half_target:
+        return None
+    return safe
 
 
 def is_decoy_fleet(fleet, planets, omega):

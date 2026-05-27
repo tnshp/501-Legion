@@ -11,10 +11,10 @@ import math
 import numpy as np
 
 from model.SAC import Encoder
-from env.training_loop import safe_angle, solve_intercept
+from env.training_loop import safe_angle, solve_intercept, solve_intercept_at_all_costs
 
 MAX_PLANETS  = 44
-MAX_FLEETS   = 500
+MAX_FLEETS   = 1000
 STATE_DIM    = 14
 ACTION_DIM   = 8
 SUN_X, SUN_Y = 50.0, 50.0
@@ -101,14 +101,20 @@ def decode_action(
     planets_np: np.ndarray,
     omega: float,
     player_id: int = 0,
-    min_ships: int = 5,
+    min_ships: int = 1,
 ) -> list:
     """
     Decode raw policy output into a list of kaggle moves.
 
-      action[i, 0]  – send logit        (> 0 triggers launch from planet i)
-      action[i, 1]  – ship-fraction     (sigmoid → clamped to [0.1, 0.9])
-      action[i, 2:] – 6-dim target key  (dot-product attention picks target)
+      action[i, 0]  – send logit    (> 0 triggers dispatch from planet i)
+      action[i, 1]  – temperature   (softplus → controls dispatch concentration;
+                                     high = diffuse across many targets,
+                                     low = concentrate on best target)
+      action[i, 2:] – 6-dim key     (softmax of key dot-products → distribution over targets)
+
+    Self-planet is included in the softmax without masking: the self-weight is the
+    fraction of ships that stay (not dispatched). This makes the temperature the sole
+    lever for dispatch volume — no separate sigmoid needed.
 
     Args:
         action_np  : [MAX_PLANETS, ACTION_DIM]  raw policy output
@@ -121,19 +127,23 @@ def decode_action(
     if n == 0:
         return []
 
-    act    = action_np[:n]
-    keys   = act[:, 2:]
-    scores = keys @ keys.T
-    np.fill_diagonal(scores, -1e9)
+    act = action_np[:n]
 
-    # Softmax over ship-fraction logits: relative priority across all planets
-    logits = act[:, 1]
-    fracs  = np.exp(logits - logits.max())
-    fracs  /= fracs.sum()
+    # Per-planet softmax temperature: softplus keeps it positive, floor at 0.1
+    _x = act[:, 1]
+    temp = np.maximum(np.where(_x > 20.0, _x, np.log1p(np.exp(_x))), 0.1).reshape(-1, 1)
+
+    # Target distribution over all n planets including self.
+    # Self-weight = fraction of ships retained (not dispatched).
+    keys = act[:, 2:]
+    scaled  = (keys @ keys.T) / temp          # [n, n], row i scaled by temp[i]
+    shifted = scaled - scaled.max(axis=1, keepdims=True)
+    target_weights = np.exp(shifted)
+    target_weights /= target_weights.sum(axis=1, keepdims=True)   # [n, n], rows sum to 1
 
     moves = []
     for i in range(n):
-        pid, owner, px, py, radius, ships, _prod = planets_np[i, :7]
+        pid, owner, px, py, _radius, ships, _prod = planets_np[i, :7]
         if int(owner) != 0:
             continue
         if float(ships) < min_ships:
@@ -141,21 +151,28 @@ def decode_action(
         if float(act[i, 0]) <= 0.0:
             continue
 
-        frac      = min(1, float(fracs[i]))
-        num_ships = int(float(ships) * frac)
-        if num_ships < 1:
-            continue
+        for j in range(n):
+            if j == i:
+                continue  # self-weight → ships stay on planet, nothing to emit
+            num_ships = int(float(ships) * float(target_weights[i, j]))
+            if num_ships < min_ships:
+                continue
 
-        j = int(np.argmax(scores[i]))
-        _tid, _t_owner, tx, ty, t_radius, _t_ships, _t_prod = planets_np[j, :7]
-
-        r = math.hypot(float(tx) - SUN_X, float(ty) - SUN_Y)
-        is_orbiting = (r + float(t_radius)) < 48.0
-        ix, iy, _ = solve_intercept(
-            float(px), float(py), float(tx), float(ty),
-            is_orbiting, omega, int(num_ships),
-        )
-        angle = safe_angle(float(px), float(py), ix, iy)
-        moves.append([int(pid), angle, num_ships])
+            _tid, _t_owner, tx, ty, t_radius, _t_ships, _t_prod = planets_np[j, :7]
+            r = math.hypot(float(tx) - SUN_X, float(ty) - SUN_Y)
+            is_orbiting = (r + float(t_radius)) < 50.0
+            ix, iy, _, valid_path = solve_intercept(
+                float(px), float(py), float(tx), float(ty),
+                is_orbiting, omega, int(num_ships),
+            )
+            if not valid_path:
+                ix, iy, _ = solve_intercept_at_all_costs(
+                    float(px), float(py), float(tx), float(ty),
+                    is_orbiting, omega, int(num_ships), t_radius,
+                )
+            angle = safe_angle(float(px), float(py), ix, iy, t_radius)
+            if angle is None:
+                continue
+            moves.append([int(pid), angle, num_ships])
 
     return moves
