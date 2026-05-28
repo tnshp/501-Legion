@@ -39,16 +39,15 @@ class Encoder:
         return planets_mapping
     
     def _pad_array(self, arr, max_size):
-        current_size = arr.shape[0]
+        current_size = min(arr.shape[0], max_size)
         feature_dim = arr.shape[1]
-        
+
         padded_arr = np.zeros((max_size, feature_dim))
         mask = np.zeros(max_size)
-        
-        # Copy real data
-        padded_arr[:current_size] = arr
+
+        padded_arr[:current_size] = arr[:current_size]
         mask[:current_size] = 1
-        
+
         return padded_arr, mask
 
     def encode(self, planets, fleets, initial_planets, angular_velocity, comet_planet_ids, time_step, apply_padding=True):
