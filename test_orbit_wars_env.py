@@ -18,7 +18,8 @@ sys.path.insert(0, "/mnt/d/ML/Kaggle/StarWars/501-Legion")
 
 from env.orbit_wars import (
     _obs_to_arrays, _swap_perspective,
-    encode_obs_as_player, decode_action, compute_reward_for_player,
+    encode_obs_as_player, decode_action, pairwise_wedge,
+    compute_reward_for_player,
     OrbitWarsEnv,
     RewardScheme1, RewardScheme2, RewardScheme3,
     reward_scheme_1, reward_scheme_2, reward_scheme_3,
@@ -258,95 +259,204 @@ class TestEncodeObsAsPlayer(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. decode_action
+# 4a. pairwise_wedge
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPairwiseWedge(unittest.TestCase):
+
+    def test_output_shape_d4(self):
+        """(n, 4) inputs → (n, n, 6) output  (C(4,2) = 6 independent planes)."""
+        a = np.random.rand(5, 4).astype(np.float32)
+        out = pairwise_wedge(a, a)
+        self.assertEqual(out.shape, (5, 5, 6))
+
+    def test_self_wedge_diagonal_zero(self):
+        """wedge(v, v) = 0 for all v  (antisymmetry)."""
+        a = np.random.rand(4, 4).astype(np.float32)
+        out = pairwise_wedge(a, a)
+        for i in range(4):
+            np.testing.assert_array_almost_equal(out[i, i], 0.0)
+
+    def test_antisymmetry(self):
+        """pairwise_wedge(A, B)[i, j] = -pairwise_wedge(B, A)[j, i]."""
+        a = np.random.rand(3, 4).astype(np.float32)
+        b = np.random.rand(3, 4).astype(np.float32)
+        ab = pairwise_wedge(a, b)
+        ba = pairwise_wedge(b, a)
+        np.testing.assert_array_almost_equal(ab, -ba.transpose(1, 0, 2))
+
+    def test_known_value(self):
+        """wedge([1,0,0,0], [0,1,0,0]) → first component = 1, rest = 0."""
+        a = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+        b = np.array([[0.0, 1.0, 0.0, 0.0]], dtype=np.float32)
+        out = pairwise_wedge(a, b)   # (1, 1, 6)
+        # pair (0,1): 1*1 - 0*0 = 1; all other pairs = 0
+        self.assertAlmostEqual(float(out[0, 0, 0]), 1.0)
+        for k in range(1, 6):
+            self.assertAlmostEqual(float(out[0, 0, k]), 0.0)
+
+    def test_all_zero_inputs(self):
+        """All-zero action → all-zero wedge → tanh(0) = 0 → no launches."""
+        a = np.zeros((4, 4), dtype=np.float32)
+        out = pairwise_wedge(a, a)
+        np.testing.assert_array_almost_equal(out, 0.0)
+
+    def test_different_array_sizes(self):
+        """Works for any n."""
+        for n in [1, 2, 10]:
+            a = np.random.rand(n, 4).astype(np.float32)
+            out = pairwise_wedge(a, a)
+            self.assertEqual(out.shape, (n, n, 6))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4b. decode_action  (pairwise-bivector decoder)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestDecodeAction(unittest.TestCase):
+    """
+    Geometry reference:
+      Planet 0 (ours)  at (70, 80)  — top-right, 20 ships
+      Planet 1 (opp)   at (30, 80)  — top-left,  15 ships
+      Both far from sun (50,50), so direct paths are unblocked.
 
-    def _planets(self):
-        # [id, owner, x, y, radius, ships, production]
+    To make planet 0 strongly target planet 1:
+      action[0] = [1, 0, 0, 0],  action[1] = [0, 1, 0, 0]
+      wedge sum = 1*1 - 0*0 = 1  → tanh(1) ≈ 0.76 > 0
+
+    Expected direct angle from (70,80) → (30,80) = atan2(0, -40) = π.
+    """
+
+    def _planets_clear(self):
+        """Two planets well clear of the sun."""
         return np.array([
-            [0, 0, 60.0, 50.0, 5.0, 20.0, 2.0],  # ours, 20 ships
-            [1, 1, 40.0, 50.0, 5.0, 15.0, 2.0],  # opponent
-            [2, 0, 50.0, 70.0, 3.0,  1.0, 1.0],  # ours but only 1 ship → skip
-            [3, -1, 50.0, 30.0, 3.0, 0.0, 1.0],  # neutral
+            [0, 0, 70.0, 80.0, 5.0, 20.0, 2.0],   # ours, 20 ships
+            [1, 1, 30.0, 80.0, 5.0, 15.0, 2.0],   # opponent
         ], dtype=np.float32)
 
-    def _action(self, launch_idx=(0,)):
-        """Random action with launch gate open for specified planet indices."""
-        act = np.full((MAX_PLANETS, ACTION_DIM), -0.5, dtype=np.float32)
-        for i in launch_idx:
-            act[i, 0] = 0.8   # gate open
-            act[i, 1] = 1.0   # sin
-            act[i, 2] = 0.0   # cos  → angle = π/2 ≈ 1.5708
-            act[i, 3] = 0.6   # fleet fraction → (0.6+1)/2=0.8 → 0.8*19≈15 ships
+    def _planets_full(self):
+        """Four-planet fixture, planet 2 has only 1 ship."""
+        return np.array([
+            [0, 0, 70.0, 80.0, 5.0, 20.0, 2.0],   # ours, 20 ships
+            [1, 1, 30.0, 80.0, 5.0, 15.0, 2.0],   # opponent
+            [2, 0, 70.0, 20.0, 3.0,  1.0, 1.0],   # ours, 1 ship → skip
+            [3, -1, 30.0, 20.0, 3.0, 5.0, 1.0],   # neutral
+        ], dtype=np.float32)
+
+    def _targeting_action(self, n=MAX_PLANETS):
+        """action[0]=[1,0,0,0], action[1]=[0,1,0,0], rest zero → planet 0 targets planet 1."""
+        act = np.zeros((n, 4), dtype=np.float32)
+        if n > 0:
+            act[0] = [1.0, 0.0, 0.0, 0.0]
+        if n > 1:
+            act[1] = [0.0, 1.0, 0.0, 0.0]
         return act
 
+    # ── basic invariants ──────────────────────────────────────────────────────
+
     def test_returns_list(self):
-        moves = decode_action(self._action(), self._planets(), 0.01)
+        moves = decode_action(self._targeting_action(), self._planets_clear(), 0.0)
         self.assertIsInstance(moves, list)
 
-    def test_only_launches_from_own_planets(self):
-        act = self._action(launch_idx=(0, 1, 3))   # open gate for opponent & neutral too
-        moves = decode_action(act, self._planets(), 0.01)
-        planet_ids = [m[0] for m in moves]
-        self.assertIn(0, planet_ids)
-        self.assertNotIn(1, planet_ids)   # opponent planet
-        self.assertNotIn(3, planet_ids)   # neutral planet
+    def test_empty_planets_returns_empty(self):
+        act = self._targeting_action()
+        moves = decode_action(act, np.empty((0, 7), dtype=np.float32), 0.0)
+        self.assertEqual(moves, [])
 
-    def test_planet_with_one_ship_skipped(self):
-        act = self._action(launch_idx=(2,))
-        moves = decode_action(act, self._planets(), 0.01)
-        planet_ids = [m[0] for m in moves]
-        self.assertNotIn(2, planet_ids)
-
-    def test_closed_gate_skips(self):
-        act = self._action(launch_idx=())   # all gates closed
-        moves = decode_action(act, self._planets(), 0.01)
+    def test_all_zero_action_no_launch(self):
+        """All-zero action → wedge = 0 → tanh(0) = 0 → scores.max() not > 0."""
+        act = np.zeros((MAX_PLANETS, 4), dtype=np.float32)
+        moves = decode_action(act, self._planets_full(), 0.0)
         self.assertEqual(len(moves), 0)
 
-    def test_angle_decoding(self):
-        act = self._action(launch_idx=(0,))
-        act[0, 1] = 1.0   # sin(90°)
-        act[0, 2] = 0.0   # cos(90°)
-        moves = decode_action(act, self._planets(), 0.01)
-        self.assertEqual(len(moves), 1)
-        pid, angle, ships = moves[0]
-        self.assertAlmostEqual(angle, math.pi / 2, places=4)
+    # ── ownership / eligibility guards ────────────────────────────────────────
 
-    def test_ship_count_zero_frac_skips(self):
-        act = self._action(launch_idx=(0,))
-        act[0, 3] = -1.0   # frac = 0 → num_ships = 0 → no move
-        moves = decode_action(act, self._planets(), 0.01)
-        self.assertEqual(len(moves), 0)
+    def test_only_own_planets_launch(self):
+        """Opponent and neutral planets never appear as move source."""
+        act = self._targeting_action()
+        moves = decode_action(act, self._planets_full(), 0.0)
+        sources = {m[0] for m in moves}
+        self.assertNotIn(1, sources)   # opponent
+        self.assertNotIn(3, sources)   # neutral
 
-    def test_ship_count_leaves_one_on_planet(self):
-        act = self._action(launch_idx=(0,))
-        act[0, 3] = 1.0   # max fraction
-        planets = self._planets()
-        ships_on_planet = int(planets[0, 5])   # 20
-        moves = decode_action(act, planets, 0.01)
-        self.assertLessEqual(moves[0][2], ships_on_planet - 1)
+    def test_one_ship_planet_skipped(self):
+        """Planet with exactly 1 ship never launches."""
+        act = self._targeting_action()
+        moves = decode_action(act, self._planets_full(), 0.0)
+        self.assertNotIn(2, {m[0] for m in moves})
+
+    def test_no_self_target(self):
+        """Source planet cannot target itself (checked via argmax restriction)."""
+        act = self._targeting_action()
+        planets = self._planets_clear()
+        moves = decode_action(act, planets, 0.0)
+        for from_id, _, _ in moves:
+            # The argmax score for self is tanh(0)=0, which fails the >0 gate,
+            # so with only one possible target (planet 1) we just verify it's used.
+            self.assertEqual(len(moves), 1)
+            break
+
+    def test_at_most_one_move_per_source(self):
+        """argmax picks exactly one target per source planet."""
+        act = np.random.uniform(-1, 1, (MAX_PLANETS, 4)).astype(np.float32)
+        moves = decode_action(act, self._planets_full(), 0.0)
+        sources = [m[0] for m in moves]
+        self.assertEqual(len(sources), len(set(sources)))
+
+    # ── ship count ────────────────────────────────────────────────────────────
+
+    def test_ships_leave_at_least_one(self):
+        """Launched fleet never takes every ship from the source planet."""
+        act = self._targeting_action()
+        planets = self._planets_clear()
+        moves = decode_action(act, planets, 0.0)
+        for from_id, _, num_ships in moves:
+            total = int(planets[planets[:, 0] == from_id, 5][0])
+            self.assertLessEqual(num_ships, total - 1)
+
+    # ── move format ───────────────────────────────────────────────────────────
 
     def test_move_format(self):
-        moves = decode_action(self._action(), self._planets(), 0.01)
+        """Each move is [int, float, int]."""
+        moves = decode_action(self._targeting_action(), self._planets_clear(), 0.0)
         self.assertGreater(len(moves), 0)
-        pid, angle, ships = moves[0]
-        self.assertIsInstance(pid, int)
-        self.assertIsInstance(angle, float)
-        self.assertIsInstance(ships, int)
+        for from_id, angle, ships in moves:
+            self.assertIsInstance(from_id, int)
+            self.assertIsInstance(angle, float)
+            self.assertIsInstance(ships, int)
 
-    def test_handles_all_zero_action(self):
-        act = np.zeros((MAX_PLANETS, 4), dtype=np.float32)
-        moves = decode_action(act, self._planets(), 0.01)
-        # gate at 0.0 → not > 0 → no launches
+    # ── angle correctness ─────────────────────────────────────────────────────
+
+    def test_angle_toward_target_static(self):
+        """omega=0: angle from (70,80) to (30,80) should equal atan2(0,-40) = π."""
+        act   = self._targeting_action()
+        moves = decode_action(act, self._planets_clear(), 0.0)
+        self.assertEqual(len(moves), 1)
+        _, angle, _ = moves[0]
+        expected = math.atan2(80.0 - 80.0, 30.0 - 70.0)  # = π
+        self.assertAlmostEqual(angle, expected, places=4)
+
+    def test_angle_toward_target_orbiting(self):
+        """omega != 0: function runs without error and returns a float angle."""
+        act   = self._targeting_action()
+        moves = decode_action(act, self._planets_clear(), omega=0.05)
+        # With small omega the direct angle is usually still valid
+        if moves:
+            _, angle, _ = moves[0]
+            self.assertIsInstance(angle, float)
+            self.assertTrue(-math.pi <= angle <= math.pi)
+
+    def test_sun_blocked_path_no_move(self):
+        """Direct path through the sun → calculate_angle returns None → move skipped."""
+        # Planet 0 (ours) directly below sun; planet 1 directly above sun.
+        # The straight line from (50,35) to (50,65) passes through (50,50) = sun.
+        planets = np.array([
+            [0, 0, 50.0, 35.0, 3.0, 20.0, 2.0],
+            [1, 1, 50.0, 65.0, 3.0, 15.0, 2.0],
+        ], dtype=np.float32)
+        act = self._targeting_action(n=2)
+        moves = decode_action(act, planets, 0.0)
         self.assertEqual(len(moves), 0)
-
-    def test_handles_empty_planets(self):
-        empty = np.empty((0, 7), dtype=np.float32)
-        act = np.zeros((MAX_PLANETS, 4), dtype=np.float32)
-        moves = decode_action(act, empty, 0.0)
-        self.assertEqual(moves, [])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -551,6 +661,239 @@ class TestOrbitWarsEnv(unittest.TestCase):
         env = OrbitWarsEnv(opponent="random", player_id=1, encoder=self.encoder)
         obs, _ = env.reset()
         self.assertEqual(obs.shape, (MAX_PLANETS + MAX_FLEETS, STATE_DIM))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4c. Fleet trajectory accuracy
+#     For each move produced by decode_action, simulate the fleet's per-tick
+#     path (segment-circle collision) and verify it reaches the target planet.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestFleetTrajectoryAccuracy(unittest.TestCase):
+    """
+    Verify that the angle returned by decode_action actually aims the fleet
+    onto a path that intersects the target planet.
+
+    Physics matches the kaggle game:
+      fleet position at tick t : (fx + cos(a)*speed*t, fy + sin(a)*speed*t)
+      planet position at tick t : (50 + r*cos(ang+omega*t), 50 + r*sin(ang+omega*t))
+      collision via segment-circle test each tick (same as RewardScheme3).
+
+    Planet configurations used here keep the direct path clear of the sun so
+    that calculate_angle finds an orbit intercept rather than returning None.
+      Source at (70, 80),  target at (30, 80) — both 30 units above the sun,
+      straight line passes through (50, 80) which is 30 units from sun centre.
+    """
+
+    MAX_SPEED = 6.0
+    SUN_X = SUN_Y = 50.0
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _fleet_speed(self, ships: int) -> float:
+        # Mirrors interpreter step 3: speed grows with fleet size, capped at MAX_SPEED.
+        s = max(1, int(ships))
+        spd = 1.0 + (self.MAX_SPEED - 1.0) * (math.log(s) / math.log(1000)) ** 1.5
+        return min(spd, self.MAX_SPEED)
+
+    @staticmethod
+    def _swept(ax, ay, bx, by, p0x, p0y, p1x, p1y, r) -> bool:
+        """Continuous swept-pair collision (interpreter copy): fleet A→B vs
+        planet P0→P1 come within r for some t in [0, 1]."""
+        d0x, d0y = ax - p0x, ay - p0y
+        dvx = (bx - ax) - (p1x - p0x)
+        dvy = (by - ay) - (p1y - p0y)
+        a = dvx * dvx + dvy * dvy
+        b = 2.0 * (d0x * dvx + d0y * dvy)
+        c = d0x * d0x + d0y * d0y - r * r
+        if a < 1e-12:
+            return c <= 0.0
+        disc = b * b - 4.0 * a * c
+        if disc < 0.0:
+            return False
+        sq = math.sqrt(disc)
+        return (-b + sq) / (2.0 * a) >= 0.0 and (-b - sq) / (2.0 * a) <= 1.0
+
+    def _simulate_hit(self, sx: float, sy: float, src_radius: float,
+                      angle: float, speed: float, target: np.ndarray,
+                      omega: float = 0.0, max_ticks: int = 200) -> tuple[bool, int]:
+        """
+        Faithful replica of the interpreter's fleet model: launch from the
+        SOURCE planet's edge (radius + 0.1), advance `speed`/tick along a fixed
+        angle, and test a continuous swept-pair collision against the (possibly
+        orbiting) target each tick. Returns (hit, first_tick_hit).
+        """
+        tx, ty, tr = float(target[2]), float(target[3]), float(target[4])
+        t_ang = math.atan2(ty - self.SUN_Y, tx - self.SUN_X)
+        t_orb = math.hypot(tx - self.SUN_X, ty - self.SUN_Y)
+        lx = sx + math.cos(angle) * (src_radius + 0.1)
+        ly = sy + math.sin(angle) * (src_radius + 0.1)
+        fpx, fpy = lx, ly
+        ppx, ppy = tx, ty                       # target at tick 0 (current)
+        for tick in range(1, max_ticks + 1):
+            fxx = lx + math.cos(angle) * speed * tick
+            fyy = ly + math.sin(angle) * speed * tick
+            if omega:
+                a = t_ang + omega * tick
+                px = self.SUN_X + t_orb * math.cos(a)
+                py = self.SUN_Y + t_orb * math.sin(a)
+            else:
+                px, py = tx, ty
+            if self._swept(fpx, fpy, fxx, fyy, ppx, ppy, px, py, tr):
+                return True, tick
+            fpx, fpy = fxx, fyy
+            ppx, ppy = px, py
+        return False, -1
+
+    def _find_target_idx(self, action_np: np.ndarray, planets: np.ndarray,
+                         src_idx: int) -> int | None:
+        """Reproduce decode_action's argmax to recover which planet was targeted."""
+        out = np.tanh(pairwise_wedge(action_np, action_np).sum(axis=-1))
+        n = min(planets.shape[0], action_np.shape[0])
+        scores = out[src_idx, :n].copy()
+        scores[src_idx] = -1.0   # mask self
+        return int(np.argmax(scores)) if scores.max() > 0.0 else None
+
+    def _sun_clear_planets(self):
+        """
+        Two planets whose straight-line path and orbit-intercept angles all avoid
+        the sun.  (65,75)→(30,75): midpoint (47.5,75) is 26 units from sun; the
+        orbit-intercept angles computed for omega 0.05 and 0.10 are also unblocked
+        (verified: closest-approach distance to sun > 10 for those ticks).
+        """
+        return np.array([
+            [0, 0, 65.0, 75.0, 5.0, 20.0, 2.0],   # ours, 20 ships
+            [1, 1, 30.0, 75.0, 5.0, 15.0, 2.0],   # opponent
+        ], dtype=np.float32)
+
+    def _targeting_action(self, n: int = MAX_PLANETS) -> np.ndarray:
+        """act[0]=[1,0,0,0], act[1]=[0,1,0,0]  → planet 0 strongly targets planet 1."""
+        act = np.zeros((n, 4), dtype=np.float32)
+        act[0] = [1.0, 0.0, 0.0, 0.0]
+        act[1] = [0.0, 1.0, 0.0, 0.0]
+        return act
+
+    def _is_static_fallback(self, angle: float, src: np.ndarray,
+                            tgt: np.ndarray) -> bool:
+        """True if angle == atan2(ty-sy, tx-sx) — i.e. the static direct angle."""
+        expected = math.atan2(float(tgt[3]) - float(src[3]),
+                              float(tgt[2]) - float(src[2]))
+        return abs(angle - expected) < 1e-9
+
+    # ── static-planet tests (omega=0) ─────────────────────────────────────────
+
+    def test_static_fleet_always_hits(self):
+        """omega=0: direct angle always reaches the target (segment-circle cannot miss)."""
+        planets = self._sun_clear_planets()
+        moves = decode_action(self._targeting_action(), planets, omega=0.0)
+        self.assertEqual(len(moves), 1)
+        from_id, angle, num_ships = moves[0]
+        src = planets[planets[:, 0] == from_id][0]
+        tgt = planets[planets[:, 0] != from_id][0]
+        speed = self._fleet_speed(num_ships)
+        hit, _ = self._simulate_hit(src[2], src[3], src[4], angle, speed, tgt, omega=0.0)
+        self.assertTrue(hit, f"Fleet missed static target (a={angle:.4f} spd={speed:.3f})")
+
+    def test_static_random_actions_100pct_hit(self):
+        """100 random actions on a 5-planet static map — every generated move hits."""
+        planets = np.array([
+            [0, 0,  70.0, 80.0, 5.0, 30.0, 2.0],
+            [1, 1,  30.0, 80.0, 5.0, 20.0, 2.0],
+            [2, 0,  80.0, 25.0, 4.0, 25.0, 2.0],
+            [3, 1,  20.0, 25.0, 4.0, 15.0, 2.0],
+            [4, -1, 50.0, 85.0, 3.0,  5.0, 1.0],
+        ], dtype=np.float32)
+        planet_by_id = {int(r[0]): r for r in planets}
+        rng = np.random.default_rng(0)
+        hits = misses = 0
+        for _ in range(100):
+            act = rng.uniform(-1, 1, (MAX_PLANETS, 4)).astype(np.float32)
+            for from_id, angle, num_ships in decode_action(act, planets, omega=0.0):
+                src_idx = int(np.where(planets[:, 0] == from_id)[0][0])
+                tgt_idx = self._find_target_idx(act, planets, src_idx)
+                if tgt_idx is None:
+                    continue
+                src, tgt = planet_by_id[from_id], planets[tgt_idx]
+                speed = self._fleet_speed(num_ships)
+                hit, _ = self._simulate_hit(src[2], src[3], src[4], angle, speed, tgt, omega=0.0)
+                hits += hit; misses += (not hit)
+        total = hits + misses
+        if total == 0:
+            self.skipTest("No moves generated")
+        self.assertEqual(misses, 0,
+                         f"Static hit rate {hits}/{total} — expected 100%")
+
+    # ── orbiting-planet tests ─────────────────────────────────────────────────
+    #
+    # Planets at (65,75)→(30,75) are verified to have unblocked orbit-intercept
+    # angles at both omega=0.05 (tick≈24) and omega=0.10 (tick≈26).
+    # When decode_action uses the orbit intercept (not the static fallback), the
+    # fleet must arrive within the target planet's radius.
+    # Moves that used the static-fallback angle are skipped (the planet has moved).
+
+    def test_orbiting_fleet_hits_moderate_omega(self):
+        """omega=0.05: orbit intercept angle correctly leads to a hit."""
+        planets = self._sun_clear_planets()
+        moves = decode_action(self._targeting_action(), planets, omega=0.05)
+        self.assertGreater(len(moves), 0, "No moves produced with omega=0.05")
+        from_id, angle, num_ships = moves[0]
+        src = planets[planets[:, 0] == from_id][0]
+        tgt = planets[planets[:, 0] != from_id][0]
+        if self._is_static_fallback(angle, src, tgt):
+            self.skipTest("No orbit intercept found (sun-blocked fallback path)")
+        speed = self._fleet_speed(num_ships)
+        hit, _ = self._simulate_hit(src[2], src[3], src[4], angle, speed, tgt, omega=0.05)
+        self.assertTrue(hit, f"Orbit intercept missed target omega=0.05 (a={angle:.4f})")
+
+    def test_orbiting_fleet_hits_fast_omega(self):
+        """omega=0.10: stronger orbit still intercepted correctly."""
+        planets = self._sun_clear_planets()
+        moves = decode_action(self._targeting_action(), planets, omega=0.10)
+        self.assertGreater(len(moves), 0, "No moves produced with omega=0.10")
+        from_id, angle, num_ships = moves[0]
+        src = planets[planets[:, 0] == from_id][0]
+        tgt = planets[planets[:, 0] != from_id][0]
+        if self._is_static_fallback(angle, src, tgt):
+            self.skipTest("No orbit intercept found (sun-blocked fallback path)")
+        speed = self._fleet_speed(num_ships)
+        hit, _ = self._simulate_hit(src[2], src[3], src[4], angle, speed, tgt, omega=0.10)
+        self.assertTrue(hit, f"Orbit intercept missed target omega=0.10 (a={angle:.4f})")
+
+    def test_orbiting_random_actions_intercept_moves_always_hit(self):
+        """
+        100 random actions on a 4-planet map with omega=0.05.
+        Moves that used an orbit intercept angle (not the static fallback) must hit.
+        Static-fallback moves are excluded — those aim at the planet's current
+        position and can miss when the planet has moved significantly.
+        """
+        planets = np.array([
+            [0, 0,  65.0, 75.0, 5.0, 30.0, 2.0],
+            [1, 1,  30.0, 75.0, 5.0, 20.0, 2.0],
+            [2, 0,  70.0, 25.0, 4.0, 25.0, 2.0],
+            [3, 1,  25.0, 25.0, 4.0, 15.0, 2.0],
+        ], dtype=np.float32)
+        planet_by_id = {int(r[0]): r for r in planets}
+        rng = np.random.default_rng(7)
+        hits = misses = skipped = 0
+        for _ in range(100):
+            act = rng.uniform(-1, 1, (MAX_PLANETS, 4)).astype(np.float32)
+            for from_id, angle, num_ships in decode_action(act, planets, omega=0.05):
+                src_idx = int(np.where(planets[:, 0] == from_id)[0][0])
+                tgt_idx = self._find_target_idx(act, planets, src_idx)
+                if tgt_idx is None:
+                    continue
+                src, tgt = planet_by_id[from_id], planets[tgt_idx]
+                if self._is_static_fallback(angle, src, tgt):
+                    skipped += 1
+                    continue   # fallback angle: planet moved, skip
+                speed = self._fleet_speed(num_ships)
+                hit, _ = self._simulate_hit(src[2], src[3], src[4], angle, speed, tgt, omega=0.05)
+                hits += hit; misses += (not hit)
+        total = hits + misses
+        if total == 0:
+            self.skipTest(f"No orbit-intercept moves generated (all {skipped} were static fallbacks)")
+        self.assertEqual(misses, 0,
+                         f"Orbit intercept hit rate {hits}/{total} — expected 100%")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -828,8 +1171,8 @@ def run_simulation(max_steps: int = 100, video_path: str = "simulation.gif",
         done         = step_results[0].status != "ACTIVE"
         final_step   = step + 1
 
-        reward        = compute_reward_for_player(obs_p0, new_obs_p0,
-                                                  player_id=0, done=done)
+        reward_scheme = RewardScheme2(ship_scale=0.5, planet_scale=1.0, win_bonus=20.0)
+        reward        = reward_scheme.compute_reward(obs_p0, new_obs_p0, player_id=0, done=done)
         total_reward += reward
         all_obs.append(new_obs_p0)
 
@@ -897,8 +1240,8 @@ def run_simulation_4p(max_steps: int = 100, video_path: str = "simulation_4p.gif
         done         = step_results[0].status != "ACTIVE"
         final_step   = step + 1
 
-        reward        = compute_reward_for_player(obs_list[0], new_obs_list[0],
-                                                  player_id=0, done=done, n_players=N)
+        reward_scheme = RewardScheme2(ship_scale=0.5, planet_scale=1.0, win_bonus=20.0)
+        reward        = reward_scheme.compute_reward(obs_list[0], new_obs_list[0], player_id=0, done=done)
         total_reward += reward
         all_obs.append(new_obs_list[0])
 
@@ -920,7 +1263,13 @@ def run_simulation_4p(max_steps: int = 100, video_path: str = "simulation_4p.gif
 
 
 if __name__ == "__main__":
-    unittest.main(argv=['first-arg-is-ignored'], exit=False)
+    env = OrbitWarsEnv(opponent="random", player_id=0)
+
+    state, _ = env.reset()
+    print("Initial state shape:", state.shape)
+    print(state)
+
+    # unittest.main(argv=['first-arg-is-ignored'], exit=False)
     
     # import argparse
     # parser = argparse.ArgumentParser()

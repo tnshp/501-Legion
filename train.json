@@ -1,0 +1,57 @@
+{
+  "model": {
+    "d_model": 128,
+    "num_layers": 2,
+    "num_heads": 4,
+    "ff_dim": 512,
+    "dropout": 0.1
+  },
+  "training": {
+    "num_episodes": 250,
+    "warmup_steps": 500,
+    "batch_size": 64,
+    "buffer_size": 100000,
+    "update_freq": 4,
+    "gradient_steps": 1,
+    "lr": 3e-4,
+    "gamma": 0.99,
+    "tau": 5e-3,
+    "alpha": 0.2,
+    "auto_alpha": false,
+    "target_entropy": null,
+    "max_steps": 500
+  },
+  "environment": {
+    "opponent": "rule_based",
+    "n_players_default": 2,
+    "ratio_4p": 0.3,
+    "mixed_send_prob": 0.3
+  },
+  "curriculum": {
+    "mixed_random_ratio_start": 1.0,
+    "mixed_random_ratio_end": 0.0,
+    "mixed_random_ratio_decay": null
+  },
+  "reward": [
+    {
+      "scheme": "RewardScheme4",
+      "ship_scale": 0.5,
+      "planet_scale": 1.0,
+      "win_bonus": 1000
+    }
+  ],
+  "io": {
+    "log_dir": null,
+    "ckpt_dir": "checkpoints",
+    "render_dir": "replays",
+    "render_interval": 10,
+    "save_interval": 100,
+    "log_interval": 1
+  },
+  "execution": {
+    "device": "auto",
+    "cpu_force": false,
+    "seed": null,
+    "resume": null
+  }
+}

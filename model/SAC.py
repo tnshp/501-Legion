@@ -422,6 +422,7 @@ class P_network(nn.Module):
             - sigma.log()
             - 0.5 * math.log(2.0 * math.pi)
         ).sum(dim=(-2, -1), keepdim=True).squeeze(-1)  # [B, 1]
+        
         return action, log_prob
     
 class ActionDecoder(nn.Module):

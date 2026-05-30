@@ -5,14 +5,15 @@ Observation space : Box(shape=(MAX_PLANETS + MAX_FLEETS, STATE_DIM), float32)
 Action space      : Box(shape=(MAX_PLANETS, ACTION_DIM), float32)  in [-1, 1]
 
 Per-planet action encoding  (ACTION_DIM = 4)
-    col 0 : launch gate     (> 0 → launch from this planet)
-    col 1 : sin θ           ┐ angle vector → θ = atan2(col1, col2) [radians]
-    col 2 : cos θ           ┘
-    col 3 : fleet fraction  [-1, 1] → mapped to (0, 1) of available ships
+    Each row is a 4-dim vector in [-1, 1].  Pairwise wedge products between
+    rows form an (n, n) attention score matrix that selects a target planet
+    and fleet fraction for each owned source planet (see decode_action /
+    pairwise_wedge).
 
 Helper functions (imported by the self-play trainer)
     encode_obs_as_player
     decode_action
+    pairwise_wedge
     compute_reward_for_player
     _obs_to_arrays
     _swap_perspective
@@ -178,49 +179,247 @@ def encode_obs_as_player(encoder, obs, initial_planets: np.ndarray,
 # Action decoding
 # ─────────────────────────────────────────────────────────────────────────────
 
-def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float) -> list:
+def pairwise_wedge(U: np.ndarray, V: np.ndarray) -> np.ndarray:
     """
-    Convert policy output to a list of kaggle orbit_wars moves.
+    Pairwise wedge (exterior) products between rows of U and V.
+
+    For every pair (i, j) this computes the antisymmetric bivector
+        wedge(U[i], V[j])[p,q] = U[i,p]*V[j,q] - U[i,q]*V[j,p]
+    and returns the upper-triangle independent components.
 
     Parameters
     ----------
-    action_np : [n_planets, 4]  tanh-squashed, values in [-1, 1]
-                  [0] launch gate  (> 0 → launch)
-                  [1] sin θ  ┐ heading θ = atan2([1],[2]) radians
-                  [2] cos θ  ┘
-                  [3] fleet fraction ([-1,1] → [0,1]) → num_ships = int(frac * ships)
-    planets   : [n, 7]  swapped planet array [id, owner, x, y, radius, ships, production]
-                Already in player-0 perspective (owner==0 means our planet).
-    omega     : float — angular velocity (unused in decoding, kept for API symmetry)
+    U, V : (n, d) — action matrices (d=ACTION_DIM=4)
+
+    Returns
+    -------
+    (n, n, d*(d-1)//2) — for d=4 the last axis has 6 independent components
+    """
+    n, d = U.shape
+    # outer_UV[i,j,p,q] = U[i,p] * V[j,q]
+    outer_UV = U[:, np.newaxis, :, np.newaxis] * V[np.newaxis, :, np.newaxis, :]
+    # outer_VU[i,j,p,q] = V[j,p] * U[i,q]  — note j indexes V, i indexes U
+    outer_VU = V[np.newaxis, :, :, np.newaxis] * U[:, np.newaxis, np.newaxis, :]
+    wedge_matrices = outer_UV - outer_VU          # antisymmetric (n, n, d, d)
+    row_idx, col_idx = np.triu_indices(d, k=1)   # upper-triangle pairs
+    return wedge_matrices[:, :, row_idx, col_idx] # (n, n, C(d,2))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fleet-physics helpers — exact copies of the kaggle interpreter's model so the
+# launch-angle search is verified against the same collision maths the engine
+# uses (kaggle_environments/envs/orbit_wars/orbit_wars.py: steps 0–4).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BOARD_SIZE            = 100.0
+_CENTER                = 50.0
+_SUN_RADIUS            = 10.0
+_ROTATION_RADIUS_LIMIT = 50.0
+_MAX_SHIP_SPEED        = 6.0
+_INTERCEPT_TICKS       = 60     # lead-prediction horizon (matches agent1.py)
+
+
+def _fleet_speed(ships: int) -> float:
+    """Board-units travelled per tick by a fleet of `ships` (interpreter step 3)."""
+    s = max(1, int(ships))
+    speed = 1.0 + (_MAX_SHIP_SPEED - 1.0) * (math.log(s) / math.log(1000)) ** 1.5
+    return min(speed, _MAX_SHIP_SPEED)
+
+
+def _point_to_segment_distance(p, v, w) -> float:
+    """Minimum distance from point p to segment v–w (interpreter copy)."""
+    l2 = (v[0] - w[0]) ** 2 + (v[1] - w[1]) ** 2
+    if l2 == 0.0:
+        return math.hypot(p[0] - v[0], p[1] - v[1])
+    t = max(0.0, min(1.0,
+            ((p[0] - v[0]) * (w[0] - v[0]) + (p[1] - v[1]) * (w[1] - v[1])) / l2))
+    proj_x = v[0] + t * (w[0] - v[0])
+    proj_y = v[1] + t * (w[1] - v[1])
+    return math.hypot(p[0] - proj_x, p[1] - proj_y)
+
+
+def _swept_pair_hit(A, B, P0, P1, r) -> bool:
+    """True iff a fleet moving A→B and a planet moving P0→P1 come within r for
+    some t in [0, 1] (interpreter copy — continuous swept-pair collision)."""
+    d0x, d0y = A[0] - P0[0], A[1] - P0[1]
+    dvx = (B[0] - A[0]) - (P1[0] - P0[0])
+    dvy = (B[1] - A[1]) - (P1[1] - P0[1])
+    a = dvx * dvx + dvy * dvy
+    b = 2.0 * (d0x * dvx + d0y * dvy)
+    c = d0x * d0x + d0y * d0y - r * r
+    if a < 1e-12:
+        return c <= 0.0
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        return False
+    sq = math.sqrt(disc)
+    t1 = (-b - sq) / (2.0 * a)
+    t2 = (-b + sq) / (2.0 * a)
+    return t2 >= 0.0 and t1 <= 1.0
+
+
+def compute_launch_angle(planet_by_id: dict, omega: float,
+                         from_planet_id: int, to_planet_id: int,
+                         num_ships: int) -> float | None:
+    """
+    Lead-intercept launch angle that mirrors the interpreter's fleet model.
+
+    The engine launches a fleet from the SOURCE planet's edge (radius + 0.1
+    outward), advances it `speed` units/tick along a FIXED angle, and scores a
+    capture via a continuous swept collision against the TARGET planet's
+    (possibly orbiting) position.  We therefore (1) predict the target's
+    position at each future tick, (2) aim straight at that lead point, and
+    (3) verify the straight-line flight actually connects under the exact
+    swept-collision model — also rejecting paths that hit the sun or leave the
+    board.  Returns None when no tick yields a verified hit, so the caller
+    skips firing instead of launching a fleet that is sure to miss.
+
+    Parameters
+    ----------
+    planet_by_id : {int planet_id: row[id, owner, x, y, radius, ships, prod]}
+    omega        : float — system angular velocity (rad/tick)
+    from_planet_id, to_planet_id : int
+    num_ships    : int — fleet size (sets the speed)
+    """
+    if from_planet_id not in planet_by_id or to_planet_id not in planet_by_id:
+        return None
+    m_row = planet_by_id[from_planet_id]
+    t_row = planet_by_id[to_planet_id]
+    mx, my, mr = float(m_row[2]), float(m_row[3]), float(m_row[4])
+    tx, ty, tr = float(t_row[2]), float(t_row[3]), float(t_row[4])
+    speed = _fleet_speed(num_ships)
+
+    # A planet orbits only when orbital_radius + radius < ROTATION_RADIUS_LIMIT;
+    # otherwise it is static even though the system's omega is non-zero.
+    def _kin(row):
+        px, py, pr = float(row[2]), float(row[3]), float(row[4])
+        orb = math.hypot(px - _CENTER, py - _CENTER)
+        return (px, py, pr, orb, math.atan2(py - _CENTER, px - _CENTER),
+                (omega != 0.0) and (orb + pr < _ROTATION_RADIUS_LIMIT))
+
+    # Kinematics for every planet, in observation order — the engine awards a
+    # collision to the FIRST planet a fleet's path crosses, so an intervening
+    # planet must veto the shot even if the lead angle is otherwise perfect.
+    kin = [(pid, _kin(row)) for pid, row in planet_by_id.items()]
+    _, _, _, t_orb, t_ang, moving = _kin(t_row)
+
+    def _pos_at(k, x, y, pr, orb, ang, mv):
+        if not mv:
+            return x, y
+        a = ang + omega * k
+        return _CENTER + orb * math.cos(a), _CENTER + orb * math.sin(a)
+
+    def target_at(tick: int):
+        if not moving:
+            return tx, ty
+        a = t_ang + omega * tick
+        return _CENTER + t_orb * math.cos(a), _CENTER + t_orb * math.sin(a)
+
+    def connects(angle: float, horizon: int) -> bool:
+        # Launch just outside the source planet; fixed-angle straight flight.
+        lx = mx + math.cos(angle) * (mr + 0.1)
+        ly = my + math.sin(angle) * (mr + 0.1)
+        fx_prev, fy_prev = lx, ly
+        prev = [(k[1][0], k[1][1]) for k in kin]   # every planet at tick 0 (now)
+        for step in range(1, horizon + 1):
+            fx = lx + math.cos(angle) * speed * step
+            fy = ly + math.sin(angle) * speed * step
+            # Planets first, in engine order — the first one hit wins the fleet.
+            for i, (pid, params) in enumerate(kin):
+                px, py = _pos_at(step, *params)
+                ppx, ppy = prev[i]
+                if _swept_pair_hit((fx_prev, fy_prev), (fx, fy),
+                                   (ppx, ppy), (px, py), params[2]):
+                    return pid == to_planet_id   # hit target → good; else blocked
+                prev[i] = (px, py)
+            if not (0.0 <= fx <= _BOARD_SIZE and 0.0 <= fy <= _BOARD_SIZE):
+                return False                    # flew off the board
+            if _point_to_segment_distance((_CENTER, _CENTER),
+                                          (fx_prev, fy_prev), (fx, fy)) < _SUN_RADIUS:
+                return False                    # consumed by the sun
+            fx_prev, fy_prev = fx, fy
+        return False
+
+    if moving:
+        # Lead the target: aim at its predicted position for each arrival tick.
+        # The radial bracket keeps the verified-candidate set small; connects()
+        # is the real arbiter of whether that angle actually lands a hit.
+        for k in range(1, _INTERCEPT_TICKS + 1):
+            px, py = target_at(k)
+            reach  = (mr + 0.1) + speed * k     # fleet's radial distance at tick k
+            if abs(reach - math.hypot(px - mx, py - my)) > tr + speed:
+                continue
+            angle = math.atan2(py - my, px - mx)
+            if connects(angle, _INTERCEPT_TICKS):
+                return angle
+        return None
+
+    # Static target: a direct shot always reaches it — only the sun can block.
+    angle   = math.atan2(ty - my, tx - mx)
+    dist    = math.hypot(tx - mx, ty - my)
+    horizon = min(600, int(dist / max(speed, 1e-6)) + 2)
+    return angle if connects(angle, horizon) else None
+
+
+def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float) -> list:
+    """
+    Convert policy output to kaggle orbit_wars moves via pairwise bivector attention.
+
+    Each planet's action row interacts with every other planet's row through a
+    wedge product.  The resulting (n, n) score matrix selects a target planet
+    and fleet fraction for each owned source planet.  `compute_launch_angle`
+    then aims the fleet accounting for the target planet's orbital motion.
+
+    Parameters
+    ----------
+    action_np : (MAX_PLANETS, 4) — policy output in [-1, 1]
+    planets   : (n, 7) — player-0-perspective array
+                [id, owner, x, y, radius, ships, production]
+    omega     : float — angular velocity of the planet system
 
     Returns
     -------
     moves : list of [planet_id (int), angle_radians (float), num_ships (int)]
     """
-    moves = []
-    n_planets = min(planets.shape[0], action_np.shape[0])
+    planet_by_id = {int(row[0]): row for row in planets}
+
+    # ── pairwise bivector attention ───────────────────────────────────────────
+    pairwise_bivectors = pairwise_wedge(action_np, action_np)
+    out = np.tanh(pairwise_bivectors.sum(axis=-1))   # (MAX_PLANETS, MAX_PLANETS)
+
+    owner_mask = planets[:, 1] == 0
+    n_planets  = min(planets.shape[0], action_np.shape[0])
+    moves      = []
 
     for i in range(n_planets):
-        planet_id = int(planets[i, 0])
-        owner     = int(planets[i, 1])
-        ships     = int(planets[i, 5])
-
-        if owner != 0 or ships <= 1:
+        if not owner_mask[i]:
+            continue
+        ships = int(planets[i, 5])
+        if ships <= 1:
             continue
 
-        act = action_np[i]
-
-        if act[0] <= 0.0:
+        scores = out[i, :n_planets]           # restrict to real planets
+        if scores.max() <= 0.0:
             continue
 
-        angle_rad = math.atan2(float(act[1]), float(act[2]))
-        frac      = (float(act[3]) + 1.0) * 0.5
+        idx            = int(np.argmax(scores))
+        from_planet_id = int(planets[i, 0])
+        to_planet_id   = int(planets[idx, 0])
+
+        if from_planet_id == to_planet_id:
+            continue
+
+        frac      = float(scores[idx])
         num_ships = min(int(frac * ships), ships - 1)
-
         if num_ships <= 0:
             continue
 
-        moves.append([planet_id, angle_rad, num_ships])
+        angle_rad = compute_launch_angle(
+            planet_by_id, omega, from_planet_id, to_planet_id, num_ships)
+        if angle_rad is None:
+            continue
+
+        moves.append([from_planet_id, angle_rad, num_ships])
 
     return moves
 
@@ -252,21 +451,28 @@ class RewardScheme1:
 
     def __call__(self, obs, new_obs, player_id: int, done: bool,
                  n_players: int = 2) -> float:
-        planets_old, _, _, _, _ = _obs_to_arrays(obs)
-        planets_new, _, _, _, _ = _obs_to_arrays(new_obs)
+        planets_old, fleets_old, _, _, _ = _obs_to_arrays(obs)
+        planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
 
         pid          = player_id
         opponent_ids = [p for p in range(n_players) if p != pid]
 
-        def _ships(p, owner):
-            mask = p[:, 1] == owner
-            return float(p[mask, 5].sum()) if mask.any() else 0.0
+        def _ships(p, f, owner):
+            # Count ships on planets AND in-transit fleets so fleet sends
+            # don't create spurious negative signals.
+            p_mask  = p[:, 1] == owner
+            p_ships = float(p[p_mask, 5].sum()) if p_mask.any() else 0.0
+            f_ships = 0.0
+            if f.shape[0] > 0:
+                f_mask  = f[:, 1] == owner
+                f_ships = float(f[f_mask, 6].sum()) if f_mask.any() else 0.0
+            return p_ships + f_ships
 
         def _count(p, owner):
             return int((p[:, 1] == owner).sum())
 
-        my_ships_δ   = _ships(planets_new, pid) - _ships(planets_old, pid)
-        opp_ships_δ  = sum(_ships(planets_new, o) - _ships(planets_old, o) for o in opponent_ids)
+        my_ships_δ   = _ships(planets_new, fleets_new, pid) - _ships(planets_old, fleets_old, pid)
+        opp_ships_δ  = sum(_ships(planets_new, fleets_new, o) - _ships(planets_old, fleets_old, o) for o in opponent_ids)
         ship_delta   = my_ships_δ - opp_ships_δ
 
         my_cnt_δ     = _count(planets_new, pid) - _count(planets_old, pid)
@@ -275,8 +481,8 @@ class RewardScheme1:
 
         terminal_bonus = 0.0
         if done:
-            my_ships_final = _ships(planets_new, pid)
-            best_opp       = max((_ships(planets_new, o) for o in opponent_ids), default=0.0)
+            my_ships_final = _ships(planets_new, fleets_new, pid)
+            best_opp       = max((_ships(planets_new, fleets_new, o) for o in opponent_ids), default=0.0)
             if best_opp < my_ships_final:
                 terminal_bonus =  self.win_bonus
             elif best_opp > my_ships_final:
@@ -303,26 +509,33 @@ class RewardScheme2:
 
     def __call__(self, obs, new_obs, player_id: int, done: bool,
                  n_players: int = 2) -> float:
-        planets_old, _, _, _, _ = _obs_to_arrays(obs)
-        planets_new, _, _, _, _ = _obs_to_arrays(new_obs)
+        planets_old, fleets_old, _, _, _ = _obs_to_arrays(obs)
+        planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
 
         pid          = player_id
         opponent_ids = [p for p in range(n_players) if p != pid]
 
-        def _ships(p, owner):
-            mask = p[:, 1] == owner
-            return float(p[mask, 5].sum()) if mask.any() else 0.0
+        def _ships(p, f, owner):
+            # Count ships on planets AND in-transit fleets so fleet sends
+            # don't create spurious negative signals.
+            p_mask  = p[:, 1] == owner
+            p_ships = float(p[p_mask, 5].sum()) if p_mask.any() else 0.0
+            f_ships = 0.0
+            if f.shape[0] > 0:
+                f_mask  = f[:, 1] == owner
+                f_ships = float(f[f_mask, 6].sum()) if f_mask.any() else 0.0
+            return p_ships + f_ships
 
         def _count(p, owner):
             return int((p[:, 1] == owner).sum())
 
-        my_ships_δ = _ships(planets_new, pid) - _ships(planets_old, pid)
+        my_ships_δ = _ships(planets_new, fleets_new, pid) - _ships(planets_old, fleets_old, pid)
         my_cnt_δ   = _count(planets_new, pid) - _count(planets_old, pid)
 
         terminal_bonus = 0.0
         if done:
-            my_ships_final = _ships(planets_new, pid)
-            best_opp       = max((_ships(planets_new, o) for o in opponent_ids), default=0.0)
+            my_ships_final = _ships(planets_new, fleets_new, pid)
+            best_opp       = max((_ships(planets_new, fleets_new, o) for o in opponent_ids), default=0.0)
             if best_opp < my_ships_final:
                 terminal_bonus =  self.win_bonus
             elif best_opp > my_ships_final:
@@ -333,18 +546,19 @@ class RewardScheme2:
 
 class RewardScheme3:
     """
-    Penalises fleets sent into open space (trajectory misses all planets).
+    Penalises the agent for sending fleets, discouraging spam.
 
-    For each new fleet (present in new_obs but not obs) owned by player_id,
-    the straight-line path is simulated tick-by-tick. Planet positions are
-    projected forward with orbital angular velocity. If no planet is hit within
-    max_ticks steps, -ship_scale * log(1 + ships_sent) is applied.
+    Each new fleet launched this step (present in new_obs but not in obs) that
+    is owned by player_id incurs a flat penalty of -ship_scale, regardless of
+    where the fleet is headed or how many ships it carries.
+
+    Total penalty = -ship_scale * num_new_fleets_sent
 
     Parameters
     ----------
-    ship_scale   : float, default 0.5 — penalty per log-unit of wasted ships
+    ship_scale   : float, default 0.5 — penalty per fleet launched
     planet_scale : float, default 1.0 — unused, kept for API symmetry
-    max_ticks    : int,   default 200 — trajectory simulation horizon
+    max_ticks    : int,   default 200 — unused, kept for API symmetry
     """
 
     def __init__(self, ship_scale: float = 0.5, planet_scale: float = 1.0,
@@ -355,82 +569,94 @@ class RewardScheme3:
 
     def __call__(self, obs, new_obs, player_id: int, done: bool,
                  n_players: int = 2) -> float:
-        SUN_X = SUN_Y = 50.0
-
-        _, fleets_old, _, _, _               = _obs_to_arrays(obs)
-        planets_new, fleets_new, _, omega, _ = _obs_to_arrays(new_obs)
+        _, fleets_old, _, _, _ = _obs_to_arrays(obs)
+        _, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
 
         if fleets_new.shape[0] == 0:
             return 0.0
 
         old_ids = {int(r[0]) for r in fleets_old} if fleets_old.shape[0] > 0 else set()
 
-        # Pre-compute per-planet orbital parameters once per call
-        p_base = []
-        for row in planets_new:
-            px, py, pr = float(row[2]), float(row[3]), float(row[4])
-            p_ang = math.atan2(py - SUN_Y, px - SUN_X)
-            p_orb = math.sqrt((px - SUN_X) ** 2 + (py - SUN_Y) ** 2)
-            p_base.append((px, py, p_ang, p_orb, pr))
+        num_new = sum(
+            1 for f in fleets_new
+            if int(f[0]) not in old_ids and int(f[1]) == player_id
+        )
 
-        penalty = 0.0
+        return -self.ship_scale * num_new
 
-        for f_row in fleets_new:
-            if int(f_row[0]) in old_ids or int(f_row[1]) != player_id:
-                continue
 
-            fx    = float(f_row[2])
-            fy    = float(f_row[3])
-            fang  = float(f_row[4])
-            fship = max(1, int(f_row[6]))
+class RewardScheme4:
+    """
+    State-based (absolute) reward — scores the player's CURRENT holdings each
+    step rather than the change since the previous step.
 
-            # Fleet speed (mirrors agents/agent1.py: get_fleet_speed)
-            speed = 1.0 + 5.0 * (math.log(fship) / math.log(1000)) ** 1.5
+    Unlike the delta schemes (1/2), this does NOT telescope over an episode:
+    Σ_t reward_t = Σ_t (ship_scale·ships_t + planet_scale·planets_t) + bonus,
+    so the episode total reflects *how much was held and for how long*.
+    Capturing and *holding* territory yields a sustained positive signal;
+    losing planets immediately lowers every subsequent step's reward.
 
-            hits           = False
-            prev_x, prev_y = fx, fy
+        ship_scale   × my_ships_now
+      + planet_scale × my_planet_count_now
+      ± win_bonus    (terminal, on win/loss)
 
-            for tick in range(1, self.max_ticks + 1):
-                nx = fx + math.cos(fang) * speed * tick
-                ny = fy + math.sin(fang) * speed * tick
+    Scaling note
+    ------------
+    my_ships grows into the hundreds/thousands via production, so keep
+    ship_scale small relative to planet_scale or the ship term dominates and
+    the agent is rewarded for hoarding ships rather than taking planets.
 
-                for px0, py0, p_ang, p_orb, pr in p_base:
-                    if omega != 0.0:
-                        pcx = SUN_X + p_orb * math.cos(p_ang + omega * tick)
-                        pcy = SUN_Y + p_orb * math.sin(p_ang + omega * tick)
-                    else:
-                        pcx, pcy = px0, py0
+    Parameters
+    ----------
+    ship_scale   : float, default 0.01
+    planet_scale : float, default 1.0
+    win_bonus    : float, default 100.0
+    """
 
-                    # Segment-circle collision (mirrors agents/agent1.py: collides)
-                    dx, dy = nx - prev_x, ny - prev_y
-                    ex, ey = pcx - prev_x, pcy - prev_y
-                    ssq = dx * dx + dy * dy
-                    if ssq == 0.0:
-                        if ex * ex + ey * ey <= pr * pr:
-                            hits = True
-                            break
-                    else:
-                        t = max(0.0, min(1.0, (ex * dx + ey * dy) / ssq))
-                        cx = prev_x + t * dx - pcx
-                        cy = prev_y + t * dy - pcy
-                        if cx * cx + cy * cy <= pr * pr:
-                            hits = True
-                            break
+    def __init__(self, ship_scale: float = 0.01, planet_scale: float = 1.0, win_bonus: float = 100.0):
+        self.ship_scale   = ship_scale
+        self.planet_scale = planet_scale
+        self.win_bonus     = win_bonus
 
-                if hits:
-                    break
-                prev_x, prev_y = nx, ny
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2) -> float:
+        # Only the post-step state matters for an absolute reward; obs unused.
+        planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
 
-            if not hits:
-                penalty -= self.ship_scale * math.log1p(fship)
+        pid          = player_id
+        opponent_ids = [p for p in range(n_players) if p != pid]
 
-        return penalty
+        def _ships(p, f, owner):
+            p_mask  = p[:, 1] == owner
+            p_ships = float(p[p_mask, 5].sum()) if p_mask.any() else 0.0
+            f_ships = 0.0
+            if f.shape[0] > 0:
+                f_mask  = f[:, 1] == owner
+                f_ships = float(f[f_mask, 6].sum()) if f_mask.any() else 0.0
+            return p_ships + f_ships
+
+        def _count(p, owner):
+            return int((p[:, 1] == owner).sum())
+
+        my_ships = _ships(planets_new, fleets_new, pid)
+        my_cnt   = _count(planets_new, pid)
+
+        terminal_bonus = 0.0
+        if done:
+            best_opp = max((_ships(planets_new, fleets_new, o) for o in opponent_ids), default=0.0)
+            if best_opp < my_ships:
+                terminal_bonus =  self.win_bonus
+            elif best_opp > my_ships:
+                terminal_bonus = -self.win_bonus
+
+        return float(self.ship_scale * my_ships + self.planet_scale * my_cnt + terminal_bonus)
 
 
 # ── Module-level default instances (backward compatibility) ──────────────────
 reward_scheme_1 = RewardScheme1()
 reward_scheme_2 = RewardScheme2()
 reward_scheme_3 = RewardScheme3()
+reward_scheme_4 = RewardScheme4()
 
 # Alias used by test_orbit_wars_env.py
 compute_reward_for_player = reward_scheme_1
@@ -547,6 +773,16 @@ class OrbitWarsEnv(gym.Env):
             self.player_id, time_step,
         )
 
+    def get_planet_counts(self) -> dict[int, int]:
+        """Return planet ownership counts: {player_id: count_owned_by_player}."""
+        if self._current_obs is None:
+            return {}
+        planets_np, _, _, _, _ = _obs_to_arrays(self._current_obs)
+        counts = {}
+        for pid in range(self.n_players):
+            counts[pid] = int((planets_np[:, 1] == pid).sum())
+        return counts
+
     # ── gymnasium API ─────────────────────────────────────────────────────────
 
     def reset(self, seed=None, options=None):
@@ -576,22 +812,33 @@ class OrbitWarsEnv(gym.Env):
     def step(self, action: np.ndarray):
         assert self._trainer is not None, "Call reset() before step()."
 
-        planets_np, _, _, omega, _ = _obs_to_arrays(self._current_obs)
+        planets_np, fleets_np, omega, _, comet_ids_np = _obs_to_arrays(self._current_obs)
         s_planets, _ = _swap_perspective(
             planets_np, _EMPTY_FLEETS.copy(), self.player_id
         )
         moves = decode_action(action, s_planets, omega)
+
+        # Snapshot pre-step state as plain numpy arrays.  The kaggle environment
+        # mutates obs0.planets / obs0.fleets in-place, so self._current_obs would
+        # otherwise silently reflect post-step values by the time reward is computed.
+        obs_pre = {
+            "planets":          planets_np,
+            "fleets":           fleets_np,
+            "angular_velocity": float(omega),
+            "comet_planet_ids": comet_ids_np,
+        }
 
         raw_obs, _kaggle_reward, done, info = self._trainer.step(moves)
         self._time_step += 1
 
         truncated  = self._time_step >= self.max_steps
         terminated = bool(done) and not truncated
+        won = _kaggle_reward
 
         reward = 0
         for r in self.reward_scheme:
             reward += r(
-                self._current_obs, raw_obs, self.player_id,
+                obs_pre, raw_obs, self.player_id,
                 done=terminated or truncated,
                 n_players=self.n_players,
             )
@@ -599,8 +846,7 @@ class OrbitWarsEnv(gym.Env):
         self._current_obs = raw_obs
         state = self._encode(raw_obs, self._time_step)
 
-        return state, reward, terminated, truncated, info or {}
-
+        return state, reward, terminated, truncated, won
     def render(self, mode: str = "human", html_path: str | None = None,
                width: int = 800, height: int = 600):
         if self._kaggle_env is None:
