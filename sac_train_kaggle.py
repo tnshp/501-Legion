@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_environments import make
 from model.SAC import P_network, Q_network, V_network, Encoder
-from env.training_loop import safe_angle, solve_intercept
+from env.aim_fns import safe_angle, solve_intercept
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants

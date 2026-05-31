@@ -32,7 +32,7 @@ except ImportError:
 
 from kaggle_environments import make as make_kaggle_env
 from model.SAC import P_network, Q_network, Encoder
-from env.dummy import (
+from env.env_utils import (
     encode_obs_as_player, decode_action, compute_reward_for_player,
     _obs_to_arrays, _swap_perspective,
     MAX_PLANETS, MAX_FLEETS, STATE_DIM, ACTION_DIM,

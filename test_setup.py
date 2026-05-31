@@ -14,7 +14,7 @@ print("=" * 80)
 # Test 1: Import environment
 print("\n1. Testing environment import...")
 try:
-    from env.dummy import MatrixEnv
+    from env.env_utils import MatrixEnv
     print("   ✓ MatrixEnv imported successfully")
     
     env = MatrixEnv(state_dim=14, action_dim=8, max_state=144, max_action=44)

@@ -1,0 +1,15 @@
+{
+    "num_episodes" :200 ,
+    "warmup_steps" :500 ,
+    "update_frequency" : 8 ,
+    "gradient_steps" : 2 ,
+    "log_interval" : 10 ,
+    "render_interval" : 10 ,
+    "checkpoint_interval" : 20 ,
+    "checkpoint_path" : "checkpoints",
+    "checkpoint_load_path" : "checkpoints/50sac_model_dual.pt",
+    "training_data_load_path" : "checkpoints/50sac_model_dual.json",
+    "rule_based_ratio" : 1.0,
+    "opponent_noise" : 0.1 ,
+    "prob_4p"  : 0.5
+}

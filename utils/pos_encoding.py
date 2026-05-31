@@ -1,7 +1,18 @@
-import torch 
-import torch.nn as nn
-import torch.nn.functional as F
+import torch
 import math
+
+# Cached per (half_dim, device) so the arange+exp is never recomputed across calls.
+_div_term_cache: dict = {}
+
+def _get_div_term(half_dim: int, device) -> torch.Tensor:
+    key = (half_dim, str(device))
+    if key not in _div_term_cache:
+        _div_term_cache[key] = torch.exp(
+            torch.arange(0, half_dim, device=device, dtype=torch.float32)
+            * (-math.log(10000.0) / max(half_dim, 1))
+        )
+    return _div_term_cache[key]
+
 
 def get_pos_encoding(pos, time_step, d_model):
     """
@@ -56,11 +67,6 @@ def get_pos_encoding(pos, time_step, d_model):
     d_t = d_model - d_x - d_y
 
     def sinusoidal_encoding(coord, dim):
-        """
-        coord: [N] or [B, N]
-        dim: output dimension
-        returns: [..., dim]
-        """
         if dim <= 0:
             if coord.ndim == 1:
                 return torch.empty(coord.shape[0], 0, device=device, dtype=dtype)
@@ -68,10 +74,7 @@ def get_pos_encoding(pos, time_step, d_model):
                 return torch.empty(coord.shape[0], coord.shape[1], 0, device=device, dtype=dtype)
 
         half_dim = dim // 2
-        div_term = torch.exp(
-            torch.arange(0, half_dim, device=device, dtype=torch.float32)
-            * (-math.log(10000.0) / max(half_dim, 1))
-        )
+        div_term = _get_div_term(half_dim, device)
 
         is_1d = coord.ndim == 1
         
