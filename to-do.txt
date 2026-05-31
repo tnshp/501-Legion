@@ -15,10 +15,16 @@
 
 
 #to-do
--add production multiplier to reward scheme 1 and 4 
+-add production multiplier to reward scheme 2 and 4 	x
+-add gradient clipping 					x			
+-add win/loss to replays 					
+-add exponential random mix ratio scheduler		x
+-early done - if agent is out early in 4p 		
+
+-verify whole flow (padding, zero mask? ,) 
+-check by adding angular velocity omega and fleet angle as a pos encoding ?
+-make tanh activation flatter 
 -Remove comets altogether
--early done - if agent is out early in 4p 
--make tanh activation more flatter 
--check by adding angular velocity omega as a pos encoding ?
+
 -add more rule agents 
  

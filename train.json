@@ -14,6 +14,7 @@
     "update_freq": 4,
     "gradient_steps": 1,
     "lr": 3e-4,
+    "grad_clip": 1.0,
     "gamma": 0.99,
     "tau": 5e-3,
     "alpha": 0.2,
@@ -30,7 +31,8 @@
   "curriculum": {
     "mixed_random_ratio_start": 1.0,
     "mixed_random_ratio_end": 0.0,
-    "mixed_random_ratio_decay": null
+    "mixed_random_ratio_decay": null,
+    "mixed_random_ratio_schedule": "linear"
   },
   "reward": [
     {

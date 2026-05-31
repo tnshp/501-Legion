@@ -149,16 +149,18 @@ class SACTrainer:
         target_entropy: Optional[float] = None,
         replay_buffer_size: int = 100_000,
         batch_size: int = 256,
+        max_grad_norm: Optional[float] = 1.0,
         state_preprocessor: Optional[Callable] = None,
         action_preprocessor: Optional[Callable] = None,
         action_postprocessor: Optional[Callable] = None,
         log_dir: Optional[str] = None,
     ):
-        self.env    = env
-        self.device = device
-        self.gamma  = gamma
-        self.tau    = tau
-        self.batch_size = batch_size
+        self.env           = env
+        self.device        = device
+        self.gamma         = gamma
+        self.tau           = tau
+        self.batch_size    = batch_size
+        self.max_grad_norm = max_grad_norm
 
         # ── VecEnv detection ──────────────────────────────────────────────────
         self.is_vec_env = hasattr(env, "num_envs")
@@ -294,19 +296,31 @@ class SACTrainer:
         # ── Q1 update ─────────────────────────────────────────────────────────
         q1_pred = self.q1_net(states, actions).unsqueeze(-1)
         q1_loss = nn.MSELoss()(q1_pred, q_target)
-        self.q1_optimizer.zero_grad(); q1_loss.backward(); self.q1_optimizer.step()
+        self.q1_optimizer.zero_grad()
+        q1_loss.backward()
+        if self.max_grad_norm is not None:
+            nn.utils.clip_grad_norm_(self.q1_net.parameters(), self.max_grad_norm)
+        self.q1_optimizer.step()
 
         # ── Q2 update ─────────────────────────────────────────────────────────
         q2_pred = self.q2_net(states, actions).unsqueeze(-1)
         q2_loss = nn.MSELoss()(q2_pred, q_target)
-        self.q2_optimizer.zero_grad(); q2_loss.backward(); self.q2_optimizer.step()
+        self.q2_optimizer.zero_grad()
+        q2_loss.backward()
+        if self.max_grad_norm is not None:
+            nn.utils.clip_grad_norm_(self.q2_net.parameters(), self.max_grad_norm)
+        self.q2_optimizer.step()
 
         # ── Policy update ──────────────────────────────────────────────────────
         a_tilde, lp = self.policy_net.sample(states)
         q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
         q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
         policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
-        self.policy_optimizer.zero_grad(); policy_loss.backward(); self.policy_optimizer.step()
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        if self.max_grad_norm is not None:
+            nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.max_grad_norm)
+        self.policy_optimizer.step()
 
         # ── Polyak-update target Q-networks ───────────────────────────────────
         self._soft_update(self.q1_target, self.q1_net)
@@ -315,7 +329,9 @@ class SACTrainer:
         # ── Auto-alpha ────────────────────────────────────────────────────────
         if self.auto_alpha:
             alpha_loss = -(self.log_alpha.exp() * (lp.detach() + self.target_entropy)).mean()
-            self.alpha_optimizer.zero_grad(); alpha_loss.backward(); self.alpha_optimizer.step()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
             self.alpha = self.log_alpha.exp().item()
 
         # ── TensorBoard ───────────────────────────────────────────────────────

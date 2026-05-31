@@ -493,13 +493,16 @@ class RewardScheme1:
 
 class RewardScheme2:
     """
-    Shaped reward: own ship delta + own planet delta + terminal bonus.
+    Shaped reward: own ship delta + production-weighted planet delta + terminal bonus.
     Ignores opponent metrics — pure self-improvement signal.
+
+    Planet captures/losses are weighted by the planet's production value, so
+    taking a high-production planet yields a larger reward than a low-production one.
 
     Parameters
     ----------
     ship_scale   : float, default 0.01
-    planet_scale : float, default 1.0
+    planet_scale : float, default 1.0 — multiplied by production of captured/lost planet
     """
 
     def __init__(self, ship_scale: float = 0.01, planet_scale: float = 1.0, win_bonus: float = 100.0):
@@ -516,8 +519,6 @@ class RewardScheme2:
         opponent_ids = [p for p in range(n_players) if p != pid]
 
         def _ships(p, f, owner):
-            # Count ships on planets AND in-transit fleets so fleet sends
-            # don't create spurious negative signals.
             p_mask  = p[:, 1] == owner
             p_ships = float(p[p_mask, 5].sum()) if p_mask.any() else 0.0
             f_ships = 0.0
@@ -526,11 +527,14 @@ class RewardScheme2:
                 f_ships = float(f[f_mask, 6].sum()) if f_mask.any() else 0.0
             return p_ships + f_ships
 
-        def _count(p, owner):
-            return int((p[:, 1] == owner).sum())
-
         my_ships_δ = _ships(planets_new, fleets_new, pid) - _ships(planets_old, fleets_old, pid)
-        my_cnt_δ   = _count(planets_new, pid) - _count(planets_old, pid)
+
+        # Production-weighted planet delta: sum production of gained minus lost planets.
+        old_owned = {int(r[0]): float(r[6]) for r in planets_old if int(r[1]) == pid}
+        new_owned = {int(r[0]): float(r[6]) for r in planets_new if int(r[1]) == pid}
+        captured_prod = sum(prod for pid_k, prod in new_owned.items() if pid_k not in old_owned)
+        lost_prod     = sum(prod for pid_k, prod in old_owned.items() if pid_k not in new_owned)
+        planet_delta  = captured_prod - lost_prod
 
         terminal_bonus = 0.0
         if done:
@@ -541,7 +545,7 @@ class RewardScheme2:
             elif best_opp > my_ships_final:
                 terminal_bonus = -self.win_bonus
 
-        return float(self.ship_scale * my_ships_δ + self.planet_scale * my_cnt_δ + terminal_bonus)
+        return float(self.ship_scale * my_ships_δ + self.planet_scale * planet_delta + terminal_bonus)
 
 
 class RewardScheme3:
@@ -591,25 +595,24 @@ class RewardScheme4:
     step rather than the change since the previous step.
 
     Unlike the delta schemes (1/2), this does NOT telescope over an episode:
-    Σ_t reward_t = Σ_t (ship_scale·ships_t + planet_scale·planets_t) + bonus,
+    Σ_t reward_t = Σ_t (ship_scale·ships_t + planet_scale·production_t) + bonus,
     so the episode total reflects *how much was held and for how long*.
-    Capturing and *holding* territory yields a sustained positive signal;
-    losing planets immediately lowers every subsequent step's reward.
+    Capturing and *holding* high-production territory yields a sustained positive
+    signal; losing planets immediately lowers every subsequent step's reward.
 
         ship_scale   × my_ships_now
-      + planet_scale × my_planet_count_now
+      + planet_scale × sum_of_production_of_my_planets_now
       ± win_bonus    (terminal, on win/loss)
 
     Scaling note
     ------------
     my_ships grows into the hundreds/thousands via production, so keep
-    ship_scale small relative to planet_scale or the ship term dominates and
-    the agent is rewarded for hoarding ships rather than taking planets.
+    ship_scale small relative to planet_scale or the ship term dominates.
 
     Parameters
     ----------
     ship_scale   : float, default 0.01
-    planet_scale : float, default 1.0
+    planet_scale : float, default 1.0 — multiplied by total owned production
     win_bonus    : float, default 100.0
     """
 
@@ -635,11 +638,9 @@ class RewardScheme4:
                 f_ships = float(f[f_mask, 6].sum()) if f_mask.any() else 0.0
             return p_ships + f_ships
 
-        def _count(p, owner):
-            return int((p[:, 1] == owner).sum())
-
-        my_ships = _ships(planets_new, fleets_new, pid)
-        my_cnt   = _count(planets_new, pid)
+        my_ships      = _ships(planets_new, fleets_new, pid)
+        my_mask       = planets_new[:, 1] == pid
+        my_production = float(planets_new[my_mask, 6].sum()) if my_mask.any() else 0.0
 
         terminal_bonus = 0.0
         if done:
@@ -649,7 +650,7 @@ class RewardScheme4:
             elif best_opp > my_ships:
                 terminal_bonus = -self.win_bonus
 
-        return float(self.ship_scale * my_ships + self.planet_scale * my_cnt + terminal_bonus)
+        return float(self.ship_scale * my_ships + self.planet_scale * my_production + terminal_bonus)
 
 
 # ── Module-level default instances (backward compatibility) ──────────────────

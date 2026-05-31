@@ -53,6 +53,25 @@ def _linear_schedule(episode: int, start: float, end: float, decay_episodes: int
     return start + (end - start) * frac
 
 
+def _exponential_schedule(episode: int, start: float, end: float, decay_episodes: int) -> float:
+    """Exponentially decay from `start` toward `end`.
+
+    The decay constant is chosen so that at `episode = decay_episodes` the value
+    is within 1% of `end` (i.e. exp(-k * decay_episodes) = 0.01 → k = log(100) / decay_episodes).
+    """
+    k = math.log(100.0) / max(1, decay_episodes)
+    return end + (start - end) * math.exp(-k * episode)
+
+
+def _make_schedule(schedule_type: str):
+    """Return the schedule function for the given type ('linear' or 'exponential')."""
+    if schedule_type == "exponential":
+        return _exponential_schedule
+    if schedule_type == "linear":
+        return _linear_schedule
+    raise ValueError(f"Unknown schedule type: {schedule_type!r}. Use 'linear' or 'exponential'.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Mixed opponent (per-step blend of random and rule-based)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,14 +206,17 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
     mixed_send_prob = env_cfg.get("mixed_send_prob", 0.3)
 
     # ── mixed_random_ratio scheduler (curriculum) ────────────────────────────
-    ratio_start = curr_cfg.get("mixed_random_ratio_start", 1.0)
-    ratio_end   = curr_cfg.get("mixed_random_ratio_end",   0.0)
-    ratio_decay = curr_cfg.get("mixed_random_ratio_decay")
+    ratio_start     = curr_cfg.get("mixed_random_ratio_start",    1.0)
+    ratio_end       = curr_cfg.get("mixed_random_ratio_end",       0.0)
+    ratio_decay     = curr_cfg.get("mixed_random_ratio_decay")
+    ratio_schedule  = curr_cfg.get("mixed_random_ratio_schedule", "linear")
     ratio_decay_eps = ratio_decay if ratio_decay is not None else num_episodes
+    schedule_fn     = _make_schedule(ratio_schedule)
 
     if opponent == "mixed":
         print(f"Mixed opponent: random_ratio {ratio_start:.2f} → {ratio_end:.2f} "
-              f"over {ratio_decay_eps} episodes, send_prob={mixed_send_prob:.2f}")
+              f"over {ratio_decay_eps} episodes ({ratio_schedule}), "
+              f"send_prob={mixed_send_prob:.2f}")
 
     # ── envs ──────────────────────────────────────────────────────────────────
     env_2p, mixed_2p = make_env(
@@ -236,6 +258,7 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
     target_entropy = train_cfg.get("target_entropy")
     buffer_size = train_cfg.get("buffer_size", 100_000)
     batch_size = train_cfg.get("batch_size", 64)
+    max_grad_norm = train_cfg.get("grad_clip", 1.0)
     log_dir = io_cfg.get("log_dir")
 
     trainer = SACTrainer(
@@ -252,6 +275,7 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
         target_entropy    = target_entropy,
         replay_buffer_size= buffer_size,
         batch_size        = batch_size,
+        max_grad_norm     = max_grad_norm,
         log_dir           = log_dir,
     )
 
@@ -273,7 +297,7 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
 
     for episode in range(num_episodes):
         # ── curriculum: anneal mixed_random_ratio ─────────────────────────────
-        current_ratio = _linear_schedule(
+        current_ratio = schedule_fn(
             episode, ratio_start, ratio_end, ratio_decay_eps
         )
         for a in all_mixed_agents:
@@ -355,9 +379,10 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
 
         # ── HTML replay ───────────────────────────────────────────────────────
         if (episode + 1) % render_interval == 0:
+            result_tag = "WIN" if won else "LOSS"
             html_path = os.path.join(
                 render_dir,
-                f"ep{episode + 1:05d}_{tag}.html",
+                f"ep{episode + 1:05d}_{tag}_{result_tag}.html",
             )
             env.render(html_path=html_path)
 
