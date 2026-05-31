@@ -361,7 +361,8 @@ def compute_launch_angle(planet_by_id: dict, omega: float,
     return angle if connects(angle, horizon) else None
 
 
-def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float) -> list:
+def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float,
+                  tanh_scale: float = 0.2, min_fleet_ships: int = 3) -> list:
     """
     Convert policy output to kaggle orbit_wars moves via pairwise bivector attention.
 
@@ -372,10 +373,13 @@ def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float) -> l
 
     Parameters
     ----------
-    action_np : (MAX_PLANETS, 4) — policy output in [-1, 1]
-    planets   : (n, 7) — player-0-perspective array
-                [id, owner, x, y, radius, ships, production]
-    omega     : float — angular velocity of the planet system
+    action_np       : (MAX_PLANETS, 4) — policy output in [-1, 1]
+    planets         : (n, 7) — player-0-perspective array
+                      [id, owner, x, y, radius, ships, production]
+    omega           : float — angular velocity of the planet system
+    tanh_scale      : float — scales the tanh input; smaller = flatter saturation
+                      (e.g. 0.2 saturates at ~±10 instead of ~±3)
+    min_fleet_ships : int — fleets with fewer ships than this are suppressed
 
     Returns
     -------
@@ -385,7 +389,8 @@ def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float) -> l
 
     # ── pairwise bivector attention ───────────────────────────────────────────
     pairwise_bivectors = pairwise_wedge(action_np, action_np)
-    out = np.tanh(pairwise_bivectors.sum(axis=-1))   # (MAX_PLANETS, MAX_PLANETS)
+    # tanh_scale < 1 flattens the curve so the model can express precise fractions.
+    out = np.tanh(tanh_scale * pairwise_bivectors.sum(axis=-1))  # (MAX_PLANETS, MAX_PLANETS)
 
     owner_mask = planets[:, 1] == 0
     n_planets  = min(planets.shape[0], action_np.shape[0])
@@ -411,7 +416,7 @@ def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float) -> l
 
         frac      = float(scores[idx])
         num_ships = min(int(frac * ships), ships - 1)
-        if num_ships <= 0:
+        if num_ships < min_fleet_ships:
             continue
 
         angle_rad = compute_launch_angle(
@@ -708,7 +713,9 @@ class OrbitWarsEnv(gym.Env):
                  n_players: int = 2,
                  encoder=None,
                  max_steps: int = 500,
-                 reward_scheme=None):
+                 reward_scheme=None,
+                 tanh_scale: float = 0.2,
+                 min_fleet_ships: int = 3):
         super().__init__()
 
         if reward_scheme is None:
@@ -725,11 +732,13 @@ class OrbitWarsEnv(gym.Env):
         else:
             opponents = [_resolve(opponent) for _ in range(n_players - 1)]
 
-        self.opponents     = opponents
-        self.player_id     = player_id
-        self.n_players     = n_players
-        self.max_steps     = max_steps
-        self.reward_scheme = reward_scheme
+        self.opponents        = opponents
+        self.player_id        = player_id
+        self.n_players        = n_players
+        self.max_steps        = max_steps
+        self.reward_scheme    = reward_scheme
+        self.tanh_scale       = tanh_scale
+        self.min_fleet_ships  = min_fleet_ships
 
         if encoder is None:
             from model.SAC import Encoder
@@ -817,7 +826,9 @@ class OrbitWarsEnv(gym.Env):
         s_planets, _ = _swap_perspective(
             planets_np, _EMPTY_FLEETS.copy(), self.player_id
         )
-        moves = decode_action(action, s_planets, omega)
+        moves = decode_action(action, s_planets, omega,
+                              tanh_scale=self.tanh_scale,
+                              min_fleet_ships=self.min_fleet_ships)
 
         # Snapshot pre-step state as plain numpy arrays.  The kaggle environment
         # mutates obs0.planets / obs0.fleets in-place, so self._current_obs would
@@ -834,7 +845,9 @@ class OrbitWarsEnv(gym.Env):
 
         truncated  = self._time_step >= self.max_steps
         terminated = bool(done) and not truncated
-        won = _kaggle_reward
+        # Kaggle reward is 1 (win), -1 (loss), 0/None (mid-game).
+        # bool(-1) == True in Python, so must check > 0 explicitly.
+        won = bool(done) and float(_kaggle_reward or 0) > 0
 
         reward = 0
         for r in self.reward_scheme:

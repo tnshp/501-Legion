@@ -14,16 +14,24 @@
 - sending fleets amongs already captured planets
 
 
-#to-do
+#to-do - v7
 -add production multiplier to reward scheme 2 and 4 	x
--add gradient clipping 					x			
--add win/loss to replays 					
+-add gradient clipping 					x	
+-add win/loss to replays 				x	
 -add exponential random mix ratio scheduler		x
--early done - if agent is out early in 4p 		
 
--verify whole flow (padding, zero mask? ,) 
--check by adding angular velocity omega and fleet angle as a pos encoding ?
--make tanh activation flatter 
+#to-do - v8 
+-sort fleets according to fleet size 
+-make tanh activation flatter | other activation 
+-deep dive wedge product | check decoder
+-verify whole flow (padding, zero mask?,) 
+-check by adding angular velocity omega and fleet angle as a pos encoding?
+
+-exclude cypthon files from repo/ remove train.json 	
+-early done - if agent is out early in 4p 	
+-fix win issue in replays				x	
+
+
 -Remove comets altogether
 
 -add more rule agents 

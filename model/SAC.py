@@ -61,6 +61,8 @@ class Encoder:
             fleets = np.empty((0, 7))
         else:
             assert fleets.shape[-1] == 7, f"Expected fleets to have 7 features, but got {fleets.shape[-1]}"
+            # Sort by ship count descending so truncation to max_fleets keeps the largest fleets.
+            fleets = fleets[np.argsort(fleets[:, 6])[::-1]]
 
         planets_owner = planets[:, 1].astype(int)
         planet_pos = planets[:, 2:4]

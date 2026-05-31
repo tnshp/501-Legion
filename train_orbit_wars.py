@@ -91,9 +91,10 @@ class MixedAgent:
     a fleet at a random angle with a random ship count (1..ships).
     """
 
-    def __init__(self, random_ratio: float = 0.5, send_prob: float = 0.3):
+    def __init__(self, random_ratio: float = 0.5, send_prob: float = 0.3, fleet_thrsh: int = 20):
         self.random_ratio = float(random_ratio)
         self.send_prob    = float(send_prob)
+        self.fleet_thrsh =  fleet_thrsh
         self._base        = RuleBasedAgent()
 
     def reset(self):
@@ -116,7 +117,9 @@ class MixedAgent:
                 continue
             if random.random() >= self.send_prob:
                 continue
-            ships = random.randint(1, int(p.ships))
+            if p.ships < self.fleet_thrsh:
+                continue
+            ships = random.randint(self.fleet_thrsh, int(p.ships))
             angle = random.uniform(0.0, 2.0 * math.pi)
             moves.append([p.id, angle, ships])
         return moves
@@ -128,7 +131,8 @@ class MixedAgent:
 
 def make_env(n_players: int, opponent: str, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100,
              reward_scheme=None, mixed_random_ratio: float = 0.5,
-             mixed_send_prob: float = 0.3):
+             mixed_send_prob: float = 0.3,
+             tanh_scale: float = 0.2, min_fleet_ships: int = 3):
     """
     Build an OrbitWarsEnv.  Opponent choices: rule_based | random | mixed.
 
@@ -158,7 +162,8 @@ def make_env(n_players: int, opponent: str, MAX_PLANETS: int = 40, MAX_FLEETS: i
     mixed_agents = [a for a in opps if isinstance(a, MixedAgent)]
 
     env = OrbitWarsEnv(opponent=opps, player_id=0, n_players=n_players,
-                       reward_scheme=reward_scheme)
+                       reward_scheme=reward_scheme,
+                       tanh_scale=tanh_scale, min_fleet_ships=min_fleet_ships)
     env.MAX_FLEETS  = MAX_FLEETS
     env.MAX_PLANETS = MAX_PLANETS
     return env, mixed_agents
@@ -201,9 +206,11 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
 
     num_episodes = train_cfg.get("num_episodes", 250)
 
-    opponent = env_cfg.get("opponent", "rule_based")
-    ratio_4p = env_cfg.get("ratio_4p", 0.3)
+    opponent        = env_cfg.get("opponent",        "rule_based")
+    ratio_4p        = env_cfg.get("ratio_4p",        0.3)
     mixed_send_prob = env_cfg.get("mixed_send_prob", 0.3)
+    tanh_scale      = env_cfg.get("tanh_scale",      0.2)
+    min_fleet_ships = env_cfg.get("min_fleet_ships",  3)
 
     # ── mixed_random_ratio scheduler (curriculum) ────────────────────────────
     ratio_start     = curr_cfg.get("mixed_random_ratio_start",    1.0)
@@ -223,12 +230,14 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
         n_players=2, opponent=opponent,
         MAX_PLANETS=MAX_PLANETS, MAX_FLEETS=MAX_FLEETS, reward_scheme=reward_scheme,
         mixed_random_ratio=ratio_start, mixed_send_prob=mixed_send_prob,
+        tanh_scale=tanh_scale, min_fleet_ships=min_fleet_ships,
     )
     if ratio_4p > 0.0:
         env_4p, mixed_4p = make_env(
             n_players=4, opponent=opponent,
             MAX_PLANETS=MAX_PLANETS, MAX_FLEETS=MAX_FLEETS, reward_scheme=reward_scheme,
             mixed_random_ratio=ratio_start, mixed_send_prob=mixed_send_prob,
+            tanh_scale=tanh_scale, min_fleet_ships=min_fleet_ships,
         )
     else:
         env_4p, mixed_4p = None, []

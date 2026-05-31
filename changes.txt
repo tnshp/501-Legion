@@ -1,6 +1,6 @@
 
 
-# commit - 
+# commit - added grad clip, exponential scheduler - v7
 - added exponential scheduler for random mix ratio 
 - added production multiplier to reward scheme 2 and 4 
 - added win/loss to replays 

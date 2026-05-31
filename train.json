@@ -26,7 +26,9 @@
     "opponent": "rule_based",
     "n_players_default": 2,
     "ratio_4p": 0.3,
-    "mixed_send_prob": 0.3
+    "mixed_send_prob": 0.3,
+    "tanh_scale": 0.2,
+    "min_fleet_ships": 3
   },
   "curriculum": {
     "mixed_random_ratio_start": 1.0,
