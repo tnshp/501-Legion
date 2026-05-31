@@ -21,18 +21,17 @@
 -add exponential random mix ratio scheduler		x
 
 #to-do - v8 
--sort fleets according to fleet size 
--make tanh activation flatter | other activation 
+-clip agent to send ships only above a threshold 	x
+-sort fleets according to fleet size 			x
+-make tanh activation flatter | other activation 	x
 -deep dive wedge product | check decoder
+-fix win issue in replays				x	
+-exclude cypthon files from repo/ remove train.json	x
+
+-early done - if agent is out early in 4p 	
 -verify whole flow (padding, zero mask?,) 
 -check by adding angular velocity omega and fleet angle as a pos encoding?
 
--exclude cypthon files from repo/ remove train.json 	
--early done - if agent is out early in 4p 	
--fix win issue in replays				x	
-
-
 -Remove comets altogether
-
 -add more rule agents 
  

@@ -185,9 +185,9 @@ class Encoder:
 
     
 class Q_network(nn.Module):
-    def __init__(self, 
-                 state_dim=14, 
-                 action_dim=8,
+    def __init__(self,
+                 state_dim=14,
+                 action_dim=4,   # matches OrbitWarsEnv.ACTION_DIM
                  max_planets=40,
                  max_fleets=100, 
                  d_model=128, 
@@ -343,10 +343,10 @@ class V_network(nn.Module):
     
 
 class P_network(nn.Module):
-    def __init__(self, 
-                 d_model=128, 
+    def __init__(self,
+                 d_model=128,
                  state_dim=14,
-                 action_dim=8,
+                 action_dim=4,   # matches OrbitWarsEnv.ACTION_DIM
                  max_planets=40,
                  max_fleets=100, 
                  nhead=4, 
@@ -405,27 +405,47 @@ class P_network(nn.Module):
         #only pass num planets tokens through heads, as action is only for planets
         mu = self.mu_head(out_[:, :self.max_planets, :])
         sigma = F.softplus(self.sigma_head(out_[:, :self.max_planets, :])) + 1e-5
+        # Clamp sigma to a bounded range so the entropy term cannot drive it to
+        # extremes: too small spikes -log(sigma) in the log-prob, too large blows
+        # up the (now tanh-squashed) action. exp(-5)≈6.7e-3, exp(2)≈7.39.
+        sigma = sigma.clamp(min=math.exp(-5.0), max=math.exp(2.0))
 
         return mu, sigma
 
     def sample(self, state):
         """
-        Sample action via reparameterisation and return log π(a|s).
+        Sample a tanh-squashed action via reparameterisation and return log π(a|s).
+
+        The action is squashed with tanh so it lies in [-1, 1] (matching the
+        env's action_space and decode_action's assumption) and so the policy
+        entropy is bounded — without this the entropy term drives sigma → ∞,
+        producing exploding Q-targets and NaNs.
 
         Returns:
-            action   : [B, max_planets, action_dim]
+            action   : [B, max_planets, action_dim]  in [-1, 1]
             log_prob : [B, 1]
         """
         mu, sigma = self.forward(state)
-        eps = torch.randn_like(sigma)
-        action = mu + eps * sigma
+        eps        = torch.randn_like(sigma)
+        raw_action = mu + eps * sigma            # pre-squash Gaussian sample
+        action     = torch.tanh(raw_action)      # bounded to [-1, 1]
+
+        # Gaussian log-density of raw_action, then the tanh change-of-variables
+        # correction: log π(a) = log N(raw) - Σ log(1 - tanh(raw)^2).
         log_prob = (
-            -0.5 * ((action - mu) / sigma) ** 2
+            -0.5 * eps ** 2
             - sigma.log()
             - 0.5 * math.log(2.0 * math.pi)
-        ).sum(dim=(-2, -1), keepdim=True).squeeze(-1)  # [B, 1]
-        
+        )
+        log_prob = log_prob - torch.log(1.0 - action ** 2 + 1e-6)
+        log_prob = log_prob.sum(dim=(-2, -1), keepdim=True).squeeze(-1)  # [B, 1]
+
         return action, log_prob
+
+    def deterministic_action(self, state):
+        """Greedy (mean) action, tanh-squashed to [-1, 1].  Used for evaluation."""
+        mu, _ = self.forward(state)
+        return torch.tanh(mu)
     
 class ActionDecoder(nn.Module):
     def __init__(self, 

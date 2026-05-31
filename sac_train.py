@@ -196,6 +196,7 @@ class SACTrainer:
                   "Run: pip install tensorboard")
         self.writer        = SummaryWriter(log_dir=log_dir) if (log_dir and _TB_AVAILABLE) else None
         self._update_count = 0
+        self._nan_skips    = 0
 
         # ── networks ──────────────────────────────────────────────────────────
         self.policy_net = policy_net.to(device)
@@ -293,6 +294,15 @@ class SACTrainer:
                 torch.min(q1_next, q2_next) - self.alpha * lp_next
             )
 
+        # NaN/Inf guard: if the target is non-finite, skip this batch entirely so
+        # one bad sample cannot poison the weights (clip_grad_norm_ would just
+        # propagate the NaN through the total norm).
+        if not torch.isfinite(q_target).all():
+            self._nan_skips += 1
+            if self.writer is not None:
+                self.writer.add_scalar("Misc/nan_skips", self._nan_skips, self._update_count)
+            return None
+
         # ── Q1 update ─────────────────────────────────────────────────────────
         q1_pred = self.q1_net(states, actions).unsqueeze(-1)
         q1_loss = nn.MSELoss()(q1_pred, q_target)
@@ -337,10 +347,14 @@ class SACTrainer:
         # ── TensorBoard ───────────────────────────────────────────────────────
         if self.writer is not None:
             s = self._update_count
+            with torch.no_grad():
+                _, sigma = self.policy_net.forward(states)
             self.writer.add_scalar("Loss/q1",              q1_loss.item(),     s)
             self.writer.add_scalar("Loss/q2",              q2_loss.item(),     s)
             self.writer.add_scalar("Loss/policy",          policy_loss.item(), s)
             self.writer.add_scalar("Policy/mean_log_prob", lp.mean().item(),   s)
+            self.writer.add_scalar("Policy/sigma_mean",    sigma.mean().item(), s)
+            self.writer.add_scalar("Q/target_mean",        q_target.mean().item(), s)
             self.writer.add_scalar("Alpha/value",          self.alpha,         s)
             self.writer.add_scalar("GradNorm/policy", self._grad_norm(self.policy_net), s)
             self.writer.add_scalar("GradNorm/q1",     self._grad_norm(self.q1_net),    s)
@@ -658,12 +672,15 @@ def make_transformer_sac_trainer(env, **trainer_kwargs) -> SACTrainer:
     SACTrainer wired with transformer Q/Policy networks for the galaxy env.
 
     State  env → network : [B, 144, 14] → [B, 140, 14]
-    Action env → network : [B,  44,  8] → [B,  40,  8]
+    Action env → network : [B,  44,  4] → [B,  40,  4]
     """
     max_planets = 40
     max_fleets  = 100
     net_seq_len = max_planets + max_fleets
-    action_dim  = 8
+    # Derive the per-token action width from the env (OrbitWarsEnv.ACTION_DIM=4)
+    # rather than hardcoding, so the policy head always matches what the
+    # decoder consumes.
+    action_dim  = env.action_space.shape[-1]
     env_action_seq = env.action_space.shape[0]
 
     net_kw = dict(state_dim=14, action_dim=action_dim,
@@ -709,7 +726,7 @@ def make_transformer_sac_trainer(env, **trainer_kwargs) -> SACTrainer:
 
 # =============================================================================
 if __name__ == "__main__":
-    env = MatrixEnv(state_dim=14, action_dim=8, max_state=144, max_action=44)
+    env = MatrixEnv(state_dim=14, action_dim=4, max_state=144, max_action=44)
 
     trainer = make_transformer_sac_trainer(
         env,

@@ -5,3 +5,11 @@
 - added production multiplier to reward scheme 2 and 4 
 - added win/loss to replays 
 - added gradient clipping 
+
+#commit - v8 
+-clip agent to send ships only above a threshold 
+-sort fleets according to fleet size 			x
+-make tanh activation flatter | other activation 	x
+-deep dive wedge product | check decoder
+-fix win issue in replays				x	
+-exclude cypthon files from repo/ remove train.json	x
