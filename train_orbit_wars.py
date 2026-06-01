@@ -270,6 +270,17 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
     max_grad_norm = train_cfg.get("grad_clip", 1.0)
     log_dir = io_cfg.get("log_dir")
 
+    # ── cache-based TD(λ) (optional; replaces target net with a λ-return cache)
+    tdl_cfg            = config.get("td_lambda", {})
+    use_lambda_returns = tdl_cfg.get("enabled", False)
+    lambda_return      = tdl_cfg.get("lambda", 0.9)
+    cache_size         = tdl_cfg.get("cache_size", 8000)
+    block_size         = tdl_cfg.get("block_size", 50)
+    refresh_freq       = tdl_cfg.get("refresh_freq", 1000)
+    if use_lambda_returns:
+        print(f"TD(λ) cache: λ={lambda_return}, S={cache_size}, B={block_size}, "
+              f"refresh every {refresh_freq} steps (target network disabled)")
+
     trainer = SACTrainer(
         env               = env_2p,
         policy_net        = policy_net,
@@ -285,6 +296,11 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
         replay_buffer_size= buffer_size,
         batch_size        = batch_size,
         max_grad_norm     = max_grad_norm,
+        use_lambda_returns= use_lambda_returns,
+        lambda_return     = lambda_return,
+        cache_size        = cache_size,
+        block_size        = block_size,
+        refresh_freq      = refresh_freq,
         log_dir           = log_dir,
     )
 
