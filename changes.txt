@@ -14,5 +14,8 @@
 -fix win issue in replays				x	
 -exclude cypthon files from repo/ remove train.json	x
 
-#commit -
+#commit - 
 - added early done for 4 player mode
+
+#commit - v9
+- added learned forurier encodings for x, y, ships and angle 
