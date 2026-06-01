@@ -843,11 +843,22 @@ class OrbitWarsEnv(gym.Env):
         raw_obs, _kaggle_reward, done, info = self._trainer.step(moves)
         self._time_step += 1
 
+        # Elimination: in >2-player games the kaggle env keeps running while the
+        # other players fight on, but once our agent owns no planets AND no fleets
+        # it is out of the game and can take no meaningful action. Treat that as a
+        # terminal (lost) state so the episode ends for us instead of idling.
+        planets_new, fleets_new, _, _, _ = _obs_to_arrays(raw_obs)
+        n_my_planets = int((planets_new[:, 1] == self.player_id).sum())
+        n_my_fleets  = (int((fleets_new[:, 1] == self.player_id).sum())
+                        if fleets_new.shape[0] > 0 else 0)
+        eliminated   = (n_my_planets == 0) and (n_my_fleets == 0)
+
         truncated  = self._time_step >= self.max_steps
-        terminated = bool(done) and not truncated
+        terminated = (bool(done) or eliminated) and not truncated
         # Kaggle reward is 1 (win), -1 (loss), 0/None (mid-game).
         # bool(-1) == True in Python, so must check > 0 explicitly.
-        won = bool(done) and float(_kaggle_reward or 0) > 0
+        # Elimination is always a loss, so it can never be a win.
+        won = (not eliminated) and bool(done) and float(_kaggle_reward or 0) > 0
 
         reward = 0
         for r in self.reward_scheme:

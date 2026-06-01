@@ -28,10 +28,10 @@
 -fix win issue in replays				x	
 -exclude cypthon files from repo/ remove train.json	x
 
--early done - if agent is out early in 4p 	
--verify whole flow (padding, zero mask?,) 
+-early done - if agent is out early in 4p 		x	
+-verify whole flow (padding, zero mask?,) 		
 -check by adding angular velocity omega and fleet angle as a pos encoding?
 
 -Remove comets altogether
--add more rule agents 
+-add more rule agents 	
  

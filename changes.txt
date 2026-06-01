@@ -13,3 +13,6 @@
 -deep dive wedge product | check decoder
 -fix win issue in replays				x	
 -exclude cypthon files from repo/ remove train.json	x
+
+#commit -
+- added early done for 4 player mode
