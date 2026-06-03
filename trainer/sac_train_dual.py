@@ -170,8 +170,15 @@ class SACTrainer:
         opponent_update_interval: int = 10,
         checkpoint_load_path: str= None,
         training_data_load_path: str= None,
+        replay_buffer_load_path: str = None,
         rule_based_agents: Optional[List[Callable]] = None,
         log_dir: Optional[str] = None,
+        # td lambda params
+        use_lambda_returns: bool = False,
+        lambda_return: float = 0.9,
+        cache_size: int = 8000,
+        block_size: int = 50,
+        refresh_freq: int = 1000,
     ):
         self.device     = device
         self._amp       = str(device).startswith("cuda")
@@ -182,14 +189,38 @@ class SACTrainer:
         self.opponent_update_interval = opponent_update_interval
         self.rule_based_agents = rule_based_agents or []
 
+
+        # ── cache-based TD(λ) (Daley & Amato 2019) ────────────────────────────
+        # When enabled, Q-targets are precomputed λ-returns stored in a cache that
+        # is refreshed every `refresh_freq` env-steps — this REPLACES the target
+        # network (no Polyak averaging, no min-over-target-nets). See _lambda_*.
+        self.use_lambda_returns = use_lambda_returns
+        self.lambda_return      = float(lambda_return)
+        self.cache_size         = int(cache_size)
+        self.block_size         = int(block_size)
+        self.refresh_freq       = int(refresh_freq)
+        self._cache_states      = None
+        self._cache_actions     = None
+        self._cache_targets     = None
+        self._cache_n           = 0
+        self._last_cache_step   = -(10 ** 9)
+        self._cache_refreshes   = 0
+
+
         # ── live networks ─────────────────────────────────────────────────────
         self.policy_net = policy_net.to(device)
         self.q1_net     = q1_net.to(device)
         self.q2_net     = q2_net.to(device)
-        self.q1_target  = copy.deepcopy(q1_net).to(device)
-        self.q2_target  = copy.deepcopy(q2_net).to(device)
-        self._hard_update(self.q1_target, self.q1_net)
-        self._hard_update(self.q2_target, self.q2_net)
+        # self.q1_target  = copy.deepcopy(q1_net).to(device)
+        # self.q2_target  = copy.deepcopy(q2_net).to(device)
+        # self._hard_update(self.q1_target, self.q1_net)
+        # self._hard_update(self.q2_target, self.q2_net)
+
+        if not self.use_lambda_returns:
+            self.q1_target = copy.deepcopy(q1_net).to(device)
+            self.q2_target = copy.deepcopy(q2_net).to(device)
+            self._hard_update(self.q1_target, self.q1_net)
+            self._hard_update(self.q2_target, self.q2_net)
 
         # ── frozen opponent snapshot (self-play only) ─────────────────────────
         self.opponent_net = copy.deepcopy(policy_net).to(device)
@@ -221,6 +252,10 @@ class SACTrainer:
         if training_data_load_path is not None:
             with open(training_data_load_path, "r") as file:
                 self.training_data = json.load(file)
+
+        self.saved_buffer = None
+        if replay_buffer_load_path is not None:
+            self.saved_buffer = replay_buffer_load_path
 
     # =========================================================================
     # Utilities
@@ -264,6 +299,9 @@ class SACTrainer:
     def update(self) -> Optional[Dict[str, float]]:
         if len(self.replay_buffer) < self.batch_size:
             return None
+        
+        if self.use_lambda_returns :
+            return self._lambda_update()
 
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
         states      = self._to(states)
@@ -553,6 +591,202 @@ class SACTrainer:
                 break
 
         return transitions, ep_reward_p0, env, won
+    
+        # =========================================================================
+    # Cache-based TD(λ)  (Daley & Amato, "Reconciling λ-Returns with
+    # Experience Replay", NeurIPS 2019)
+    #
+    # Why: in Orbit Wars the reward for launching a fleet only lands ~10-20
+    # steps later (flight time), so a 1-step (TD(0)) target assigns credit very
+    # slowly. λ-returns interpolate between TD(0) and Monte-Carlo, propagating
+    # that delayed reward back over many steps in a single update.
+    #
+    # How (faithful to the paper, fixed λ):
+    #   • Promote S/B contiguous "blocks" of B transitions from the replay buffer
+    #     into a cache C of size S (`_build_lambda_cache`). Because the buffer is
+    #     filled in temporal order, a contiguous block IS a trajectory; the stored
+    #     `done` flags cut returns at episode boundaries.
+    #   • Compute each block's λ-returns backwards by recursion (Eq. 8 / footnote
+    #     4), reusing one bootstrap value per transition — O(B) Q-evaluations per
+    #     block instead of O(B²) (paper §3.1).
+    #   • The stored returns are stable TD targets, so the target network is
+    #     eliminated. The cache is rebuilt every `refresh_freq` env-steps using
+    #     the current networks (paper §3.2).
+    #   • SAC adaptation: the bootstrap is the SOFT value
+    #         V(s') = min(Q1,Q2)(s',a') − α·logπ(a'|s'),   a' ~ π(·|s')
+    #     so at λ=0 this reduces exactly to the standard SAC 1-step target.
+    # =========================================================================
+
+    def _soft_value(self, next_states_np: np.ndarray) -> np.ndarray:
+        """Batched soft state-value V(s') for the cache bootstrap, computed in
+        chunks under no_grad. Returns a 1-D numpy array (NaN/Inf → 0)."""
+        out   = []
+        chunk = max(self.batch_size, 256)
+        with torch.no_grad():
+            for i in range(0, len(next_states_np), chunk):
+                ns = torch.from_numpy(next_states_np[i:i + chunk])
+                ns = self.state_preprocessor(self._to(ns))
+                a, lp = self.policy_net.sample(ns)                 # a:[c,...], lp:[c,1]
+                q1 = self.q1_net(ns, a).unsqueeze(-1)              # [c,1]
+                q2 = self.q2_net(ns, a).unsqueeze(-1)              # [c,1]
+                v  = torch.min(q1, q2) - self.alpha * lp           # [c,1]
+                out.append(v.squeeze(-1).cpu().numpy())
+        v_all = np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
+        return np.nan_to_num(v_all, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    def _build_lambda_cache(self) -> bool:
+        """Promote S/B temporally-contiguous blocks into the cache and fill it
+        with precomputed λ-return targets. Returns True on success."""
+        buf = self.replay_buffer
+        B   = self.block_size
+        if len(buf) < B:
+            return False
+        n_blocks = max(1, self.cache_size // B)
+
+        # ── sample valid block start indices (no seam-straddling) ─────────────
+        if buf._size < buf._max:
+            # Buffer not yet full: valid transitions live in [0, _size).
+            starts = np.random.randint(0, buf._size - B + 1, size=n_blocks)
+            wrap   = False
+        else:
+            # Full buffer: the only physical discontinuity is the write pointer
+            # (newest|oldest seam). Reject blocks whose interior crosses it.
+            ptr    = buf._ptr
+            starts = np.empty(n_blocks, dtype=np.int64)
+            filled = 0
+            while filled < n_blocks:
+                cand = np.random.randint(0, buf._max - B + 1, size=n_blocks - filled)
+                ok   = ~((cand < ptr) & (ptr < cand + B))
+                good = cand[ok]
+                starts[filled:filled + len(good)] = good
+                filled += len(good)
+            wrap = True
+
+        block_idx = starts[:, None] + np.arange(B)[None, :]        # [n_blocks, B]
+        if wrap:
+            block_idx %= buf._max
+        flat_idx = block_idx.reshape(-1)
+
+        states_np      = buf.states     [flat_idx]
+        actions_np     = buf.actions    [flat_idx]
+        rewards_np     = buf.rewards    [flat_idx].reshape(n_blocks, B)
+        next_states_np = buf.next_states[flat_idx]
+        dones_np       = buf.dones      [flat_idx].reshape(n_blocks, B)
+
+        # ── soft-value bootstrap for every transition's next-state ────────────
+        v_next = self._soft_value(next_states_np).reshape(n_blocks, B)
+
+        # ── backward λ-return recursion (vectorised across blocks) ────────────
+        #   Rλ_t = r_t + γ(1−d_t)[λ·Rλ_{t+1} + (1−λ)·V(s_{t+1})]
+        # The last transition in a block has no in-block successor, so its
+        # bootstrap falls back to V(s') (a plain 1-step target there).
+        targets = np.empty((n_blocks, B), dtype=np.float32)
+        lam, gam = self.lambda_return, self.gamma
+        g = v_next[:, B - 1].copy()
+        for t in range(B - 1, -1, -1):
+            d    = dones_np[:, t]
+            vt   = v_next[:, t]
+            boot = vt if t == B - 1 else g
+            g = rewards_np[:, t] + gam * (1.0 - d) * (lam * boot + (1.0 - lam) * vt)
+            targets[:, t] = g
+
+        self._cache_states  = states_np
+        self._cache_actions = actions_np
+        self._cache_targets = targets.reshape(-1, 1).astype(np.float32)
+        self._cache_n       = self._cache_targets.shape[0]
+        return True
+
+    def _lambda_update(self) -> Optional[Dict[str, float]]:
+        """One gradient step against the λ-return cache (no target network)."""
+        # ── refresh the cache on schedule (every refresh_freq env-steps) ──────
+        if (self._cache_targets is None
+                or self.train_step - self._last_cache_step >= self.refresh_freq):
+            if self._build_lambda_cache():
+                self._last_cache_step = self.train_step
+                self._cache_refreshes += 1
+                if self.writer is not None:
+                    self.writer.add_scalar("Cache/refreshes",
+                                           self._cache_refreshes, self._update_count)
+                    self.writer.add_scalar("Cache/target_mean",
+                                           float(self._cache_targets.mean()),
+                                           self._update_count)
+        if self._cache_targets is None:
+            return None
+
+        idx     = np.random.randint(0, self._cache_n, size=self.batch_size)
+        states  = self.state_preprocessor (self._to(torch.from_numpy(self._cache_states[idx])))
+        actions = self.action_preprocessor(self._to(torch.from_numpy(self._cache_actions[idx])))
+        targets = self._to(torch.from_numpy(self._cache_targets[idx]))
+
+        if not torch.isfinite(targets).all():
+            self._nan_skips += 1
+            if self.writer is not None:
+                self.writer.add_scalar("Misc/nan_skips", self._nan_skips, self._update_count)
+            return None
+
+        # ── Q updates toward the precomputed λ-return (shared by Q1 & Q2) ─────
+        q1_pred = self.q1_net(states, actions).unsqueeze(-1)
+        q1_loss = nn.MSELoss()(q1_pred, targets)
+        self.q1_optimizer.zero_grad()
+        q1_loss.backward()
+        if self.max_grad_norm is not None:
+            nn.utils.clip_grad_norm_(self.q1_net.parameters(), self.max_grad_norm)
+        self.q1_optimizer.step()
+
+        q2_pred = self.q2_net(states, actions).unsqueeze(-1)
+        q2_loss = nn.MSELoss()(q2_pred, targets)
+        self.q2_optimizer.zero_grad()
+        q2_loss.backward()
+        if self.max_grad_norm is not None:
+            nn.utils.clip_grad_norm_(self.q2_net.parameters(), self.max_grad_norm)
+        self.q2_optimizer.step()
+
+        # ── Policy update — identical SAC actor objective ─────────────────────
+        a_tilde, lp = self.policy_net.sample(states)
+        q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
+        q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
+        policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        if self.max_grad_norm is not None:
+            nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.max_grad_norm)
+        self.policy_optimizer.step()
+
+        # NB: no target-network Polyak update — the cache is the stable target.
+
+        # ── Auto-alpha (unchanged) ────────────────────────────────────────────
+        if self.auto_alpha:
+            alpha_loss = -(self.log_alpha.exp() * (lp.detach() + self.target_entropy)).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            self.alpha = self.log_alpha.exp().item()
+
+        # ── TensorBoard ───────────────────────────────────────────────────────
+        if self.writer is not None:
+            s = self._update_count
+            with torch.no_grad():
+                _, sigma = self.policy_net.forward(states)
+            self.writer.add_scalar("Loss/q1",              q1_loss.item(),     s)
+            self.writer.add_scalar("Loss/q2",              q2_loss.item(),     s)
+            self.writer.add_scalar("Loss/policy",          policy_loss.item(), s)
+            self.writer.add_scalar("Policy/mean_log_prob", lp.mean().item(),   s)
+            self.writer.add_scalar("Policy/sigma_mean",    sigma.mean().item(), s)
+            self.writer.add_scalar("Q/target_mean",        targets.mean().item(), s)
+            self.writer.add_scalar("Alpha/value",          self.alpha,         s)
+            self.writer.add_scalar("GradNorm/policy", self._grad_norm(self.policy_net), s)
+            self.writer.add_scalar("GradNorm/q1",     self._grad_norm(self.q1_net),    s)
+            self.writer.add_scalar("GradNorm/q2",     self._grad_norm(self.q2_net),    s)
+            if self.auto_alpha:
+                self.writer.add_scalar("Loss/alpha", alpha_loss.item(), s)
+
+        self._update_count += 1
+        return {
+            "q1_loss": q1_loss.item(),
+            "q2_loss": q2_loss.item(),
+            "pi_loss": policy_loss.item(),
+        }
+
 
     # =========================================================================
     # Training loop
@@ -567,7 +801,8 @@ class SACTrainer:
         log_interval: int        = 10,
         checkpoint_interval: int = 50,
         checkpoint_path: str     = "checkpoints",
-        render_interval: int     = 0,
+        render_interval: int     = 10,
+        replay_storage_interval  = 50,
         render_dir: str          = "renders",
         profile: bool            = False,
         rule_based_ratio: float  = 1.0,
@@ -603,6 +838,9 @@ class SACTrainer:
             start = self.training_data["ep"]
             num_episodes = self.training_data["num_episodes"]
             opponent_noise_checkpoint = self.training_data["noise"]
+
+        if self.saved_buffer is not None:
+            self.load_replay_buffer(self.saved_buffer)
         
         opp_noise_inc = (opponent_noise-0.01)/(num_episodes*rule_based_ratio)
         opponent_noise = opponent_noise_checkpoint            
@@ -669,13 +907,16 @@ class SACTrainer:
                 if profile and _ep_times:
                     _print_profile(_ep_times)
                     _ep_times.clear()
+            
+            if (ep+1) % replay_storage_interval == 0:
+                self.save_replay_buffer(checkpoint_path + f"/EP{ep+1}_replay_buffer.pt")
 
             if (ep + 1) % checkpoint_interval == 0:
                 train_dict = {"ep": ep+1, "noise": opponent_noise, "num_episodes": num_episodes}
                 self.save_checkpoint(checkpoint_path + f"/EP{ep+1}_.pt", train_dict)
 
             if render_interval > 0 and (ep + 1) % render_interval == 0:
-                render_path = os.path.join(render_dir, f"ep{ep+1:04d}.html")
+                render_path = os.path.join(render_dir, f"ep_{ep+1}_{won}.html")
                 html = ep_env.render(mode="html", width=800, height=600)
                 with open(render_path, "w") as f:
                     f.write(html)
@@ -694,31 +935,82 @@ class SACTrainer:
     # =========================================================================
     # Checkpoint I/O
     # =========================================================================
-
-    def save_checkpoint(self, path: str, train_dict = None):
-        torch.save({
+    def save_checkpoint(self, path: str, train_dict = None, replay_buffer = None):
+        ckpt = {
             "policy_net": self.policy_net.state_dict(),
             "q1_net":     self.q1_net.state_dict(),
             "q2_net":     self.q2_net.state_dict(),
-            "q1_target":  self.q1_target.state_dict(),
-            "q2_target":  self.q2_target.state_dict(),
             "train_step": self.train_step,
-        }, path)
+        }
+        # Target nets only exist on the 1-step path.
+        if not self.use_lambda_returns:
+            ckpt["q1_target"] = self.q1_target.state_dict()
+            ckpt["q2_target"] = self.q2_target.state_dict()
+        torch.save(ckpt, path)
         print(f"Checkpoint saved → {path}")
         if train_dict is not None:
             with open(path[:-2] + "json", "w", encoding="utf-8") as file:
                 json.dump(train_dict, file, indent=4)
-            
+    
+    def save_replay_buffer(self, path : str):
+        replay_buffer_ckpt = {
+            "states": self.replay_buffer.states,
+            "actions": self.replay_buffer.actions,
+            "rewards": self.replay_buffer.rewards,
+            "next_states": self.replay_buffer.next_states,
+            "dones": self.replay_buffer.dones,
+            "_ptr": self.replay_buffer._ptr,
+            "_size": self.replay_buffer._size,
+        }
+        torch.save(replay_buffer_ckpt, "replay_buffer"+path)
+    
+    def load_replay_buffer(self, path: str):
+        replay_buffer_ckpt = torch.load(path)
+        self.replay_buffer.states = replay_buffer_ckpt["states"]
+        self.replay_buffer.actions = replay_buffer_ckpt["actions"]
+        self.replay_buffer.rewards = replay_buffer_ckpt["rewards"]
+        self.replay_buffer.next_states = replay_buffer_ckpt["next_states"]
+        self.replay_buffer.dones = replay_buffer_ckpt["dones"]
+        self.replay_buffer._ptr = replay_buffer_ckpt["_ptr"]
+        self.replay_buffer._size = replay_buffer_ckpt["_size"]
+        
 
+
+
+    # def save_checkpoint(self, path: str, train_dict = None):
+    #     torch.save({
+    #         "policy_net": self.policy_net.state_dict(),
+    #         "q1_net":     self.q1_net.state_dict(),
+    #         "q2_net":     self.q2_net.state_dict(),
+    #         "q1_target":  self.q1_target.state_dict(),
+    #         "q2_target":  self.q2_target.state_dict(),
+    #         "train_step": self.train_step,
+    #     }, path)
+    #     print(f"Checkpoint saved → {path}")
+    #     if train_dict is not None:
+    #         with open(path[:-2] + "json", "w", encoding="utf-8") as file:
+    #             json.dump(train_dict, file, indent=4)
+            
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
         self.policy_net.load_state_dict(ckpt["policy_net"])
         self.q1_net.load_state_dict(ckpt["q1_net"])
         self.q2_net.load_state_dict(ckpt["q2_net"])
-        self.q1_target.load_state_dict(ckpt["q1_target"])
-        self.q2_target.load_state_dict(ckpt["q2_target"])
+        if not self.use_lambda_returns and "q1_target" in ckpt:
+            self.q1_target.load_state_dict(ckpt["q1_target"])
+            self.q2_target.load_state_dict(ckpt["q2_target"])
         self.train_step = ckpt["train_step"]
         print(f"Checkpoint loaded ← {path}")
+    
+    # def load_checkpoint(self, path: str):
+    #     ckpt = torch.load(path, map_location=self.device)
+    #     self.policy_net.load_state_dict(ckpt["policy_net"])
+    #     self.q1_net.load_state_dict(ckpt["q1_net"])
+    #     self.q2_net.load_state_dict(ckpt["q2_net"])
+    #     self.q1_target.load_state_dict(ckpt["q1_target"])
+    #     self.q2_target.load_state_dict(ckpt["q2_target"])
+    #     self.train_step = ckpt["train_step"]
+    #     print(f"Checkpoint loaded ← {path}")
 
     def close(self):
         if self.writer is not None:
@@ -769,6 +1061,7 @@ if __name__ == "__main__":
         log_dir="runs/latest",
         checkpoint_load_path = config["checkpoint_load_path"],
         training_data_load_path = config["training_data_load_path"],
+        replay_buffer_load_path = config["replay_buffer_load_path"]
     )
 
     print(f"TensorBoard: tensorboard --logdir ./runs/latest")
@@ -781,6 +1074,7 @@ if __name__ == "__main__":
         log_interval = config["log_interval"],
         render_interval = config["render_interval"],
         checkpoint_interval = config["checkpoint_interval"],
+        replay_storage_interval = config["replay_storage_interval"],
         checkpoint_path = config["checkpoint_path"],
         rule_based_ratio = config["rule_based_ratio"],
         opponent_noise = config["opponent_noise"],

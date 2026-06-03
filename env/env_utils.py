@@ -24,12 +24,15 @@ SUN_X, SUN_Y = 50.0, 50.0
 # Observation helpers
 # =============================================================================
 
-def _obs_to_arrays(obs):
+def _obs_to_arrays(obs, player_id = 0):
     """Return (planets_np [n,7], fleets_np [m,7], comet_ids [k], omega, step)."""
     planets_np = np.array(obs.planets, dtype=np.float32)
 
     raw_fleets = obs.fleets if obs.fleets else []
-    fleets_np  = np.array(raw_fleets, dtype=np.float32) if raw_fleets else np.empty((0, 7), dtype=np.float32)
+    opp_fleets = raw_fleets[raw_fleets[2]!=player_id]
+    own_fleets = raw_fleets[raw_fleets[2]==player_id]
+    raw_fleets_ordered = opp_fleets+own_fleets
+    fleets_np  = np.array(raw_fleets_ordered, dtype=np.float32) if raw_fleets_ordered else np.empty((0, 7), dtype=np.float32)
 
     raw_comets = getattr(obs, "comet_planet_ids", None) or []
     comet_ids  = np.array(raw_comets, dtype=np.float32)
@@ -73,7 +76,7 @@ def encode_obs_as_player(
     Owner IDs are swapped so the network always sees itself as player 0.
     Returns float32 array of shape [MAX_PLANETS + MAX_FLEETS, STATE_DIM].
     """
-    planets_np, fleets_np, comet_ids, omega, step = _obs_to_arrays(obs)
+    planets_np, fleets_np, comet_ids, omega, step = _obs_to_arrays(obs, player_id)
     planets_np, fleets_np = _swap_perspective(planets_np, fleets_np, player_id)
     state, _ = encoder.encode(
         planets_np, fleets_np, initial_planets,

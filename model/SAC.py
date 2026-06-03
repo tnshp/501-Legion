@@ -4,7 +4,12 @@ import torch.nn.functional as F
 import math
 import numpy as np
 
-from utils.pos_encoding import get_pos_encoding
+from utils.pos_encoding import (
+    get_pos_encoding,
+    LearnedFourierPosEncoding,
+    LearnedFourierScalarEncoding,
+    FourierAngleEncoding,
+)
 
 class Encoder:
     # planets - [id, owner, x, y, radius, ships, production]
@@ -200,9 +205,17 @@ class Q_network(nn.Module):
         self.max_planets = max_planets
         self.max_fleets = max_fleets
 
-        self.P = nn.Linear(state_dim - 4, d_model)
-        self.F = nn.Linear(state_dim - 4, d_model)
+        self.ship_encoder  = LearnedFourierScalarEncoding()
+        self.angle_encoder = FourierAngleEncoding()
+        # +ship & angle fourier dims, -1 for the raw ship slot ship_encoder replaces
+        _proj_in = ((state_dim - 4) - 1
+                    + self.ship_encoder.out_dim
+                    + self.angle_encoder.out_dim)
+        self.P = nn.Linear(_proj_in, d_model)
+        self.F = nn.Linear(_proj_in, d_model)
         self.A = nn.Linear(action_dim, d_model)
+
+        self.pos_encoder = LearnedFourierPosEncoding(d_model)
 
         self.value_head = nn.Linear(d_model, 1)
 
@@ -233,15 +246,25 @@ class Q_network(nn.Module):
         Returns:
             value: [B]
         """
-        p_end = self.max_planets
-        f_end = p_end + self.max_fleets
+        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        planets_mask[:, :self.max_planets] = 1
 
-        # Project each token type separately — avoids allocating mask tensors on GPU
-        p_embed = self.P(state[:, :p_end,        :10].contiguous())  # [B, P, d]
-        f_embed = self.F(state[:, p_end:f_end,   :10].contiguous())  # [B, F, d]
+        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
+
+        ship_block  = self.ship_encoder(state[:, :, 5:6])
+        angle_block = self.angle_encoder(state[:, :, 4:5])
+
+        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:10], ship_block, angle_block], dim=-1)
+
+        p_embed = self.P(token_feats * planets_mask.unsqueeze(-1))
+        f_embed  = self.F(token_feats * fleets_mask.unsqueeze(-1))
+
         state_embed = torch.cat([p_embed, f_embed], dim=1)           # [B, P+F, d]
 
-        pos_encoding = get_pos_encoding(state[:, :, 11:13], state[:, :, -1], self.d_model)
+        time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
+        pos = state[:, :, 11:13]  # Assuming position is at indices 11 and 12
+        pos_encoding = self.pos_encoder(pos, time_step)
         state_embed = state_embed + pos_encoding
 
         action_embed = self.A(action)  # [B, P, d]
@@ -335,8 +358,16 @@ class P_network(nn.Module):
         self.max_planets = max_planets
         self.max_fleets = max_fleets
 
-        self.P = nn.Linear(state_dim - 4, d_model)
-        self.F = nn.Linear(state_dim - 4, d_model)
+        self.ship_encoder  = LearnedFourierScalarEncoding()
+        self.angle_encoder = FourierAngleEncoding()
+        # +ship & angle fourier dims, -1 for the raw ship slot ship_encoder replaces
+        _proj_in = ((state_dim - 4) - 1
+                    + self.ship_encoder.out_dim
+                    + self.angle_encoder.out_dim)
+        self.P = nn.Linear(_proj_in, d_model)
+        self.F = nn.Linear(_proj_in, d_model)
+
+        self.pos_encoder = LearnedFourierPosEncoding(d_model)
 
         self.mu_head = nn.Linear(d_model, action_dim)
         self.sigma_head = nn.Linear(d_model, action_dim)
@@ -365,14 +396,28 @@ class P_network(nn.Module):
             mu:    [B, max_planets, action_dim]
             log_std: [B, max_planets, action_dim]
         """
+        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        planets_mask[:, :self.max_planets] = 1
+
+        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
+        
         p_end = self.max_planets
         f_end = p_end + self.max_fleets
 
-        p_embed = self.P(state[:, :p_end,      :10].contiguous())  # [B, P, d]
-        f_embed = self.F(state[:, p_end:f_end, :10].contiguous())  # [B, F, d]
+        ship_block  = self.ship_encoder(state[:, :, 5:6])
+        # Fleet heading (index 4 = angle): periodic Fourier code so the model can
+        # judge precisely whether a fleet's trajectory will strike a target planet.
+        # (For planets index 4 is radius; self.P simply learns to downweight it.)
+        angle_block = self.angle_encoder(state[:, :, 4:5])
+        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:10],
+                                 ship_block, angle_block], dim=-1)
+        p_embed = self.P(token_feats * planets_mask.unsqueeze(-1))
+        f_embed  = self.F(token_feats * fleets_mask.unsqueeze(-1))
+
         state_embed = torch.cat([p_embed, f_embed], dim=1)         # [B, P+F, d]
 
-        pos_encoding = get_pos_encoding(state[:, :, 11:13], state[:, :, -1], self.d_model)
+        pos_encoding = self.pos_encoder(state[:, :, 11:13], state[:, :, -1])
         state_embed = state_embed + pos_encoding
 
         out_ = self.transformer(state_embed)  # [B, P+F, d]
