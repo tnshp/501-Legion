@@ -1,4 +1,5 @@
 import copy
+import os
 import time
 import numpy as np
 import torch
@@ -98,6 +99,56 @@ class ReplayBuffer:
 
     def __len__(self):
         return self._size
+
+    # ── persistence ──────────────────────────────────────────────────────────
+    def save(self, path: str):
+        """Atomically write the filled portion of the buffer (+ ptr/size/max so
+        the circular ordering can be restored) to `path`. Writes to a temp file
+        first and os.replace()s it, so an interrupted save can't corrupt an
+        existing buffer file."""
+        n   = self._size
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as f:
+            np.savez(
+                f,
+                states      = self.states     [:n],
+                actions     = self.actions    [:n],
+                rewards     = self.rewards     [:n],
+                next_states = self.next_states[:n],
+                dones       = self.dones      [:n],
+                ptr  = np.int64(self._ptr),
+                size = np.int64(self._size),
+                max  = np.int64(self._max),
+            )
+        os.replace(tmp, path)
+
+    def load(self, path: str) -> bool:
+        """Restore buffer contents from `path`. Returns False if the file is
+        missing. If the saved capacity differs from this buffer's, the saved
+        transitions are restored as a linear prefill (clamped to capacity)."""
+        if not os.path.exists(path):
+            return False
+        data       = np.load(path)
+        saved_max  = int(data["max"])
+        saved_size = int(data["size"])
+        saved_ptr  = int(data["ptr"])
+        n = min(saved_size, self._max)
+
+        self.states     [:n] = data["states"]     [:n]
+        self.actions    [:n] = data["actions"]    [:n]
+        self.rewards    [:n] = data["rewards"]    [:n]
+        self.next_states[:n] = data["next_states"][:n]
+        self.dones      [:n] = data["dones"]      [:n]
+
+        if saved_max == self._max:
+            # Same capacity → restore exact circular state (ptr marks the seam).
+            self._size = saved_size
+            self._ptr  = saved_ptr
+        else:
+            # Different capacity → treat restored rows as a fresh linear prefill.
+            self._size = n
+            self._ptr  = n % self._max
+        return True
 
 
 # =============================================================================
@@ -887,6 +938,20 @@ class SACTrainer:
             self.q2_target.load_state_dict(ckpt["q2_target"])
         self.train_step = ckpt["train_step"]
         print(f"Checkpoint loaded ← {path}")
+
+    def save_replay_buffer(self, path: str):
+        self.replay_buffer.save(path)
+        size_mb = os.path.getsize(path) / 1e6
+        print(f"Replay buffer saved → {path} "
+              f"({len(self.replay_buffer)} transitions, {size_mb:.0f} MB)")
+
+    def load_replay_buffer(self, path: str) -> bool:
+        if self.replay_buffer.load(path):
+            print(f"Replay buffer loaded ← {path} "
+                  f"({len(self.replay_buffer)} transitions)")
+            return True
+        print(f"No replay buffer found at {path}; starting with an empty buffer")
+        return False
 
 
 # =============================================================================

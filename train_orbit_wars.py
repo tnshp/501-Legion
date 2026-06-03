@@ -203,6 +203,9 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
     render_dir = io_cfg.get("render_dir", "replays")
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(render_dir, exist_ok=True)
+    # Replay buffer is persisted alongside checkpoints so a resumed run does not
+    # have to rebuild it from scratch.
+    buffer_path = os.path.join(ckpt_dir, "replay_buffer.npz")
 
     num_episodes = train_cfg.get("num_episodes", 250)
 
@@ -307,6 +310,7 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
     resume = exec_cfg.get("resume")
     if resume:
         trainer.load_checkpoint(resume)
+        trainer.load_replay_buffer(buffer_path)
 
     episode_rewards: list[float] = []
     episode_wins: list[bool] = []
@@ -417,9 +421,11 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
                 ckpt_dir, f"sac_ep{episode + 1:05d}.pt"
             )
             trainer.save_checkpoint(ckpt_path)
+            trainer.save_replay_buffer(buffer_path)
 
     # ── final save ────────────────────────────────────────────────────────────
     trainer.save_checkpoint(os.path.join(ckpt_dir, "sac_final.pt"))
+    trainer.save_replay_buffer(buffer_path)
     trainer.close()
     env_2p.close()
     if env_4p:
