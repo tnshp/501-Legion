@@ -739,6 +739,10 @@ class OrbitWarsEnv(gym.Env):
         self.reward_scheme    = reward_scheme
         self.tanh_scale       = tanh_scale
         self.min_fleet_ships  = min_fleet_ships
+        # Number of fleets our agent actually launched on the most recent step
+        # (after decode_action's thresholds). Read by the training loop for the
+        # moving-average "fleets sent" metric.
+        self.last_fleets_sent = 0
 
         if encoder is None:
             from model.SAC import Encoder
@@ -829,6 +833,7 @@ class OrbitWarsEnv(gym.Env):
         moves = decode_action(action, s_planets, omega,
                               tanh_scale=self.tanh_scale,
                               min_fleet_ships=self.min_fleet_ships)
+        self.last_fleets_sent = len(moves)
 
         # Snapshot pre-step state as plain numpy arrays.  The kaggle environment
         # mutates obs0.planets / obs0.fleets in-place, so self._current_obs would

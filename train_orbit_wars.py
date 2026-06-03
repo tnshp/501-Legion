@@ -29,6 +29,7 @@ import math
 import os
 import random
 import time
+from collections import deque
 
 import numpy as np
 import torch
@@ -314,6 +315,9 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
 
     episode_rewards: list[float] = []
     episode_wins: list[bool] = []
+    # Rolling window of fleets-sent-per-step. Tracked across episodes (not reset
+    # per episode) so the metric is independent of variable episode length.
+    fleets_window: deque[int] = deque(maxlen=50)
     t0 = time.perf_counter()
 
     max_steps = train_cfg.get("max_steps", 500)
@@ -358,6 +362,15 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
             ep_reward += reward
             ep_length += 1
             state = next_state
+
+            # ── per-step fleets-sent moving average (window = 50 steps) ────────
+            fleets_window.append(env.last_fleets_sent)
+            if trainer.writer:
+                trainer.writer.add_scalar(
+                    "Policy/fleets_sent_ma50",
+                    float(np.mean(fleets_window)),
+                    trainer.train_step,
+                )
 
             if (
                 trainer.train_step >= warmup_steps
