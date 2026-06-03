@@ -1,5 +1,5 @@
 {
-    "num_episodes" :200 ,
+    "num_episodes" :1000 ,
     "warmup_steps" :500 ,
     "update_frequency" : 8 ,
     "gradient_steps" : 2 ,
@@ -7,9 +7,9 @@
     "render_interval" : 10 ,
     "checkpoint_interval" : 20 ,
     "checkpoint_path" : "checkpoints",
-    "checkpoint_load_path" : "checkpoints/50sac_model_dual.pt",
-    "training_data_load_path" : "checkpoints/50sac_model_dual.json",
+    "checkpoint_load_path" : "checkpoints/EP340_.pt",
+    "training_data_load_path" : "checkpoints/EP340_..json",
     "rule_based_ratio" : 1.0,
-    "opponent_noise" : 0.1 ,
+    "opponent_noise" : 0.3 ,
     "prob_4p"  : 0.5
 }

@@ -256,66 +256,66 @@ class Q_network(nn.Module):
         return value.squeeze(-1)                # [B]
     
 
-class V_network(nn.Module):
-    def __init__(self, 
-                 state_dim=14,
-                 max_planets=40,
-                 max_fleets=100,
-                 d_model=128, 
-                 nhead=4, 
-                 num_layers=2,  
-                 dim_feedforward=128, 
-                 dropout=0.1):
+# class V_network(nn.Module):
+#     def __init__(self, 
+#                  state_dim=14,
+#                  max_planets=40,
+#                  max_fleets=100,
+#                  d_model=128, 
+#                  nhead=4, 
+#                  num_layers=2,  
+#                  dim_feedforward=128, 
+#                  dropout=0.1):
         
-        super(V_network, self).__init__()
-        self.max_planets = max_planets
-        self.max_fleets = max_fleets
+#         super(V_network, self).__init__()
+#         self.max_planets = max_planets
+#         self.max_fleets = max_fleets
         
-        self.P = nn.Linear(state_dim - 4, d_model)
-        self.F = nn.Linear(state_dim - 4, d_model)
+#         self.P = nn.Linear(state_dim - 4, d_model)
+#         self.F = nn.Linear(state_dim - 4, d_model)
 
-        self.value_head = nn.Linear(d_model, 1)
+#         self.value_head = nn.Linear(d_model, 1)
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+#         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
-        #transformer - encoder only
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation='relu',
-            batch_first=True  # Recommended for easier tensor handling
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, 
-                                                 num_layers=num_layers, 
-        )
-        self.d_model = d_model
+#         #transformer - encoder only
+#         encoder_layer = nn.TransformerEncoderLayer(
+#             d_model=d_model, 
+#             nhead=nhead, 
+#             dim_feedforward=dim_feedforward,
+#             dropout=dropout,
+#             activation='relu',
+#             batch_first=True  # Recommended for easier tensor handling
+#         )
+#         self.transformer = nn.TransformerEncoder(encoder_layer, 
+#                                                  num_layers=num_layers, 
+#         )
+#         self.d_model = d_model
 
-    def forward(self, state):
-        """
-        Args:
-            state: [B, max_planets+max_fleets, state_dim]
-        Returns:
-            value: [B]
-        """
-        p_end = self.max_planets
-        f_end = p_end + self.max_fleets
+#     def forward(self, state):
+#         """
+#         Args:
+#             state: [B, max_planets+max_fleets, state_dim]
+#         Returns:
+#             value: [B]
+#         """
+#         p_end = self.max_planets
+#         f_end = p_end + self.max_fleets
 
-        p_embed = self.P(state[:, :p_end,      :10].contiguous())  # [B, P, d]
-        f_embed = self.F(state[:, p_end:f_end, :10].contiguous())  # [B, F, d]
-        state_embed = torch.cat([p_embed, f_embed], dim=1)         # [B, P+F, d]
+#         p_embed = self.P(state[:, :p_end,      :10].contiguous())  # [B, P, d]
+#         f_embed = self.F(state[:, p_end:f_end, :10].contiguous())  # [B, F, d]
+#         state_embed = torch.cat([p_embed, f_embed], dim=1)         # [B, P+F, d]
 
-        pos_encoding = get_pos_encoding(state[:, :, 11:13], state[:, :, -1], self.d_model)
-        state_embed = state_embed + pos_encoding
+#         pos_encoding = get_pos_encoding(state[:, :, 11:13], state[:, :, -1], self.d_model)
+#         state_embed = state_embed + pos_encoding
 
-        batch_size = state_embed.shape[0]
-        cls_token = self.cls_token.expand(batch_size, -1, -1)
+#         batch_size = state_embed.shape[0]
+#         cls_token = self.cls_token.expand(batch_size, -1, -1)
 
-        src = torch.cat([cls_token, state_embed], dim=1)
-        out_ = self.transformer(src)
-        value = self.value_head(out_[:, 0, :])  # [B, 1]
-        return value.squeeze(-1)                # [B]
+#         src = torch.cat([cls_token, state_embed], dim=1)
+#         out_ = self.transformer(src)
+#         value = self.value_head(out_[:, 0, :])  # [B, 1]
+#         return value.squeeze(-1)                # [B]
     
 
 class P_network(nn.Module):
@@ -363,7 +363,7 @@ class P_network(nn.Module):
             state: [B, max_planets+max_fleets, state_dim]
         Returns:
             mu:    [B, max_planets, action_dim]
-            sigma: [B, max_planets, action_dim]
+            log_std: [B, max_planets, action_dim]
         """
         p_end = self.max_planets
         f_end = p_end + self.max_fleets
@@ -379,8 +379,13 @@ class P_network(nn.Module):
 
         planet_out = out_[:, :self.max_planets, :]          # [B, P, d]
         mu    = self.mu_head(planet_out)                    # [B, P, action_dim]
-        sigma = F.softplus(self.sigma_head(planet_out)) + 1e-5
-        return mu, sigma
+        # sigma = F.softplus(self.sigma_head(planet_out)) + 1e-5
+        # return mu, sigma
+
+        log_std = self.sigma_head(planet_out)
+        log_std = torch.clamp(log_std, -5.0, 2.0)
+
+        return mu, log_std
 
     def sample(self, state):
         """
@@ -390,14 +395,20 @@ class P_network(nn.Module):
             action   : [B, max_planets, action_dim]
             log_prob : [B, 1]
         """
-        mu, sigma = self.forward(state)
+        mu, log_std = self.forward(state)
+        sigma = torch.exp(log_std)
+        
         eps = torch.randn_like(sigma)
-        action = mu + eps * sigma
+        action_raw = mu + eps * sigma
+        action = torch.tanh(action_raw)
+
         log_prob = (
-            -0.5 * ((action - mu) / sigma) ** 2
-            - sigma.log()
+            -0.5 * eps ** 2
+            - log_std
             - 0.5 * math.log(2.0 * math.pi)
-        ).sum(dim=(-2, -1), keepdim=True).squeeze(-1)  # [B, 1]
+        )
+        log_prob = log_prob - torch.log(1.0 - action ** 2 + 1e-6)
+        log_prob = log_prob.sum(dim=(-2, -1), keepdim=True).squeeze(-1)
         return action, log_prob
     
 # class ActionDecoder(nn.Module):

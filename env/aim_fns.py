@@ -18,7 +18,7 @@ def fleet_speed(ships: int) -> float:
 
 
 def travel_time(x1: float, y1: float, x2: float, y2: float, ships: int, source_rad: float, target_rad: float) -> float:
-    dist = math.hypot(x2 - x1, y2 - y1) - (source_rad+target_rad)+0.1
+    dist = math.hypot(x2 - x1, y2 - y1) - (source_rad+target_rad)
     return dist / fleet_speed(ships) if ships > 0 else 999.0
 
 

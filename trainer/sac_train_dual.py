@@ -321,6 +321,7 @@ class SACTrainer:
             self.writer.add_scalar("Loss/policy",          pi_v,   s)
             self.writer.add_scalar("Policy/mean_log_prob", lp_v,   s)
             self.writer.add_scalar("Loss/mean_q1_pred",    q1_mag, s)
+            self.writer.add_scalar("Loss/mean_q_target",   q_target.mean(), s)
             return {"q1_loss": q1_v, "q2_loss": q2_v, "pi_loss": pi_v}
 
         return None
@@ -342,7 +343,7 @@ class SACTrainer:
             ep_reward_p0: float
         """
         env = make_kaggle_env("orbit_wars", debug=False)
-        env.reset()
+        env.reset(num_opps)
 
         obs = env.steps[0][0].observation
         planets_np, _, _, _, _ = _obs_to_arrays(obs)
@@ -392,18 +393,18 @@ class SACTrainer:
             done     = step_results[0].status != "ACTIVE"
 
             # ── Rewards ───────────────────────────────────────────────────────
-            r_p0 = compute_reward_for_player(obs, new_obs, player_id=0)
-            r_p1 = compute_reward_for_player(obs, new_obs, player_id=1)
+            r_p0 = compute_reward_for_player(obs, new_obs, player_id=0, num_opps = num_opps)
+            r_p1 = compute_reward_for_player(obs, new_obs, player_id=1, num_opps = num_opps)
 
             env_r0 = step_results[0].reward
             env_r1 = step_results[1].reward if len(step_results) > 1 else None
 
             
             won = env_r0>0
-            if abs(env_r0) == 1:
-                env_r0 *= 5000
-            if env_r1 is not None and abs(env_r1) == 1:
-                env_r1 *= 5000
+            if abs(env_r0) >= 1:
+                env_r0 *= 2000
+            if env_r1 is not None and abs(env_r1) >= 1:
+                env_r1 *= 2000
 
             if env_r0 is not None:
                 r_p0 += float(env_r0)
@@ -424,16 +425,16 @@ class SACTrainer:
             state_p1 = new_state_p1
             
             if num_opps>2:
-                r_p2 = compute_reward_for_player(obs, new_obs, player_id=2)
-                r_p3 = compute_reward_for_player(obs, new_obs, player_id=3)
+                r_p2 = compute_reward_for_player(obs, new_obs, player_id=2, num_opps= num_opps)
+                r_p3 = compute_reward_for_player(obs, new_obs, player_id=3, num_opps= num_opps)
                 env_r2 = step_results[2].reward if len(step_results) > 2 else None
                 env_r3 = step_results[3].reward if len(step_results) > 3 else None
-                if env_r2 is not None and abs(env_r2) == 1:
-                    env_r2 *= 5000
+                if env_r2 is not None and abs(env_r2) >= 1:
+                    env_r2 *= 2000
                 if env_r2 is not None:
                     r_p2 += float(env_r2)
-                if env_r3 is not None and abs(env_r3) == 1:
-                    env_r3 *= 5000
+                if env_r3 is not None and abs(env_r3) >= 1:
+                    env_r3 *= 2000
                 if env_r3 is not None:
                     r_p3 += float(env_r3)
 
@@ -475,6 +476,7 @@ class SACTrainer:
         """
         env = make_kaggle_env("orbit_wars", debug=False)
         is4p = len(agent_fns)>1
+        num_opps = len(agent_fns)
         env.reset(4 if is4p else 2)
         obs_p0 = env.steps[0][0].observation
         opp_obs = []
@@ -526,11 +528,11 @@ class SACTrainer:
             done         = step_results[0].status != "ACTIVE"
 
             # ── Reward for player 0 only ──────────────────────────────────────
-            r_p0   = compute_reward_for_player(obs_p0, new_obs_p0, player_id=0)
+            r_p0   = compute_reward_for_player(obs_p0, new_obs_p0, player_id=0, num_opps=num_opps)
             env_r0 = step_results[0].reward
             won = env_r0>0
-            if env_r0 is not None and abs(env_r0) == 1:
-                env_r0 *= 5000
+            if env_r0 is not None and abs(env_r0) >= 1:
+                env_r0 *= 2000
             if env_r0 is not None:
                 r_p0 += float(env_r0)
 
@@ -686,7 +688,7 @@ class SACTrainer:
                 win_count_consec = 0
                 opponent_noise-=opp_noise_inc
 
-        self.save_checkpoint(checkpoint_path)
+        self.save_checkpoint(checkpoint_path + f"/EP{ep+1}_.pt", train_dict)
         return ep_rewards
 
     # =========================================================================
@@ -704,7 +706,7 @@ class SACTrainer:
         }, path)
         print(f"Checkpoint saved → {path}")
         if train_dict is not None:
-            with open(path[:-2] + ".json", "w", encoding="utf-8") as file:
+            with open(path[:-2] + "json", "w", encoding="utf-8") as file:
                 json.dump(train_dict, file, indent=4)
             
 
@@ -764,12 +766,12 @@ if __name__ == "__main__":
         batch_size=64,
         replay_buffer_size=50_000,
         rule_based_agents=rb_agents,
-        log_dir="runs/transformer_sac_dual",
+        log_dir="runs/latest",
         checkpoint_load_path = config["checkpoint_load_path"],
         training_data_load_path = config["training_data_load_path"],
     )
 
-    print("TensorBoard: tensorboard --logdir runs/transformer_sac_dual")
+    print(f"TensorBoard: tensorboard --logdir ./runs/latest")
 
     trainer.train(
         num_episodes = config["num_episodes"],

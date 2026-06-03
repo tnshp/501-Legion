@@ -12,7 +12,7 @@ import numpy as np
 
 from model.SAC import Encoder
 from env.aim_fns import safe_angle, solve_intercept, solve_intercept_at_all_costs
-from scipy.special import softplus
+# from scipy.special import softplus
 MAX_PLANETS  = 44
 MAX_FLEETS   = 1000
 STATE_DIM    = 14
@@ -82,13 +82,25 @@ def encode_obs_as_player(
     return state.astype(np.float32)
 
 
-def compute_reward_for_player(obs_prev, obs_next, player_id: int) -> float:
+def compute_reward_for_player(obs_prev, obs_next, player_id: int, num_opps: int) -> float:
     """Shaped reward: change in (ships + production*10) for player_id."""
     def score(o):
-        return sum(
-            float(p[5]) + float(p[6]) * 10.0
+        positives_planets = sum(
+            float(p[5]) + float(p[6]) * 1.5
             for p in o.planets if int(p[1]) == player_id
         )
+        negatives_planets = sum(
+            float(p[5]) + float(p[6]) * 1.5
+            for p in o.planets if int(p[1]) != player_id
+        )/num_opps
+        positives_fleets = sum(
+            float(f[-1]) for f in o.fleets if int(f[1]) == player_id
+        )
+        negatives_fleets = sum(
+            float(f[-1]) for f in o.fleets if int(f[1]) != player_id
+        )/num_opps
+        transition_score = positives_planets - negatives_planets + 0.75*(positives_fleets - negatives_fleets)
+        return transition_score
     return score(obs_next) - score(obs_prev)
 
 
@@ -124,9 +136,9 @@ def decode_action(
     """
     Decode raw policy output into a list of kaggle moves.
 
-      action[i, 0]  – send logit    (> 0 triggers dispatch from planet i)
-      action[i, 1]  – temperature   (softplus → controls dispatch concentration)
-      action[i, 2:] – 6-dim key     (sparsemax of key dot-products → sparse
+      action[i, 0]  - send logit    (> 0 triggers dispatch from planet i)
+      action[i, 1]  - temperature   (softplus → controls dispatch concentration)
+      action[i, 2:] - 6-dim key     (sparsemax of key dot-products → sparse
                                      distribution over targets; self-weight is
                                      the fraction of ships that stay)
 
@@ -144,7 +156,8 @@ def decode_action(
     act = action_np[:n]
 
     _x = act[:, 1]
-    temp = np.maximum(softplus(_x), 0.1).reshape(-1, 1)
+    temp = np.maximum(np.exp(2*_x), 0.13).reshape(-1, 1)
+    # temp = np.maximum(softplus(_x), 0.1).reshape(-1, 1)
 
     keys = act[:, 2:]
     scaled         = (keys @ keys.T) / temp             # [n, n]
