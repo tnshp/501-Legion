@@ -260,7 +260,7 @@ class Q_network(nn.Module):
         p_embed = self.P(token_feats * planets_mask.unsqueeze(-1))
         f_embed  = self.F(token_feats * fleets_mask.unsqueeze(-1))
 
-        state_embed = torch.cat([p_embed, f_embed], dim=1)           # [B, P+F, d]
+        state_embed = p_embed + f_embed
 
         time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
         pos = state[:, :, 11:13]  # Assuming position is at indices 11 and 12
@@ -410,12 +410,13 @@ class P_network(nn.Module):
         # judge precisely whether a fleet's trajectory will strike a target planet.
         # (For planets index 4 is radius; self.P simply learns to downweight it.)
         angle_block = self.angle_encoder(state[:, :, 4:5])
-        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:10],
-                                 ship_block, angle_block], dim=-1)
+        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:10], ship_block, angle_block], dim=-1)
+
         p_embed = self.P(token_feats * planets_mask.unsqueeze(-1))
         f_embed  = self.F(token_feats * fleets_mask.unsqueeze(-1))
 
-        state_embed = torch.cat([p_embed, f_embed], dim=1)         # [B, P+F, d]
+        # state_embed = torch.cat([p_embed, f_embed], dim=1)         # [B, P+F, d]
+        state_embed = p_embed + f_embed         # [B, P+F, d]
 
         pos_encoding = self.pos_encoder(state[:, :, 11:13], state[:, :, -1])
         state_embed = state_embed + pos_encoding

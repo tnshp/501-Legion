@@ -3,14 +3,24 @@
     "warmup_steps" :500 ,
     "update_frequency" : 8 ,
     "gradient_steps" : 2 ,
+
+    "use_lambda_returns" : false,
+    "lambda_return" :  0.9,
+    "cache_size" :  8000,
+    "block_size" :  50,
+    
+    "refresh_freq" :  1000,
     "log_interval" : 10 ,
     "render_interval" : 10 ,
+
     "checkpoint_interval" : 20 ,
     "checkpoint_path" : "checkpoints",
-    "checkpoint_load_path" : null,
-    "training_data_load_path" : null,
-    "replay_buffer_load_path" : null,
+    "checkpoint_load_path" : "checkpoints/EP240_.pt",
+    "training_data_load_path" : "checkpoints/EP240_.json",
+
+    "replay_buffer_load_path" : "checkpoints/EP200_replay_buffer.pt",
     "replay_storage_interval" : 50,
+
     "rule_based_ratio" : 1.0,
     "opponent_noise" : 0.3 ,
     "prob_4p"  : 0.5

@@ -28,11 +28,14 @@ def _obs_to_arrays(obs, player_id = 0):
     """Return (planets_np [n,7], fleets_np [m,7], comet_ids [k], omega, step)."""
     planets_np = np.array(obs.planets, dtype=np.float32)
 
-    raw_fleets = obs.fleets if obs.fleets else []
-    opp_fleets = raw_fleets[raw_fleets[2]!=player_id]
-    own_fleets = raw_fleets[raw_fleets[2]==player_id]
-    raw_fleets_ordered = opp_fleets+own_fleets
-    fleets_np  = np.array(raw_fleets_ordered, dtype=np.float32) if raw_fleets_ordered else np.empty((0, 7), dtype=np.float32)
+    raw_fleets = np.array(obs.fleets, dtype = np.float32) if obs.fleets else np.empty((0,7), dtype=np.float32)
+    if raw_fleets.size ==0:
+        opp_fleets = raw_fleets[raw_fleets[:,1]!=player_id]
+        own_fleets = raw_fleets[raw_fleets[:,1]==player_id]
+        raw_fleets_ordered = np.vstack((opp_fleets,own_fleets))
+    else:
+        raw_fleets_ordered = raw_fleets
+    fleets_np  = raw_fleets_ordered
 
     raw_comets = getattr(obs, "comet_planet_ids", None) or []
     comet_ids  = np.array(raw_comets, dtype=np.float32)

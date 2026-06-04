@@ -257,6 +257,10 @@ class SACTrainer:
         if replay_buffer_load_path is not None:
             self.saved_buffer = replay_buffer_load_path
 
+        self.pitime = 0
+        self.envtime = 0
+        self.updatetime = 0
+
     # =========================================================================
     # Utilities
     # =========================================================================
@@ -540,12 +544,18 @@ class SACTrainer:
             _, _, _, omega, _ = _obs_to_arrays(obs_p0)
             planets_now = np.array(obs_p0.planets, dtype=np.float32)
             in_warmup   = self.train_step < warmup_steps
+            
+            t0 = time.time()
 
             # ── Player 0: live policy ─────────────────────────────────────────
             if in_warmup:
                 action_p0 = np.random.randn(MAX_PLANETS, ACTION_DIM).astype(np.float32)
             else:
                 action_p0 = self.select_action(state_p0)
+
+            self.pitime += time.time() - t0
+
+            t0 = time.time()
 
             swapped_p0, _ = _swap_perspective(planets_now, np.empty((0, 7), np.float32), player_id=0)
             moves_p0 = decode_action(action_p0, swapped_p0, omega)
@@ -586,6 +596,8 @@ class SACTrainer:
                 opp_obs[1] = step_results[2].observation
                 opp_obs[2] = step_results[3].observation
             state_p0 = new_state_p0
+
+            self.envtime+= time.time() - t0
 
             if done:
                 break
@@ -843,9 +855,11 @@ class SACTrainer:
             self.load_replay_buffer(self.saved_buffer)
         
         opp_noise_inc = (opponent_noise-0.01)/(num_episodes*rule_based_ratio)
-        opponent_noise = opponent_noise_checkpoint            
+        opponent_noise = opponent_noise_checkpoint    
 
         for ep in range(start, num_episodes):
+
+
             num_opps = 3 if np.random.random()<prob_4p else 1
             use_rulebased = bool(rb_agents) and (np.random.random() < rule_based_ratio)
 
@@ -863,6 +877,8 @@ class SACTrainer:
 
             _t0 = time.perf_counter()
 
+            t0 = time.time()
+
             for s, a, r, ns, d in transitions:
                 self.replay_buffer.add(s, a, r, ns, d)
                 self.train_step += 1
@@ -873,6 +889,8 @@ class SACTrainer:
                 ):
                     for _ in range(gradient_steps):
                         self.update()
+
+            self.updatetime+= time.time() - t0
 
             ep_rewards.append(ep_reward)
             ep_wins.append(won)
@@ -904,6 +922,9 @@ class SACTrainer:
                     f"buf={len(self.replay_buffer):>6} | "
                     f"steps={self.train_step}"
                 )
+                print(f"pitime = {self.pitime}")
+                print(f"envtime = {self.envtime}")
+                print(f"updatetime = {self.updatetime}")
                 if profile and _ep_times:
                     _print_profile(_ep_times)
                     _ep_times.clear()
@@ -929,7 +950,7 @@ class SACTrainer:
                 win_count_consec = 0
                 opponent_noise-=opp_noise_inc
 
-        self.save_checkpoint(checkpoint_path + f"/EP{ep+1}_.pt", train_dict)
+        self.save_checkpoint(checkpoint_path + f"replayBuffers/EP{ep+1}_.pt", train_dict)
         return ep_rewards
 
     # =========================================================================
@@ -962,10 +983,10 @@ class SACTrainer:
             "_ptr": self.replay_buffer._ptr,
             "_size": self.replay_buffer._size,
         }
-        torch.save(replay_buffer_ckpt, "replay_buffer"+path)
+        torch.save(replay_buffer_ckpt, path)
     
     def load_replay_buffer(self, path: str):
-        replay_buffer_ckpt = torch.load(path)
+        replay_buffer_ckpt = torch.load(path, weights_only=False)
         self.replay_buffer.states = replay_buffer_ckpt["states"]
         self.replay_buffer.actions = replay_buffer_ckpt["actions"]
         self.replay_buffer.rewards = replay_buffer_ckpt["rewards"]
@@ -1055,13 +1076,18 @@ if __name__ == "__main__":
     trainer = make_transformer_sac_trainer(
         device="cuda" if torch.cuda.is_available() else "cpu",
         learning_rate=1e-4,
-        batch_size=64,
+        batch_size=128,
         replay_buffer_size=50_000,
         rule_based_agents=rb_agents,
         log_dir="runs/latest",
         checkpoint_load_path = config["checkpoint_load_path"],
         training_data_load_path = config["training_data_load_path"],
-        replay_buffer_load_path = config["replay_buffer_load_path"]
+        replay_buffer_load_path = config["replay_buffer_load_path"],
+        use_lambda_returns = config["use_lambda_returns"],
+        lambda_return = config["lambda_return"],
+        cache_size = config["cache_size"],
+        block_size = config["block_size"],
+        refresh_freq = config["refresh_freq"],
     )
 
     print(f"TensorBoard: tensorboard --logdir ./runs/latest")
