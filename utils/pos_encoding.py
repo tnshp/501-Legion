@@ -123,9 +123,9 @@ class LearnedFourierPosEncoding(nn.Module):
     def __init__(self, d_model, num_freqs=32, coord_scale=100.0,
                  min_wavelength=2.0, max_time_step=500.0):
         super().__init__()
-        self.d_model       = d_model
-        self.num_freqs     = num_freqs
-        self.max_time_step = float(max_time_step)
+        self.d_model   = d_model
+        self.num_freqs = num_freqs
+        self.register_buffer("_max_time_step", torch.tensor(float(max_time_step)))
 
         # Init wavelengths log-spaced from the whole board (~coord_scale) down to
         # a few units, so attention can resolve both global position and
@@ -146,7 +146,7 @@ class LearnedFourierPosEncoding(nn.Module):
         x_proj = x * self.freq_x                           # [..., num_freqs]
         y_proj = y * self.freq_y                           # [..., num_freqs]
 
-        t = time_step.to(x.dtype) / self.max_time_step     # [...]
+        t = time_step.to(x.dtype) / self._max_time_step    # [...]
         t = t.unsqueeze(-1)                                # [..., 1]
 
         feats = torch.cat(
@@ -178,7 +178,7 @@ class LearnedFourierScalarEncoding(nn.Module):
 
     def __init__(self, num_freqs=16, max_value=1000.0):
         super().__init__()
-        self.log_max = math.log1p(float(max_value))
+        self.register_buffer("_log_max", torch.tensor(math.log1p(float(max_value))))
         # Broad log-spaced init from ~1 to ~128 cycles over the normalized range;
         # learnable thereafter so training can sharpen resolution where it pays.
         freq_init = 2.0 * math.pi * torch.logspace(0.0, math.log10(128.0), num_freqs)
@@ -186,7 +186,7 @@ class LearnedFourierScalarEncoding(nn.Module):
         self.out_dim = 2 * num_freqs + 1
 
     def forward(self, s):
-        u    = torch.log1p(s.clamp(min=0)) / self.log_max   # [..., 1]
+        u    = torch.log1p(s.clamp(min=0)) / self._log_max  # [..., 1]
         proj = u * self.freq                                # [..., num_freqs]
         return torch.cat([u, torch.sin(proj), torch.cos(proj)], dim=-1)
 

@@ -205,6 +205,12 @@ class Q_network(nn.Module):
         self.max_planets = max_planets
         self.max_fleets = max_fleets
 
+        _seq = max_planets + max_fleets
+        _pm = torch.zeros(_seq); _pm[:max_planets] = 1.0
+        _fm = torch.zeros(_seq); _fm[max_planets:max_planets + max_fleets] = 1.0
+        self.register_buffer("_p_mask", _pm)
+        self.register_buffer("_f_mask", _fm)
+
         self.ship_encoder  = LearnedFourierScalarEncoding()
         self.angle_encoder = FourierAngleEncoding()
         # +ship & angle fourier dims, -1 for the raw ship slot ship_encoder replaces
@@ -246,24 +252,20 @@ class Q_network(nn.Module):
         Returns:
             value: [B]
         """
-        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
-        planets_mask[:, :self.max_planets] = 1
-
-        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
-        fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
-
         ship_block  = self.ship_encoder(state[:, :, 5:6])
         angle_block = self.angle_encoder(state[:, :, 4:5])
 
         token_feats = torch.cat([state[:, :, :5], state[:, :, 6:10], ship_block, angle_block], dim=-1)
 
-        p_embed = self.P(token_feats * planets_mask.unsqueeze(-1))
-        f_embed  = self.F(token_feats * fleets_mask.unsqueeze(-1))
+        p_mask = self._p_mask.unsqueeze(-1)   # [T, 1] — broadcasts over batch and feature dims
+        f_mask = self._f_mask.unsqueeze(-1)
+        p_embed = self.P(token_feats * p_mask)
+        f_embed = self.F(token_feats * f_mask)
 
         state_embed = p_embed + f_embed
 
-        time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
-        pos = state[:, :, 11:13]  # Assuming position is at indices 11 and 12
+        time_step = state[:, :, -1]
+        pos = state[:, :, 11:13]
         pos_encoding = self.pos_encoder(pos, time_step)
         state_embed = state_embed + pos_encoding
 
@@ -358,6 +360,12 @@ class P_network(nn.Module):
         self.max_planets = max_planets
         self.max_fleets = max_fleets
 
+        _seq = max_planets + max_fleets
+        _pm = torch.zeros(_seq); _pm[:max_planets] = 1.0
+        _fm = torch.zeros(_seq); _fm[max_planets:max_planets + max_fleets] = 1.0
+        self.register_buffer("_p_mask", _pm)
+        self.register_buffer("_f_mask", _fm)
+
         self.ship_encoder  = LearnedFourierScalarEncoding()
         self.angle_encoder = FourierAngleEncoding()
         # +ship & angle fourier dims, -1 for the raw ship slot ship_encoder replaces
@@ -396,15 +404,6 @@ class P_network(nn.Module):
             mu:    [B, max_planets, action_dim]
             log_std: [B, max_planets, action_dim]
         """
-        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
-        planets_mask[:, :self.max_planets] = 1
-
-        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
-        fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
-        
-        p_end = self.max_planets
-        f_end = p_end + self.max_fleets
-
         ship_block  = self.ship_encoder(state[:, :, 5:6])
         # Fleet heading (index 4 = angle): periodic Fourier code so the model can
         # judge precisely whether a fleet's trajectory will strike a target planet.
@@ -412,10 +411,11 @@ class P_network(nn.Module):
         angle_block = self.angle_encoder(state[:, :, 4:5])
         token_feats = torch.cat([state[:, :, :5], state[:, :, 6:10], ship_block, angle_block], dim=-1)
 
-        p_embed = self.P(token_feats * planets_mask.unsqueeze(-1))
-        f_embed  = self.F(token_feats * fleets_mask.unsqueeze(-1))
+        p_mask = self._p_mask.unsqueeze(-1)   # [T, 1] — broadcasts over batch and feature dims
+        f_mask = self._f_mask.unsqueeze(-1)
+        p_embed = self.P(token_feats * p_mask)
+        f_embed = self.F(token_feats * f_mask)
 
-        # state_embed = torch.cat([p_embed, f_embed], dim=1)         # [B, P+F, d]
         state_embed = p_embed + f_embed         # [B, P+F, d]
 
         pos_encoding = self.pos_encoder(state[:, :, 11:13], state[:, :, -1])

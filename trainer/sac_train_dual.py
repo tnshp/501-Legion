@@ -179,6 +179,10 @@ class SACTrainer:
         cache_size: int = 8000,
         block_size: int = 50,
         refresh_freq: int = 1000,
+        # gradient clipping / auto-alpha
+        max_grad_norm: Optional[float] = None,
+        auto_alpha: bool = False,
+        target_entropy: Optional[float] = None,
     ):
         self.device     = device
         self._amp       = str(device).startswith("cuda")
@@ -206,6 +210,23 @@ class SACTrainer:
         self._last_cache_step   = -(10 ** 9)
         self._cache_refreshes   = 0
 
+        # ── gradient clipping / auto-alpha ────────────────────────────────────
+        self.max_grad_norm = max_grad_norm
+        self._nan_skips    = 0
+
+        self.auto_alpha = auto_alpha
+        if auto_alpha:
+            self.target_entropy  = float(target_entropy) if target_entropy is not None else -float(np.prod(act_shape))
+            self.log_alpha       = nn.Parameter(torch.zeros(1, device=device))
+            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=learning_rate)
+        else:
+            self.target_entropy  = None
+            self.log_alpha       = None
+            self.alpha_optimizer = None
+
+        # identity preprocessors (hook point for future normalization)
+        self.state_preprocessor  = lambda x: x
+        self.action_preprocessor = lambda x: x
 
         # ── live networks ─────────────────────────────────────────────────────
         self.policy_net = policy_net.to(device)
@@ -271,6 +292,13 @@ class SACTrainer:
     def _soft_update(self, target: nn.Module, source: nn.Module):
         for tp, sp in zip(target.parameters(), source.parameters()):
             tp.data.copy_(self.tau * sp.data + (1.0 - self.tau) * tp.data)
+
+    def _grad_norm(self, net: nn.Module) -> float:
+        total = 0.0
+        for p in net.parameters():
+            if p.grad is not None:
+                total += p.grad.data.norm(2).item() ** 2
+        return total ** 0.5
 
     def update_opponent(self):
         """Snapshot the current policy into the frozen opponent."""
@@ -634,15 +662,15 @@ class SACTrainer:
         chunks under no_grad. Returns a 1-D numpy array (NaN/Inf → 0)."""
         out   = []
         chunk = max(self.batch_size, 256)
-        with torch.no_grad():
+        _amp  = torch.autocast("cuda", dtype=torch.bfloat16, enabled=self._amp)
+        with torch.no_grad(), _amp:
             for i in range(0, len(next_states_np), chunk):
-                ns = torch.from_numpy(next_states_np[i:i + chunk])
-                ns = self.state_preprocessor(self._to(ns))
-                a, lp = self.policy_net.sample(ns)                 # a:[c,...], lp:[c,1]
-                q1 = self.q1_net(ns, a).unsqueeze(-1)              # [c,1]
-                q2 = self.q2_net(ns, a).unsqueeze(-1)              # [c,1]
-                v  = torch.min(q1, q2) - self.alpha * lp           # [c,1]
-                out.append(v.squeeze(-1).cpu().numpy())
+                ns = self.state_preprocessor(self._to(torch.from_numpy(next_states_np[i:i + chunk])))
+                a, lp = self.policy_net.sample(ns)
+                q1 = self.q1_net(ns, a).unsqueeze(-1)
+                q2 = self.q2_net(ns, a).unsqueeze(-1)
+                v  = torch.min(q1, q2) - self.alpha * lp
+                out.append(v.squeeze(-1).float().cpu().numpy())
         v_all = np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
         return np.nan_to_num(v_all, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
@@ -736,17 +764,21 @@ class SACTrainer:
                 self.writer.add_scalar("Misc/nan_skips", self._nan_skips, self._update_count)
             return None
 
+        _amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=self._amp)
+
         # ── Q updates toward the precomputed λ-return (shared by Q1 & Q2) ─────
-        q1_pred = self.q1_net(states, actions).unsqueeze(-1)
-        q1_loss = nn.MSELoss()(q1_pred, targets)
+        with _amp:
+            q1_pred = self.q1_net(states, actions).unsqueeze(-1)
+            q1_loss = nn.MSELoss()(q1_pred, targets)
         self.q1_optimizer.zero_grad()
         q1_loss.backward()
         if self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.q1_net.parameters(), self.max_grad_norm)
         self.q1_optimizer.step()
 
-        q2_pred = self.q2_net(states, actions).unsqueeze(-1)
-        q2_loss = nn.MSELoss()(q2_pred, targets)
+        with _amp:
+            q2_pred = self.q2_net(states, actions).unsqueeze(-1)
+            q2_loss = nn.MSELoss()(q2_pred, targets)
         self.q2_optimizer.zero_grad()
         q2_loss.backward()
         if self.max_grad_norm is not None:
@@ -754,10 +786,11 @@ class SACTrainer:
         self.q2_optimizer.step()
 
         # ── Policy update — identical SAC actor objective ─────────────────────
-        a_tilde, lp = self.policy_net.sample(states)
-        q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
-        q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
-        policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
+        with _amp:
+            a_tilde, lp = self.policy_net.sample(states)
+            q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
+            q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
+            policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
         if self.max_grad_norm is not None:
@@ -766,9 +799,10 @@ class SACTrainer:
 
         # NB: no target-network Polyak update — the cache is the stable target.
 
-        # ── Auto-alpha (unchanged) ────────────────────────────────────────────
+        # ── Auto-alpha ────────────────────────────────────────────────────────
         if self.auto_alpha:
-            alpha_loss = -(self.log_alpha.exp() * (lp.detach() + self.target_entropy)).mean()
+            with _amp:
+                alpha_loss = -(self.log_alpha.exp() * (lp.detach() + self.target_entropy)).mean()
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
@@ -1075,9 +1109,9 @@ if __name__ == "__main__":
 
     trainer = make_transformer_sac_trainer(
         device="cuda" if torch.cuda.is_available() else "cpu",
-        learning_rate=1e-4,
-        batch_size=128,
-        replay_buffer_size=50_000,
+        learning_rate=config["learning_rate"],
+        batch_size=config["batch_size"],
+        replay_buffer_size=config["replay_buffer_size"],
         rule_based_agents=rb_agents,
         log_dir="runs/latest",
         checkpoint_load_path = config["checkpoint_load_path"],
@@ -1088,6 +1122,8 @@ if __name__ == "__main__":
         cache_size = config["cache_size"],
         block_size = config["block_size"],
         refresh_freq = config["refresh_freq"],
+        max_grad_norm = config.get("max_grad_norm"),
+        auto_alpha = config.get("auto_alpha", False),
     )
 
     print(f"TensorBoard: tensorboard --logdir ./runs/latest")
