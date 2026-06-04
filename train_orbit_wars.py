@@ -38,6 +38,12 @@ from model.SAC      import P_network, Q_network
 from sac_train      import SACTrainer
 from env.orbit_wars import (
     OrbitWarsEnv,
+    # composable reward components
+    RelativeShipAdvantage, RelativePlanetAdvantage,
+    ShipGrowth, ProductionPlanetDelta,
+    AbsoluteHoldings, FleetLaunchPenalty,
+    TerminalWinBonus, TimeDecayWinBonus,
+    # legacy numbered schemes (backward compatibility)
     RewardScheme1, RewardScheme2, RewardScheme3, RewardScheme4,
 )
 from agents.agent1  import RuleBasedAgent
@@ -318,6 +324,8 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
     # Rolling window of fleets-sent-per-step. Tracked across episodes (not reset
     # per episode) so the metric is independent of variable episode length.
     fleets_window: deque[int] = deque(maxlen=50)
+    # All-time peak of total fleets in play — for sizing MAX_FLEETS.
+    max_fleets_seen = 0
     t0 = time.perf_counter()
 
     max_steps = train_cfg.get("max_steps", 500)
@@ -365,11 +373,23 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
 
             # ── per-step fleets-sent moving average (window = 50 steps) ────────
             fleets_window.append(env.last_fleets_sent)
+            # ── total fleets in play (all players) — for sizing MAX_FLEETS ─────
+            max_fleets_seen = max(max_fleets_seen, env.last_n_fleets)
             if trainer.writer:
                 trainer.writer.add_scalar(
                     "Policy/fleets_sent_ma50",
                     float(np.mean(fleets_window)),
                     trainer.train_step,
+                )
+                # Instantaneous count carries the distribution + peaks (read the
+                # series max for the worst case); the running max plateaus at the
+                # all-time peak so the number to compare against MAX_FLEETS is
+                # unambiguous.
+                trainer.writer.add_scalar(
+                    "Env/fleets_present", env.last_n_fleets, trainer.train_step,
+                )
+                trainer.writer.add_scalar(
+                    "Env/fleets_present_max", max_fleets_seen, trainer.train_step,
                 )
 
             if (
@@ -487,9 +507,26 @@ if __name__ == "__main__":
         torch.manual_seed(seed)
         print(f"Random seed set to: {seed}")
 
-    # Load and instantiate reward schemes
+    # Load and instantiate reward schemes.
+    #
+    # Each entry in the "reward" list is summed every step. The "scheme" key
+    # selects the class; every *other* key is passed straight to its constructor,
+    # so a config only specifies the params that scheme actually declares
+    # (e.g. ship_scale, planet_scale, win_bonus). Compose a full reward by listing
+    # several components — e.g. RelativeShipAdvantage + RelativePlanetAdvantage +
+    # TimeDecayWinBonus reproduces (and improves on) the old RewardScheme1.
     reward_cfg_list = config.get("reward", [])
     reward_scheme_map = {
+        # composable single-responsibility components
+        "RelativeShipAdvantage":   RelativeShipAdvantage,
+        "RelativePlanetAdvantage": RelativePlanetAdvantage,
+        "ShipGrowth":              ShipGrowth,
+        "ProductionPlanetDelta":   ProductionPlanetDelta,
+        "AbsoluteHoldings":        AbsoluteHoldings,
+        "FleetLaunchPenalty":      FleetLaunchPenalty,
+        "TerminalWinBonus":        TerminalWinBonus,
+        "TimeDecayWinBonus":       TimeDecayWinBonus,
+        # legacy numbered schemes (composites; kept for backward compatibility)
         "RewardScheme1": RewardScheme1,
         "RewardScheme2": RewardScheme2,
         "RewardScheme3": RewardScheme3,
@@ -500,22 +537,14 @@ if __name__ == "__main__":
     if reward_cfg_list:
         for reward_cfg in reward_cfg_list:
             scheme_name = reward_cfg.get("scheme", "RewardScheme1")
-            RewardSchemeClass = reward_scheme_map.get(scheme_name, RewardScheme1)
-
-            # Extract parameters, handling RewardScheme3 which has max_ticks instead
-            if scheme_name == "RewardScheme3":
-                params = {
-                    "ship_scale": reward_cfg.get("ship_scale", 0.5),
-                    "planet_scale": reward_cfg.get("planet_scale", 1.0),
-                    "max_ticks": reward_cfg.get("max_ticks", 200),
-                }
-            else:
-                params = {
-                    "ship_scale": reward_cfg.get("ship_scale", 0.01),
-                    "planet_scale": reward_cfg.get("planet_scale", 1.0),
-                    "win_bonus": reward_cfg.get("win_bonus", 100.0),
-                }
-
+            if scheme_name not in reward_scheme_map:
+                raise ValueError(
+                    f"Unknown reward scheme {scheme_name!r}. "
+                    f"Available: {sorted(reward_scheme_map)}"
+                )
+            RewardSchemeClass = reward_scheme_map[scheme_name]
+            # Pass every key except "scheme" straight to the constructor.
+            params = {k: v for k, v in reward_cfg.items() if k != "scheme"}
             reward_scheme.append(RewardSchemeClass(**params))
             print(f"Loaded {scheme_name} with params: {params}")
     else:

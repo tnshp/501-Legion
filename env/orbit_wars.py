@@ -430,232 +430,347 @@ def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reward shaping — class-based API
+# Reward shaping — composable, single-responsibility components
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Each class below scores ONE thing (a ship delta, a planet delta, a win bonus,
+# …) and returns a float.  The training loop sums a *list* of these instances
+# each step (OrbitWarsEnv.reward_scheme), so a full reward is assembled by
+# composition rather than by one monolithic class.  Every component shares the
+# call signature
+#
+#     reward = component(obs, new_obs, player_id, done, n_players, step, max_steps)
+#
+# where `obs`/`new_obs` are the pre/post-step observations, `done` is True on the
+# terminal step, and `step`/`max_steps` give the current tick and episode limit
+# (used only by the time-decaying win bonus).  `step`/`max_steps` are keyword
+# defaults so the older `component(obs, new_obs, player_id=…, done=…)` call form
+# still works.
+#
+# The legacy numbered schemes (RewardScheme1–4) are retained at the bottom as
+# thin compositions of these components, so existing configs keep working.
+
+# ── shared low-level helpers ──────────────────────────────────────────────────
+
+def _owned_ships(planets: np.ndarray, fleets: np.ndarray, owner: int) -> float:
+    """Total ships an owner controls — on planets AND in in-transit fleets, so
+    launching a fleet does not create a spurious drop in the count."""
+    p_mask  = planets[:, 1] == owner
+    p_ships = float(planets[p_mask, 5].sum()) if p_mask.any() else 0.0
+    f_ships = 0.0
+    if fleets.shape[0] > 0:
+        f_mask  = fleets[:, 1] == owner
+        f_ships = float(fleets[f_mask, 6].sum()) if f_mask.any() else 0.0
+    return p_ships + f_ships
+
+
+def _planet_count(planets: np.ndarray, owner: int) -> int:
+    """Number of planets owned by `owner`."""
+    return int((planets[:, 1] == owner).sum())
+
+
+def _owned_production(planets: np.ndarray, owner: int) -> float:
+    """Total production of planets owned by `owner`."""
+    mask = planets[:, 1] == owner
+    return float(planets[mask, 6].sum()) if mask.any() else 0.0
+
+
+def _terminal_result(planets_new: np.ndarray, fleets_new: np.ndarray,
+                     player_id: int, n_players: int) -> int:
+    """Win/loss/tie at game end, decided by total ships held.
+
+    Returns +1 (player_id holds strictly more ships than every opponent),
+    -1 (some opponent holds more), or 0 (tie).
+    """
+    opponent_ids = [p for p in range(n_players) if p != player_id]
+    my       = _owned_ships(planets_new, fleets_new, player_id)
+    best_opp = max((_owned_ships(planets_new, fleets_new, o) for o in opponent_ids),
+                   default=0.0)
+    if best_opp < my:
+        return 1
+    if best_opp > my:
+        return -1
+    return 0
+
+
+def _time_decay_fraction(step: int, max_steps: int) -> float:
+    """Linear decay weight in [0, 1]: 1.0 at step 1, 0.0 at step `max_steps`."""
+    if max_steps <= 1:
+        return 1.0
+    frac = (max_steps - step) / (max_steps - 1)
+    return min(1.0, max(0.0, frac))
+
+
+# ── per-step shaping components ────────────────────────────────────────────────
+
+class RelativeShipAdvantage:
+    """Reward the change in ship advantage *relative to the opponents*.
+
+        ship_scale × [ (my_ships_Δ) − Σ_opp(opp_ships_Δ) ]
+
+    Positive when you gain ships faster than your opponents (or they lose ships
+    faster than you).  Ships in flight are counted, so launching a fleet is
+    reward-neutral until it actually fights.  (Ship half of the old RewardScheme1.)
+    """
+
+    def __init__(self, ship_scale: float = 0.01):
+        self.ship_scale = ship_scale
+
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        planets_old, fleets_old, _, _, _ = _obs_to_arrays(obs)
+        planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
+        opponent_ids = [p for p in range(n_players) if p != player_id]
+
+        my_δ  = (_owned_ships(planets_new, fleets_new, player_id)
+                 - _owned_ships(planets_old, fleets_old, player_id))
+        opp_δ = sum(_owned_ships(planets_new, fleets_new, o)
+                    - _owned_ships(planets_old, fleets_old, o) for o in opponent_ids)
+        return float(self.ship_scale * (my_δ - opp_δ))
+
+
+class RelativePlanetAdvantage:
+    """Reward the change in planet-count advantage *relative to the opponents*.
+
+        planet_scale × [ (my_planet_cnt_Δ) − Σ_opp(opp_planet_cnt_Δ) ]
+
+    Each planet counts equally (use ProductionPlanetDelta to weight by output).
+    (Planet half of the old RewardScheme1.)
+    """
+
+    def __init__(self, planet_scale: float = 1.0):
+        self.planet_scale = planet_scale
+
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        planets_old, _, _, _, _ = _obs_to_arrays(obs)
+        planets_new, _, _, _, _ = _obs_to_arrays(new_obs)
+        opponent_ids = [p for p in range(n_players) if p != player_id]
+
+        my_δ  = _planet_count(planets_new, player_id) - _planet_count(planets_old, player_id)
+        opp_δ = sum(_planet_count(planets_new, o) - _planet_count(planets_old, o)
+                    for o in opponent_ids)
+        return float(self.planet_scale * (my_δ - opp_δ))
+
+
+class ShipGrowth:
+    """Reward the change in your OWN ship total, ignoring opponents.
+
+        ship_scale × my_ships_Δ
+
+    A pure self-improvement signal (ship half of the old RewardScheme2).
+    """
+
+    def __init__(self, ship_scale: float = 0.01):
+        self.ship_scale = ship_scale
+
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        planets_old, fleets_old, _, _, _ = _obs_to_arrays(obs)
+        planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
+        my_δ = (_owned_ships(planets_new, fleets_new, player_id)
+                - _owned_ships(planets_old, fleets_old, player_id))
+        return float(self.ship_scale * my_δ)
+
+
+class ProductionPlanetDelta:
+    """Reward captured planets and penalise lost ones, weighted by production.
+
+        planet_scale × ( Σ production of planets gained this step
+                         − Σ production of planets lost this step )
+
+    Taking a high-production planet is worth more than a low-production one.
+    (Planet half of the old RewardScheme2.)
+    """
+
+    def __init__(self, planet_scale: float = 1.0):
+        self.planet_scale = planet_scale
+
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        planets_old, _, _, _, _ = _obs_to_arrays(obs)
+        planets_new, _, _, _, _ = _obs_to_arrays(new_obs)
+
+        old_owned = {int(r[0]): float(r[6]) for r in planets_old if int(r[1]) == player_id}
+        new_owned = {int(r[0]): float(r[6]) for r in planets_new if int(r[1]) == player_id}
+        captured = sum(prod for k, prod in new_owned.items() if k not in old_owned)
+        lost     = sum(prod for k, prod in old_owned.items() if k not in new_owned)
+        return float(self.planet_scale * (captured - lost))
+
+
+class AbsoluteHoldings:
+    """Score CURRENT holdings each step (absolute, not a delta).
+
+        ship_scale × my_ships_now + planet_scale × my_production_now
+
+    Unlike the delta components this does NOT telescope over an episode, so the
+    episode return reflects *how much was held and for how long* — holding
+    high-production territory pays every step.  Keep ship_scale small relative to
+    planet_scale (ship counts grow into the thousands).  (Old RewardScheme4 body.)
+    """
+
+    def __init__(self, ship_scale: float = 0.01, planet_scale: float = 1.0):
+        self.ship_scale   = ship_scale
+        self.planet_scale = planet_scale
+
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
+        my_ships      = _owned_ships(planets_new, fleets_new, player_id)
+        my_production = _owned_production(planets_new, player_id)
+        return float(self.ship_scale * my_ships + self.planet_scale * my_production)
+
+
+class FleetLaunchPenalty:
+    """Flat penalty per fleet launched this step, discouraging fleet spam.
+
+        −ship_scale × (number of new fleets owned by player_id)
+
+    A fleet is "new" if its id appears in new_obs but not in obs; the penalty is
+    independent of fleet size or destination.  (Old RewardScheme3.)
+    """
+
+    def __init__(self, ship_scale: float = 0.5):
+        self.ship_scale = ship_scale
+
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        _, fleets_old, _, _, _ = _obs_to_arrays(obs)
+        _, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
+        if fleets_new.shape[0] == 0:
+            return 0.0
+        old_ids = {int(r[0]) for r in fleets_old} if fleets_old.shape[0] > 0 else set()
+        num_new = sum(1 for f in fleets_new
+                      if int(f[0]) not in old_ids and int(f[1]) == player_id)
+        return float(-self.ship_scale * num_new)
+
+
+class TerminalWinBonus:
+    """Flat ±win_bonus awarded on the terminal step (0 otherwise).
+
+        +win_bonus on a win, −win_bonus on a loss, 0 on a tie.
+
+    Win/loss is decided by total ships held at game end (see _terminal_result).
+    This is the constant-magnitude bonus embedded in the old RewardScheme1/2/4.
+    For a bonus that rewards *winning quickly*, use TimeDecayWinBonus instead.
+    """
+
+    def __init__(self, win_bonus: float = 100.0):
+        self.win_bonus = win_bonus
+
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        if not done:
+            return 0.0
+        planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
+        return float(self.win_bonus * _terminal_result(planets_new, fleets_new,
+                                                        player_id, n_players))
+
+
+class TimeDecayWinBonus:
+    """±win_bonus on the terminal step, scaled DOWN the later the game ends.
+
+        bonus = result × win_bonus × (max_steps − step) / (max_steps − 1)
+
+    where result ∈ {+1 win, −1 loss, 0 tie}.  The decay weight is 1.0 at step 1
+    and falls linearly to 0.0 at step `max_steps`:
+
+        win/lose at step 1     → full ±win_bonus
+        win/lose at step 500   → 0   (with max_steps = 500)
+
+    This rewards *winning fast* and softens *losing slowly* — a late loss is
+    barely penalised, an early loss is penalised in full.  `step`/`max_steps` are
+    supplied by OrbitWarsEnv.step (the current tick and the episode limit).
+    """
+
+    def __init__(self, win_bonus: float = 100.0):
+        self.win_bonus = win_bonus
+
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        if not done:
+            return 0.0
+        planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
+        result = _terminal_result(planets_new, fleets_new, player_id, n_players)
+        if result == 0:
+            return 0.0
+        return float(result * self.win_bonus * _time_decay_fraction(step, max_steps))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy numbered schemes — kept for backward compatibility.
+#
+# Each is now a thin composition of the components above and reproduces the old
+# behaviour exactly.  Prefer composing the named components directly in new
+# configs; these remain so existing configs / checkpoints keep working.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RewardScheme1:
-    """
-    Shaped reward: relative ship advantage + planet advantage + terminal bonus.
+    """Legacy: RelativeShipAdvantage + RelativePlanetAdvantage + TerminalWinBonus."""
 
-    Components
-    ----------
-    ship_scale   × (our_ships_Δ − sum_opp_ships_Δ)
-    planet_scale × (our_planet_cnt_Δ − sum_opp_planet_cnt_Δ)
-    ±100 terminal bonus on win / loss
-
-    Parameters
-    ----------
-    ship_scale   : float, default 0.01
-    planet_scale : float, default 1.0
-    """
-
-    def __init__(self, ship_scale: float = 0.01, planet_scale: float = 1.0, win_bonus: float = 100.0):
+    def __init__(self, ship_scale: float = 0.01, planet_scale: float = 1.0,
+                 win_bonus: float = 100.0):
         self.ship_scale   = ship_scale
         self.planet_scale = planet_scale
-        self.win_bonus     = win_bonus
+        self.win_bonus    = win_bonus
+        self._parts = (RelativeShipAdvantage(ship_scale),
+                       RelativePlanetAdvantage(planet_scale),
+                       TerminalWinBonus(win_bonus))
 
     def __call__(self, obs, new_obs, player_id: int, done: bool,
-                 n_players: int = 2) -> float:
-        planets_old, fleets_old, _, _, _ = _obs_to_arrays(obs)
-        planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
-
-        pid          = player_id
-        opponent_ids = [p for p in range(n_players) if p != pid]
-
-        def _ships(p, f, owner):
-            # Count ships on planets AND in-transit fleets so fleet sends
-            # don't create spurious negative signals.
-            p_mask  = p[:, 1] == owner
-            p_ships = float(p[p_mask, 5].sum()) if p_mask.any() else 0.0
-            f_ships = 0.0
-            if f.shape[0] > 0:
-                f_mask  = f[:, 1] == owner
-                f_ships = float(f[f_mask, 6].sum()) if f_mask.any() else 0.0
-            return p_ships + f_ships
-
-        def _count(p, owner):
-            return int((p[:, 1] == owner).sum())
-
-        my_ships_δ   = _ships(planets_new, fleets_new, pid) - _ships(planets_old, fleets_old, pid)
-        opp_ships_δ  = sum(_ships(planets_new, fleets_new, o) - _ships(planets_old, fleets_old, o) for o in opponent_ids)
-        ship_delta   = my_ships_δ - opp_ships_δ
-
-        my_cnt_δ     = _count(planets_new, pid) - _count(planets_old, pid)
-        opp_cnt_δ    = sum(_count(planets_new, o) - _count(planets_old, o) for o in opponent_ids)
-        planet_delta = my_cnt_δ - opp_cnt_δ
-
-        terminal_bonus = 0.0
-        if done:
-            my_ships_final = _ships(planets_new, fleets_new, pid)
-            best_opp       = max((_ships(planets_new, fleets_new, o) for o in opponent_ids), default=0.0)
-            if best_opp < my_ships_final:
-                terminal_bonus =  self.win_bonus
-            elif best_opp > my_ships_final:
-                terminal_bonus = -self.win_bonus
-
-        return float(self.ship_scale * ship_delta + self.planet_scale * planet_delta + terminal_bonus)
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        return float(sum(p(obs, new_obs, player_id, done, n_players, step, max_steps)
+                         for p in self._parts))
 
 
 class RewardScheme2:
-    """
-    Shaped reward: own ship delta + production-weighted planet delta + terminal bonus.
-    Ignores opponent metrics — pure self-improvement signal.
+    """Legacy: ShipGrowth + ProductionPlanetDelta + TerminalWinBonus."""
 
-    Planet captures/losses are weighted by the planet's production value, so
-    taking a high-production planet yields a larger reward than a low-production one.
-
-    Parameters
-    ----------
-    ship_scale   : float, default 0.01
-    planet_scale : float, default 1.0 — multiplied by production of captured/lost planet
-    """
-
-    def __init__(self, ship_scale: float = 0.01, planet_scale: float = 1.0, win_bonus: float = 100.0):
+    def __init__(self, ship_scale: float = 0.01, planet_scale: float = 1.0,
+                 win_bonus: float = 100.0):
         self.ship_scale   = ship_scale
         self.planet_scale = planet_scale
-        self.win_bonus     = win_bonus
+        self.win_bonus    = win_bonus
+        self._parts = (ShipGrowth(ship_scale),
+                       ProductionPlanetDelta(planet_scale),
+                       TerminalWinBonus(win_bonus))
 
     def __call__(self, obs, new_obs, player_id: int, done: bool,
-                 n_players: int = 2) -> float:
-        planets_old, fleets_old, _, _, _ = _obs_to_arrays(obs)
-        planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
-
-        pid          = player_id
-        opponent_ids = [p for p in range(n_players) if p != pid]
-
-        def _ships(p, f, owner):
-            p_mask  = p[:, 1] == owner
-            p_ships = float(p[p_mask, 5].sum()) if p_mask.any() else 0.0
-            f_ships = 0.0
-            if f.shape[0] > 0:
-                f_mask  = f[:, 1] == owner
-                f_ships = float(f[f_mask, 6].sum()) if f_mask.any() else 0.0
-            return p_ships + f_ships
-
-        my_ships_δ = _ships(planets_new, fleets_new, pid) - _ships(planets_old, fleets_old, pid)
-
-        # Production-weighted planet delta: sum production of gained minus lost planets.
-        old_owned = {int(r[0]): float(r[6]) for r in planets_old if int(r[1]) == pid}
-        new_owned = {int(r[0]): float(r[6]) for r in planets_new if int(r[1]) == pid}
-        captured_prod = sum(prod for pid_k, prod in new_owned.items() if pid_k not in old_owned)
-        lost_prod     = sum(prod for pid_k, prod in old_owned.items() if pid_k not in new_owned)
-        planet_delta  = captured_prod - lost_prod
-
-        terminal_bonus = 0.0
-        if done:
-            my_ships_final = _ships(planets_new, fleets_new, pid)
-            best_opp       = max((_ships(planets_new, fleets_new, o) for o in opponent_ids), default=0.0)
-            if best_opp < my_ships_final:
-                terminal_bonus =  self.win_bonus
-            elif best_opp > my_ships_final:
-                terminal_bonus = -self.win_bonus
-
-        return float(self.ship_scale * my_ships_δ + self.planet_scale * planet_delta + terminal_bonus)
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        return float(sum(p(obs, new_obs, player_id, done, n_players, step, max_steps)
+                         for p in self._parts))
 
 
 class RewardScheme3:
-    """
-    Penalises the agent for sending fleets, discouraging spam.
-
-    Each new fleet launched this step (present in new_obs but not in obs) that
-    is owned by player_id incurs a flat penalty of -ship_scale, regardless of
-    where the fleet is headed or how many ships it carries.
-
-    Total penalty = -ship_scale * num_new_fleets_sent
-
-    Parameters
-    ----------
-    ship_scale   : float, default 0.5 — penalty per fleet launched
-    planet_scale : float, default 1.0 — unused, kept for API symmetry
-    max_ticks    : int,   default 200 — unused, kept for API symmetry
-    """
+    """Legacy alias for FleetLaunchPenalty (planet_scale / max_ticks unused)."""
 
     def __init__(self, ship_scale: float = 0.5, planet_scale: float = 1.0,
                  max_ticks: int = 200):
         self.ship_scale   = ship_scale
         self.planet_scale = planet_scale
         self.max_ticks    = max_ticks
+        self._part = FleetLaunchPenalty(ship_scale)
 
     def __call__(self, obs, new_obs, player_id: int, done: bool,
-                 n_players: int = 2) -> float:
-        _, fleets_old, _, _, _ = _obs_to_arrays(obs)
-        _, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
-
-        if fleets_new.shape[0] == 0:
-            return 0.0
-
-        old_ids = {int(r[0]) for r in fleets_old} if fleets_old.shape[0] > 0 else set()
-
-        num_new = sum(
-            1 for f in fleets_new
-            if int(f[0]) not in old_ids and int(f[1]) == player_id
-        )
-
-        return -self.ship_scale * num_new
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        return self._part(obs, new_obs, player_id, done, n_players, step, max_steps)
 
 
 class RewardScheme4:
-    """
-    State-based (absolute) reward — scores the player's CURRENT holdings each
-    step rather than the change since the previous step.
+    """Legacy: AbsoluteHoldings + TerminalWinBonus."""
 
-    Unlike the delta schemes (1/2), this does NOT telescope over an episode:
-    Σ_t reward_t = Σ_t (ship_scale·ships_t + planet_scale·production_t) + bonus,
-    so the episode total reflects *how much was held and for how long*.
-    Capturing and *holding* high-production territory yields a sustained positive
-    signal; losing planets immediately lowers every subsequent step's reward.
-
-        ship_scale   × my_ships_now
-      + planet_scale × sum_of_production_of_my_planets_now
-      ± win_bonus    (terminal, on win/loss)
-
-    Scaling note
-    ------------
-    my_ships grows into the hundreds/thousands via production, so keep
-    ship_scale small relative to planet_scale or the ship term dominates.
-
-    Parameters
-    ----------
-    ship_scale   : float, default 0.01
-    planet_scale : float, default 1.0 — multiplied by total owned production
-    win_bonus    : float, default 100.0
-    """
-
-    def __init__(self, ship_scale: float = 0.01, planet_scale: float = 1.0, win_bonus: float = 100.0):
+    def __init__(self, ship_scale: float = 0.01, planet_scale: float = 1.0,
+                 win_bonus: float = 100.0):
         self.ship_scale   = ship_scale
         self.planet_scale = planet_scale
-        self.win_bonus     = win_bonus
+        self.win_bonus    = win_bonus
+        self._parts = (AbsoluteHoldings(ship_scale, planet_scale),
+                       TerminalWinBonus(win_bonus))
 
     def __call__(self, obs, new_obs, player_id: int, done: bool,
-                 n_players: int = 2) -> float:
-        # Only the post-step state matters for an absolute reward; obs unused.
-        planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
-
-        pid          = player_id
-        opponent_ids = [p for p in range(n_players) if p != pid]
-
-        def _ships(p, f, owner):
-            p_mask  = p[:, 1] == owner
-            p_ships = float(p[p_mask, 5].sum()) if p_mask.any() else 0.0
-            f_ships = 0.0
-            if f.shape[0] > 0:
-                f_mask  = f[:, 1] == owner
-                f_ships = float(f[f_mask, 6].sum()) if f_mask.any() else 0.0
-            return p_ships + f_ships
-
-        my_ships      = _ships(planets_new, fleets_new, pid)
-        my_mask       = planets_new[:, 1] == pid
-        my_production = float(planets_new[my_mask, 6].sum()) if my_mask.any() else 0.0
-
-        terminal_bonus = 0.0
-        if done:
-            best_opp = max((_ships(planets_new, fleets_new, o) for o in opponent_ids), default=0.0)
-            if best_opp < my_ships:
-                terminal_bonus =  self.win_bonus
-            elif best_opp > my_ships:
-                terminal_bonus = -self.win_bonus
-
-        return float(self.ship_scale * my_ships + self.planet_scale * my_production + terminal_bonus)
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        return float(sum(p(obs, new_obs, player_id, done, n_players, step, max_steps)
+                         for p in self._parts))
 
 
 # ── Module-level default instances (backward compatibility) ──────────────────
@@ -743,6 +858,10 @@ class OrbitWarsEnv(gym.Env):
         # (after decode_action's thresholds). Read by the training loop for the
         # moving-average "fleets sent" metric.
         self.last_fleets_sent = 0
+        # Total fleets present in play (all players) after the most recent step —
+        # this is what the encoder truncates to MAX_FLEETS, so the training loop
+        # logs it to size MAX_FLEETS.
+        self.last_n_fleets = 0
 
         if encoder is None:
             from model.SAC import Encoder
@@ -857,6 +976,8 @@ class OrbitWarsEnv(gym.Env):
         n_my_fleets  = (int((fleets_new[:, 1] == self.player_id).sum())
                         if fleets_new.shape[0] > 0 else 0)
         eliminated   = (n_my_planets == 0) and (n_my_fleets == 0)
+        # Total fleets in play (all players) — the quantity truncated to MAX_FLEETS.
+        self.last_n_fleets = int(fleets_new.shape[0])
 
         truncated  = self._time_step >= self.max_steps
         terminated = (bool(done) or eliminated) and not truncated
@@ -871,6 +992,8 @@ class OrbitWarsEnv(gym.Env):
                 obs_pre, raw_obs, self.player_id,
                 done=terminated or truncated,
                 n_players=self.n_players,
+                step=self._time_step,
+                max_steps=self.max_steps,
             )
 
         self._current_obs = raw_obs

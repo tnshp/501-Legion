@@ -6,6 +6,69 @@
 mixed_random_ratio_decay = None -> spawn all training episodes
 
 
+## Reward schemes
+
+Rewards are **composable**. The `"reward"` list in the config holds one or more
+*components*; their per-step values are **summed** to form the reward the agent
+sees. Each component scores exactly one thing and lives in
+[env/orbit_wars.py](env/orbit_wars.py). The `"scheme"` key picks the class; every
+other key is forwarded straight to its constructor, so a config only lists the
+parameters that scheme actually declares.
+
+Every component is called as
+`component(obs, new_obs, player_id, done, n_players, step, max_steps)` and returns
+a float. `obs`/`new_obs` are the pre/post-step observations, `done` is True on the
+terminal step, and `step`/`max_steps` are the current tick and the episode limit
+(used only by `TimeDecayWinBonus`).
+
+### Per-step shaping components
+
+| Component | Formula (per step) | What it rewards |
+|---|---|---|
+| `RelativeShipAdvantage` | `ship_scale × [ Δmy_ships − Σ Δopp_ships ]` | Gaining ships faster than opponents. Ships in flight are counted, so launching a fleet is neutral until it fights. |
+| `RelativePlanetAdvantage` | `planet_scale × [ Δmy_planet_cnt − Σ Δopp_planet_cnt ]` | Taking more planets than opponents (each planet counts equally). |
+| `ShipGrowth` | `ship_scale × Δmy_ships` | Growing your own fleet, opponents ignored (pure self-improvement). |
+| `ProductionPlanetDelta` | `planet_scale × (Σ prod gained − Σ prod lost)` | Capturing planets, weighted by their production. |
+| `AbsoluteHoldings` | `ship_scale × my_ships_now + planet_scale × my_prod_now` | *Holding* territory — scored every step, so it pays to keep high-production planets. Does **not** telescope: keep `ship_scale` small. |
+| `FleetLaunchPenalty` | `−ship_scale × n_new_fleets` | (Penalty) discourages fleet spam — flat cost per fleet launched, regardless of size/destination. |
+
+### Terminal win-bonus components
+
+Both award a bonus on the final step only, with sign from total ships held at game
+end (`+` win, `−` loss, `0` tie).
+
+| Component | Formula | Notes |
+|---|---|---|
+| `TerminalWinBonus` | `±win_bonus` | Constant magnitude regardless of when the game ends. |
+| `TimeDecayWinBonus` | `±win_bonus × (max_steps − step) / (max_steps − 1)` | **Decays with game length:** full `±win_bonus` for a win/loss at step 1, linearly down to `0` at `step = max_steps`. Rewards *winning fast* and softens *losing slowly* (a late loss is barely penalised, an early loss in full). |
+
+### Example config
+
+```json
+"reward": [
+  { "scheme": "AbsoluteHoldings",   "ship_scale": 0.5, "planet_scale": 1.0 },
+  { "scheme": "FleetLaunchPenalty", "ship_scale": 1.0 },
+  { "scheme": "TimeDecayWinBonus",  "win_bonus": 1000 }
+]
+```
+
+### Legacy numbered schemes (backward compatible)
+
+The old monolithic `RewardScheme1–4` are retained as thin compositions of the
+components above and reproduce their old behaviour exactly, so existing configs
+keep working. Prefer composing the named components in new configs.
+
+| Legacy | Equivalent composition |
+|---|---|
+| `RewardScheme1(ship_scale, planet_scale, win_bonus)` | `RelativeShipAdvantage(ship_scale)` + `RelativePlanetAdvantage(planet_scale)` + `TerminalWinBonus(win_bonus)` |
+| `RewardScheme2(ship_scale, planet_scale, win_bonus)` | `ShipGrowth(ship_scale)` + `ProductionPlanetDelta(planet_scale)` + `TerminalWinBonus(win_bonus)` |
+| `RewardScheme3(ship_scale)` | `FleetLaunchPenalty(ship_scale)` |
+| `RewardScheme4(ship_scale, planet_scale, win_bonus)` | `AbsoluteHoldings(ship_scale, planet_scale)` + `TerminalWinBonus(win_bonus)` |
+
+To adopt the time-decaying bonus, swap `TerminalWinBonus` → `TimeDecayWinBonus` in
+the equivalent composition.
+
+
 ## TD -lambda
 Cache-based TD(λ) for SAC
 I implemented the Daley & Amato (2019) method — λ-returns stored in a periodically-refreshed cache that replaces the target network — as an opt-in path in sac_train.py. The existing 1-step code is untouched and remains the default.

@@ -45,9 +45,16 @@
   },
   "reward": [
     {
-      "scheme": "RewardScheme4",
+      "scheme": "AbsoluteHoldings",
       "ship_scale": 0.5,
-      "planet_scale": 1.0,
+      "planet_scale": 1.0
+    },
+    {
+      "scheme": "FleetLaunchPenalty",
+      "ship_scale": 1.0
+    },
+    {
+      "scheme": "TimeDecayWinBonus",
       "win_bonus": 1000
     }
   ],
