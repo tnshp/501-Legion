@@ -13,3 +13,4 @@ __pycache__
 runs
 model/__pycache__/SAC.cpython-313.pyc
 env/__pycache__/dummy.cpython-313.pyc
+checkpoints
