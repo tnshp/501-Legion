@@ -215,6 +215,11 @@ class SACTrainer:
         self.max_grad_norm = max_grad_norm
         self._nan_skips    = 0
 
+        self.training_data = None
+        if training_data_load_path is not None:
+            with open(training_data_load_path, "r") as file:
+                self.training_data = json.load(file)
+        
         self.auto_alpha = auto_alpha
         if auto_alpha:
             self.target_entropy  = float(target_entropy) if target_entropy is not None else -float(np.prod(act_shape))
@@ -270,10 +275,6 @@ class SACTrainer:
         if checkpoint_load_path is not None:
             self.load_checkpoint(checkpoint_load_path)
         
-        self.training_data = None
-        if training_data_load_path is not None:
-            with open(training_data_load_path, "r") as file:
-                self.training_data = json.load(file)
 
         self.saved_buffer = None
         if replay_buffer_load_path is not None:
@@ -344,6 +345,15 @@ class SACTrainer:
         dones       = self._to(dones)
 
         _amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=self._amp)
+
+        # ── Auto-alpha ────────────────────────────────────────────────────────
+        if self.auto_alpha:
+            with _amp:
+                alpha_loss = -(self.log_alpha.exp() * (lp.detach() + self.target_entropy)).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            self.alpha = self.log_alpha.exp().item()
 
         # ── Q-targets ─────────────────────────────────────────────────────────
         with _amp, torch.no_grad():
@@ -818,7 +828,7 @@ class SACTrainer:
             self.writer.add_scalar("Loss/q2",              q2_loss.item(),     s)
             self.writer.add_scalar("Loss/policy",          policy_loss.item(), s)
             self.writer.add_scalar("Policy/mean_log_prob", lp.mean().item(),   s)
-            self.writer.add_scalar("Policy/sigma_mean",    sigma.mean().item(), s)
+            self.writer.add_scalar("Policy/log_sigma_mean",    sigma.mean().item(), s)
             self.writer.add_scalar("Q/target_mean",        targets.mean().item(), s)
             self.writer.add_scalar("Alpha/value",          self.alpha,         s)
             self.writer.add_scalar("GradNorm/policy", self._grad_norm(self.policy_net), s)
@@ -889,7 +899,7 @@ class SACTrainer:
         if self.saved_buffer is not None:
             self.load_replay_buffer(self.saved_buffer)
         
-        opp_noise_inc = (opponent_noise-0.01)/(num_episodes*rule_based_ratio)
+        opp_noise_inc = 0.05
         opponent_noise = opponent_noise_checkpoint    
 
         for ep in range(start, num_episodes):
@@ -1002,6 +1012,9 @@ class SACTrainer:
         if not self.use_lambda_returns:
             ckpt["q1_target"] = self.q1_target.state_dict()
             ckpt["q2_target"] = self.q2_target.state_dict()
+        if self.auto_alpha:
+            ckpt["log_alpha"]            = self.log_alpha.item()
+            ckpt["alpha_optimizer"]      = self.alpha_optimizer.state_dict()
         torch.save(ckpt, path)
         print(f"Checkpoint saved → {path}")
         if train_dict is not None:
@@ -1055,6 +1068,11 @@ class SACTrainer:
         if not self.use_lambda_returns and "q1_target" in ckpt:
             self.q1_target.load_state_dict(ckpt["q1_target"])
             self.q2_target.load_state_dict(ckpt["q2_target"])
+        if self.auto_alpha and "log_alpha" in ckpt:
+            self.log_alpha.data.fill_(ckpt["log_alpha"])
+            self.alpha = self.log_alpha.exp().item()
+            if "alpha_optimizer" in ckpt:
+                self.alpha_optimizer.load_state_dict(ckpt["alpha_optimizer"])
         self.train_step = ckpt["train_step"]
         print(f"Checkpoint loaded ← {path}")
     
