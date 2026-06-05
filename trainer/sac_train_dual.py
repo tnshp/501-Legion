@@ -162,6 +162,7 @@ class SACTrainer:
         q2_net: nn.Module,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         learning_rate: float = 3e-4,
+        learning_rate_alpha: float = 3e-4,
         gamma: float = 0.99,
         tau: float = 5e-3,
         alpha: float = 0.2,
@@ -218,7 +219,7 @@ class SACTrainer:
         if auto_alpha:
             self.target_entropy  = float(target_entropy) if target_entropy is not None else -float(np.prod(act_shape))
             self.log_alpha       = nn.Parameter(torch.zeros(1, device=device))
-            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=learning_rate)
+            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=learning_rate_alpha)
         else:
             self.target_entropy  = None
             self.log_alpha       = None
@@ -1110,6 +1111,7 @@ if __name__ == "__main__":
     trainer = make_transformer_sac_trainer(
         device="cuda" if torch.cuda.is_available() else "cpu",
         learning_rate=config["learning_rate"],
+        learning_rate_alpha=config["learning_rate_alpha"],
         batch_size=config["batch_size"],
         replay_buffer_size=config["replay_buffer_size"],
         rule_based_agents=rb_agents,

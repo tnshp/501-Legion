@@ -1,16 +1,17 @@
 {
     "num_episodes" : 1000,
-    "warmup_steps" : 500,
+    "warmup_steps" : 1000,
     "update_frequency" : 8,
     "gradient_steps" : 2,
 
     "learning_rate" : 1e-4,
+    "learning_rate_alpha" : 1e-3,
     "batch_size" : 128,
     "replay_buffer_size" : 50000,
     "max_grad_norm" : 10.0,
     "auto_alpha" : true,
 
-    "use_lambda_returns" : false,
+    "use_lambda_returns" : true,
     "lambda_return" : 0.9,
     "cache_size" : 32000,
     "block_size" : 100,
