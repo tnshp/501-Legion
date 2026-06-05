@@ -1,14 +1,14 @@
 {
     "num_episodes" : 1000,
     "warmup_steps" : 500,
-    "update_frequency" : 4,
-    "gradient_steps" : 4,
+    "update_frequency" : 8,
+    "gradient_steps" : 2,
 
     "learning_rate" : 1e-4,
-    "batch_size" : 512,
+    "batch_size" : 128,
     "replay_buffer_size" : 50000,
     "max_grad_norm" : 10.0,
-    "auto_alpha" : false,
+    "auto_alpha" : true,
 
     "use_lambda_returns" : false,
     "lambda_return" : 0.9,
@@ -28,6 +28,6 @@
     "replay_storage_interval" : 50,
 
     "rule_based_ratio" : 1.0,
-    "opponent_noise" : 0.3,
+    "opponent_noise" : 0.7,
     "prob_4p" : 0.5
 }

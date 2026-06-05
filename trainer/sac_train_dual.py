@@ -452,7 +452,7 @@ class SACTrainer:
                 else:
                     action = self.select_opponent_action(state_p1)
 
-                swapped_p1, _ = _swap_perspective(planets_now, np.empty((0, 7), np.float32), player_id=1)
+                swapped_p1, _ = _swap_perspective(planets_now, np.empty((0, 7), np.float32), player_id=num+1)
                 moves_p1 = decode_action(action, swapped_p1, omega)
                 opp_moves.append(moves_p1)
                 opp_actions.append(action)
@@ -592,7 +592,7 @@ class SACTrainer:
             for i in range(3 if is4p else 1):
                 if opponent_noise > 0.0 and np.random.random() < opponent_noise:
                     rand_action_p1 = np.random.randn(MAX_PLANETS, ACTION_DIM).astype(np.float32)
-                    swapped_p1, _ = _swap_perspective(planets_now, np.empty((0, 7), np.float32), player_id=1)
+                    swapped_p1, _ = _swap_perspective(planets_now, np.empty((0, 7), np.float32), player_id=i + 1)
                     moves_p1 = decode_action(rand_action_p1, swapped_p1, omega)
                 else:
                     moves_p1 = agent_fns[0](opp_obs[i]) or []
