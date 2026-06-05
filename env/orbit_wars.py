@@ -645,6 +645,35 @@ class FleetLaunchPenalty:
         return float(-self.ship_scale * num_new)
 
 
+class StepPenalty:
+    """Constant negative reward on every timestep — a 'living cost'.
+
+        −weight   on every step (terminal step included)
+
+    Adds the value of TIME to the objective: since each step costs a fixed
+    amount, any given capture is worth more the sooner it happens. This pushes
+    the agent to grab nearby planets first (their fleets arrive sooner) and to
+    finish games quickly rather than dithering. The reward is independent of the
+    observations — every step is the same flat −weight.
+
+    Pair it with a win bonus so the pressure is to win *fast*, not to end the
+    game fast by any means: on its own a step penalty makes a quick loss look as
+    good as a quick win. TimeDecayWinBonus complements it well (both reward
+    speed, and the bonus keeps the sign of the outcome dominant).
+
+    Parameters
+    ----------
+    weight : float, default 0.1 — magnitude w of the per-step penalty
+    """
+
+    def __init__(self, weight: float = 0.1):
+        self.weight = weight
+
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        return float(-self.weight)
+
+
 class TerminalWinBonus:
     """Flat ±win_bonus awarded on the terminal step (0 otherwise).
 

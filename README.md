@@ -31,6 +31,7 @@ terminal step, and `step`/`max_steps` are the current tick and the episode limit
 | `ProductionPlanetDelta` | `planet_scale × (Σ prod gained − Σ prod lost)` | Capturing planets, weighted by their production. |
 | `AbsoluteHoldings` | `ship_scale × my_ships_now + planet_scale × my_prod_now` | *Holding* territory — scored every step, so it pays to keep high-production planets. Does **not** telescope: keep `ship_scale` small. |
 | `FleetLaunchPenalty` | `−ship_scale × n_new_fleets` | (Penalty) discourages fleet spam — flat cost per fleet launched, regardless of size/destination. |
+| `StepPenalty` | `−weight` (every step) | (Penalty) a flat per-step "living cost" that adds the value of *time*: any capture is worth more the sooner it lands, so the agent prefers nearby planets and quick games. Pair with a win bonus (e.g. `TimeDecayWinBonus`) so it rewards winning *fast*, not just ending fast. |
 
 ### Terminal win-bonus components
 
