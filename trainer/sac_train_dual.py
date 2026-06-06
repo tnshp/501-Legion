@@ -255,6 +255,18 @@ class SACTrainer:
         for p in self.opponent_net.parameters():
             p.requires_grad_(False)
 
+        # ── torch.compile (CUDA only) ─────────────────────────────────────────
+        # Must come after all deepcopy() calls so opponent/target snapshots are
+        # separate uncompiled modules (they get load_state_dict periodically and
+        # aren't on the hot update path, so compiling them isn't worth it).
+        if str(device).startswith("cuda"):
+            self.policy_net = torch.compile(self.policy_net, mode="reduce-overhead")
+            self.q1_net     = torch.compile(self.q1_net,     mode="reduce-overhead")
+            self.q2_net     = torch.compile(self.q2_net,     mode="reduce-overhead")
+            if not self.use_lambda_returns:
+                self.q1_target = torch.compile(self.q1_target, mode="reduce-overhead")
+                self.q2_target = torch.compile(self.q2_target, mode="reduce-overhead")
+
         # ── optimisers ────────────────────────────────────────────────────────
         self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
         self.q1_optimizer     = optim.Adam(self.q1_net.parameters(),     lr=learning_rate)
@@ -820,15 +832,12 @@ class SACTrainer:
             self.alpha = self.log_alpha.exp().item()
 
         # ── TensorBoard ───────────────────────────────────────────────────────
-        if self.writer is not None:
+        if self.writer is not None and self._update_count % self._tb_log_every == 0:
             s = self._update_count
-            with torch.no_grad():
-                _, sigma = self.policy_net.forward(states)
             self.writer.add_scalar("Loss/q1",              q1_loss.item(),     s)
             self.writer.add_scalar("Loss/q2",              q2_loss.item(),     s)
             self.writer.add_scalar("Loss/policy",          policy_loss.item(), s)
             self.writer.add_scalar("Policy/mean_log_prob", lp.mean().item(),   s)
-            self.writer.add_scalar("Policy/log_sigma_mean",    sigma.mean().item(), s)
             self.writer.add_scalar("Q/target_mean",        targets.mean().item(), s)
             self.writer.add_scalar("Alpha/value",          self.alpha,         s)
             self.writer.add_scalar("GradNorm/policy", self._grad_norm(self.policy_net), s)
