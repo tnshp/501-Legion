@@ -344,14 +344,14 @@ class TestDecodeAction(unittest.TestCase):
         """Two planets well clear of the sun."""
         return np.array([
             [0, 0, 70.0, 80.0, 5.0, 20.0, 2.0],   # ours, 20 ships
-            [1, 1, 30.0, 80.0, 5.0, 15.0, 2.0],   # opponent
+            [1, 1, 30.0, 80.0, 5.0,  2.0, 2.0],   # opponent, 2 ships (beatable by the fleet)
         ], dtype=np.float32)
 
     def _planets_full(self):
         """Four-planet fixture, planet 2 has only 1 ship."""
         return np.array([
             [0, 0, 70.0, 80.0, 5.0, 20.0, 2.0],   # ours, 20 ships
-            [1, 1, 30.0, 80.0, 5.0, 15.0, 2.0],   # opponent
+            [1, 1, 30.0, 80.0, 5.0,  2.0, 2.0],   # opponent, 2 ships (beatable by the fleet)
             [2, 0, 70.0, 20.0, 3.0,  1.0, 1.0],   # ours, 1 ship → skip
             [3, -1, 30.0, 20.0, 3.0, 5.0, 1.0],   # neutral
         ], dtype=np.float32)
@@ -426,6 +426,21 @@ class TestDecodeAction(unittest.TestCase):
         for from_id, _, num_ships in moves:
             total = int(planets[planets[:, 0] == from_id, 5][0])
             self.assertLessEqual(num_ships, total - 1)
+
+    def test_launch_only_when_fleet_beats_target_garrison(self):
+        """Mask: a fleet is launched only if it exceeds the TARGET planet's ships."""
+        act = self._targeting_action()
+        # Source planet 0 has 20 ships; with tanh_scale=0.2 the fleet is ~3 ships.
+        weak = np.array([
+            [0, 0, 70.0, 80.0, 5.0, 20.0, 2.0],   # ours
+            [1, 1, 30.0, 80.0, 5.0,  2.0, 2.0],   # target 2 ships → 3 > 2 → send
+        ], dtype=np.float32)
+        strong = np.array([
+            [0, 0, 70.0, 80.0, 5.0, 20.0, 2.0],   # ours
+            [1, 1, 30.0, 80.0, 5.0, 10.0, 2.0],   # target 10 ships → 3 <= 10 → suppress
+        ], dtype=np.float32)
+        self.assertEqual(len(decode_action(act, weak,   0.0)), 1)
+        self.assertEqual(len(decode_action(act, strong, 0.0)), 0)
 
     # ── move format ───────────────────────────────────────────────────────────
 
@@ -776,7 +791,7 @@ class TestFleetTrajectoryAccuracy(unittest.TestCase):
         """
         return np.array([
             [0, 0, 65.0, 75.0, 5.0, 20.0, 2.0],   # ours, 20 ships
-            [1, 1, 30.0, 75.0, 5.0, 15.0, 2.0],   # opponent
+            [1, 1, 30.0, 75.0, 5.0,  2.0, 2.0],   # opponent, 2 ships (beatable by the fleet)
         ], dtype=np.float32)
 
     def _targeting_action(self, n: int = MAX_PLANETS) -> np.ndarray:

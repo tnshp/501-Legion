@@ -394,7 +394,20 @@ def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float,
     omega           : float — angular velocity of the planet system
     tanh_scale      : float — scales the tanh input; smaller = flatter saturation
                       (e.g. 0.2 saturates at ~±10 instead of ~±3)
-    min_fleet_ships : int — fleets with fewer ships than this are suppressed
+    min_fleet_ships : int — DEPRECATED / unused. The fixed minimum-size mask has
+                      been replaced by a capture-feasibility mask: a fleet is only
+                      launched if it is LARGER than the target planet's current
+                      garrison (see below). Kept in the signature so existing
+                      callers / configs don't break.
+
+    Launch mask
+    -----------
+    A move is emitted only if the fleet would be bigger than the number of ships
+    currently on the TARGET planet, i.e. `num_ships > target_planet_ships`. This
+    suppresses fleets too small to take their target (against a 0-ship neutral any
+    non-empty fleet qualifies; against a defended planet the fleet must exceed the
+    defender). Note this uses the target's ship count at LAUNCH time and does not
+    model production / reinforcement accrued during the fleet's flight.
 
     Returns
     -------
@@ -431,7 +444,11 @@ def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float,
 
         frac      = float(scores[idx])
         num_ships = min(int(frac * ships), ships - 1)
-        if num_ships < min_fleet_ships:
+        # Capture-feasibility mask: only launch a fleet that is LARGER than the
+        # target planet's current garrison — i.e. only send fleets that could
+        # actually take the target. (Replaces the old fixed min_fleet_ships floor.)
+        target_ships = int(planets[idx, 5])
+        if num_ships <= target_ships:
             continue
 
         angle_rad = compute_launch_angle(

@@ -6,6 +6,24 @@
 mixed_random_ratio_decay = None -> spawn all training episodes
 
 
+## Action decoder launch mask
+
+`decode_action` now gates fleet launches by **capture feasibility** instead of a
+fixed minimum size. A move is emitted only if the fleet is **larger than the
+target planet's current garrison**:
+
+```
+launch only if  num_ships > target_planet_ships
+```
+
+So against a 0-ship neutral any non-empty fleet qualifies, while a defended
+planet requires a fleet that exceeds its defenders — the agent stops launching
+fleets too small to take their target. (Caveat: it uses the target's ship count
+at *launch* time and doesn't model production/reinforcement during the fleet's
+flight.) The old `min_fleet_ships` parameter is now **deprecated/unused** but
+kept in the signatures and config so existing callers don't break.
+
+
 ## Metadata token (global summary)
 
 The transformer is fed an extra **metadata token** prepended to the planet/fleet
