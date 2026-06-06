@@ -1,14 +1,14 @@
 {
-    "num_episodes" : 1000,
+    "num_episodes" : 2000,
     "warmup_steps" : 1000,
-    "update_frequency" : 16,
+    "update_frequency" : 8,
     "gradient_steps" : 2,
 
     "learning_rate" : 1e-4,
     "learning_rate_alpha" : 1e-3,
     "batch_size" : 256,
     "replay_buffer_size" : 50000,
-    "max_grad_norm" : 200.0,
+    "max_grad_norm" : 5.0,
     "auto_alpha" : true,
 
     "use_lambda_returns" : true,
@@ -22,13 +22,13 @@
 
     "checkpoint_interval" : 20,
     "checkpoint_path" : "checkpoints",
-    "checkpoint_load_path" : "checkpoints/round1.pt",
-    "training_data_load_path" : "checkpoints/round1.json",
+    "checkpoint_load_path" : null,
+    "training_data_load_path" : null,
 
-    "replay_buffer_load_path" : "checkpoints/round1_replay_buffer.pt",
+    "replay_buffer_load_path" : null,
     "replay_storage_interval" : 50,
 
-    "rule_based_ratio" : 1.0,
+    "rule_based_ratio" : 0.7,
     "opponent_noise" : 0.7,
-    "prob_4p" : 0.5
+    "prob_4p" : 0.2
 }

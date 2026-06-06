@@ -47,6 +47,7 @@ from env.env_utils import (
     MAX_PLANETS, MAX_FLEETS, STATE_DIM, ACTION_DIM,
 )
 
+_REWARD_NORM = 2000.0
 
 # =============================================================================
 # Rule-based agent loader
@@ -353,7 +354,7 @@ class SACTrainer:
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
         states      = self._to(states)
         actions     = self._to(actions)
-        rewards     = self._to(rewards)
+        rewards     = self._to(rewards) / _REWARD_NORM
         next_states = self._to(next_states)
         dones       = self._to(dones)
 
@@ -733,7 +734,7 @@ class SACTrainer:
 
         states_np      = buf.states     [flat_idx]
         actions_np     = buf.actions    [flat_idx]
-        rewards_np     = buf.rewards    [flat_idx].reshape(n_blocks, B)
+        rewards_np     = buf.rewards    [flat_idx].reshape(n_blocks, B) / _REWARD_NORM
         next_states_np = buf.next_states[flat_idx]
         dones_np       = buf.dones      [flat_idx].reshape(n_blocks, B)
 
