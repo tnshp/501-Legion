@@ -324,6 +324,9 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
     # Rolling window of fleets-sent-per-step. Tracked across episodes (not reset
     # per episode) so the metric is independent of variable episode length.
     fleets_window: deque[int] = deque(maxlen=50)
+    # Rolling window of per-step reward for a smoothed step-wise reward curve.
+    # Tracked across episodes (not reset per episode) so it spans episode seams.
+    reward_window: deque[float] = deque(maxlen=100)
     # All-time peak of total fleets in play — for sizing MAX_FLEETS.
     max_fleets_seen = 0
     t0 = time.perf_counter()
@@ -371,11 +374,21 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
             ep_length += 1
             state = next_state
 
+            # ── per-step reward: current value + 100-step moving average ───────
+            reward_window.append(float(reward))
             # ── per-step fleets-sent moving average (window = 50 steps) ────────
             fleets_window.append(env.last_fleets_sent)
             # ── total fleets in play (all players) — for sizing MAX_FLEETS ─────
             max_fleets_seen = max(max_fleets_seen, env.last_n_fleets)
             if trainer.writer:
+                trainer.writer.add_scalar(
+                    "Reward/step", float(reward), trainer.train_step,
+                )
+                trainer.writer.add_scalar(
+                    "Reward/step_ma100",
+                    float(np.mean(reward_window)),
+                    trainer.train_step,
+                )
                 trainer.writer.add_scalar(
                     "Policy/fleets_sent_ma50",
                     float(np.mean(fleets_window)),
@@ -407,7 +420,13 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
         episode_wins.append(won)
 
         episode_rewards.append(ep_reward)
-        trainer._log_episode(episode, ep_reward, ep_length)
+        # Reward is now logged step-wise (Reward/step + Reward/step_ma100 in the
+        # rollout above), so the per-episode reward scalar is dropped here. Keep
+        # the non-reward per-episode diagnostics that _log_episode used to emit.
+        if trainer.writer:
+            trainer.writer.add_scalar("Misc/episode_length", ep_length, episode)
+            trainer.writer.add_scalar("Misc/buffer_fill", len(trainer.replay_buffer), episode)
+            trainer.writer.add_scalar("Misc/env_steps", trainer.train_step, episode)
 
         # ── per-episode tensorboard scalars ───────────────────────────────────
         win_float    = 1.0 if won else 0.0
@@ -436,8 +455,6 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
                 f"Steps: {trainer.train_step:>7}{ratio_tag} | "
                 f"{elapsed:.0f}s"
             )
-            if trainer.writer:
-                trainer.writer.add_scalar("Reward/moving_avg",    avg_reward, episode)
 
         # ── HTML replay ───────────────────────────────────────────────────────
         if (episode + 1) % render_interval == 0:
@@ -559,4 +576,4 @@ if __name__ == "__main__":
     print()
 
     # Start training
-    train(config, MAX_PLANETS=40, MAX_FLEETS=100, reward_scheme=reward_scheme)
+    train(config, MAX_PLANETS=40, MAX_FLEETS=200, reward_scheme=reward_scheme)
