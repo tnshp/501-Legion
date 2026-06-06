@@ -76,7 +76,7 @@ def _make_obs_dict(n_planets=3, angular_velocity=0.02):
         ][:n_planets],
         "fleets": [],
         "angular_velocity": angular_velocity,
-        "comet_planet_ids": [2],
+        "comet_planet_ids": [],
     }
 
 
@@ -129,10 +129,23 @@ class TestObsToArrays(unittest.TestCase):
         _, fleets, _, _, _ = _obs_to_arrays(obs)
         self.assertEqual(fleets.shape, (0, 7))
 
-    def test_comet_ids_parsed(self):
-        obs = _make_obs_dict(n_planets=3)
-        _, _, _, _, comets = _obs_to_arrays(obs)
-        self.assertIn(2, comets)
+    def test_comets_are_stripped(self):
+        # Planet id 2 is flagged as a comet → it must be removed from planets_np
+        # entirely, while comet_ids still reports the id that was stripped.
+        obs = {
+            "planets": [
+                {"id": 0, "owner": 0,    "x": 60.0, "y": 50.0, "radius": 5.0, "ships": 20, "production": 2},
+                {"id": 1, "owner": 1,    "x": 40.0, "y": 50.0, "radius": 5.0, "ships": 10, "production": 2},
+                {"id": 2, "owner": None, "x": 50.0, "y": 70.0, "radius": 1.0, "ships":  3, "production": 1},
+            ],
+            "fleets": [],
+            "angular_velocity": 0.02,
+            "comet_planet_ids": [2],
+        }
+        planets, _, _, _, comets = _obs_to_arrays(obs)
+        self.assertEqual(planets.shape, (2, 7))                 # comet row removed
+        self.assertNotIn(2, planets[:, 0].astype(int))         # id 2 gone from planets
+        self.assertIn(2, comets)                               # still reported as stripped
 
     def test_numpy_array_planets_passthrough(self):
         raw = np.random.rand(5, 7).astype(np.float32)

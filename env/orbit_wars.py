@@ -40,13 +40,17 @@ def _obs_to_arrays(obs):
     Handles attribute-access (Observation object), dict-access, and kaggle's
     native list-of-lists format.
 
+    Comet planets are stripped from `planets_np` (see below) — they never reach
+    the encoder, action decoding, reward schemes, or flight-path raycasts.
+
     Returns
     -------
     planets_np         : [n, 7]  [id, owner, x, y, radius, ships, production]
+                         (comets removed)
     fleets_np          : [m, 7]  [id, owner, x, y, angle, from_planet_id, ships]
     angular_velocity   : float
     omega              : float  (alias for angular_velocity)
-    comet_ids          : np.ndarray of int
+    comet_ids          : np.ndarray of int  (the ids that were stripped)
     """
     def _get(obj, attr):
         return getattr(obj, attr, None) if not isinstance(obj, dict) else obj.get(attr)
@@ -106,6 +110,17 @@ def _obs_to_arrays(obs):
     else:
         comet_ids = np.array(list(raw_comets), dtype=np.int32)
 
+    # Strip comets from the observation entirely. Comets are transient planets the
+    # engine spawns at fixed steps; they add no strategic value but pollute the
+    # launch-angle search (extra moving obstacles/targets) and the state. Removing
+    # their rows here means they never reach the encoder, decode_action, the
+    # reward schemes, or the flight-path raycasts. comet_ids is still returned for
+    # signature stability but should now always describe an empty set of remaining
+    # planets.
+    if comet_ids.size > 0 and planets_np.shape[0] > 0:
+        keep = ~np.isin(planets_np[:, 0].astype(np.int32), comet_ids)
+        planets_np = planets_np[keep]
+
     omega = angular_velocity
     return planets_np, fleets_np, angular_velocity, omega, comet_ids
 
@@ -164,12 +179,12 @@ def encode_obs_as_player(encoder, obs, initial_planets: np.ndarray,
     -------
     state : np.ndarray [MAX_PLANETS + MAX_FLEETS, STATE_DIM], dtype float32
     """
-    planets_np, fleets_np, angular_velocity, _, comet_ids = _obs_to_arrays(obs)
+    planets_np, fleets_np, angular_velocity, _, _ = _obs_to_arrays(obs)
     s_planets, s_fleets = _swap_perspective(planets_np, fleets_np, player_id)
 
     state, _ = encoder.encode(
         s_planets, s_fleets, initial_planets,
-        angular_velocity, comet_ids, time_step,
+        angular_velocity, time_step,
         apply_padding=True,
     )
     return state.astype(np.float32)
@@ -598,6 +613,62 @@ class ProductionPlanetDelta:
         return float(self.planet_scale * (captured - lost))
 
 
+class ProximityCaptureBonus:
+    """Extra reward for capturing planets CLOSE to your existing territory.
+
+        for each planet captured this step:
+            + scale × exp(−d / ref_dist)
+
+    where d is the distance (board units) from the captured planet to your
+    NEAREST other owned planet, measured in the pre-step state — a faithful proxy
+    for how far the capturing fleet had to travel.
+
+    A capture right next to your base (small d) earns ≈ +scale; a capture flung
+    across the map (large d) earns ≈ 0. This biases the agent toward expanding
+    into nearby planets first instead of sending fleets far away: long-range
+    sends both arrive late (the opponent grabs the easy planets meanwhile) AND
+    now pay a smaller bonus, so the opening stops bleeding tempo.
+
+    The board is 100×100; `ref_dist` sets the falloff — at d = ref_dist the bonus
+    is e⁻¹ ≈ 0.37 × scale. This rewards the capture EVENT only (like
+    ProductionPlanetDelta); pair it with that scheme if you also want value- /
+    production-weighting, and with a win bonus for the terminal objective.
+
+    Parameters
+    ----------
+    scale    : float, default 1.0  — bonus for an adjacent capture (d → 0)
+    ref_dist : float, default 25.0 — distance decay constant, in board units
+    """
+
+    def __init__(self, scale: float = 1.0, ref_dist: float = 25.0):
+        self.scale    = scale
+        self.ref_dist = max(1e-6, ref_dist)
+
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        planets_old, _, _, _, _ = _obs_to_arrays(obs)
+        planets_new, _, _, _, _ = _obs_to_arrays(new_obs)
+
+        # Our planets BEFORE this step (positions) and the owner of every planet
+        # before — a planet is "captured" if it is ours now but was not ours then.
+        was_mine = {int(r[0]) for r in planets_old if int(r[1]) == player_id}
+        my_old_xy = [(float(r[2]), float(r[3])) for r in planets_old
+                     if int(r[1]) == player_id]
+
+        total = 0.0
+        for r in planets_new:
+            if int(r[1]) != player_id or int(r[0]) in was_mine:
+                continue                      # not a fresh capture for us
+            px, py = float(r[2]), float(r[3])
+            if not my_old_xy:
+                closeness = 1.0               # no prior territory → treat as adjacent
+            else:
+                d = min(math.hypot(px - ox, py - oy) for ox, oy in my_old_xy)
+                closeness = math.exp(-d / self.ref_dist)
+            total += self.scale * closeness
+        return float(total)
+
+
 class AbsoluteHoldings:
     """Score CURRENT holdings each step (absolute, not a delta).
 
@@ -643,6 +714,116 @@ class FleetLaunchPenalty:
         num_new = sum(1 for f in fleets_new
                       if int(f[0]) not in old_ids and int(f[1]) == player_id)
         return float(-self.ship_scale * num_new)
+
+
+def _fleet_flight_ticks(fx0: float, fy0: float, angle: float, ships: float,
+                        planets: np.ndarray, omega: float, max_ticks: int,
+                        skip_id: int | None = None) -> int | None:
+    """Replay a just-launched fleet's straight-line flight and return the number
+    of ticks until it first crosses a planet (its target), or None if it reaches
+    no planet within `max_ticks` (flies off the board, into the sun, or misses).
+
+    Mirrors the interpreter's swept-collision model exactly — same helpers and
+    constants as compute_launch_angle, including per-tick planet orbital motion.
+    `skip_id` (the fleet's source planet) is excluded so a fleet launched from a
+    planet's edge is never scored as targeting its own source.
+    """
+    speed = _fleet_speed(int(ships))
+
+    # Per-planet kinematics at the fleet's launch instant (tick 0).
+    kin = []
+    for r in planets:
+        if skip_id is not None and int(r[0]) == skip_id:
+            continue
+        px, py, pr = float(r[2]), float(r[3]), float(r[4])
+        orb = math.hypot(px - _CENTER, py - _CENTER)
+        ang = math.atan2(py - _CENTER, px - _CENTER)
+        moving = (omega != 0.0) and (orb + pr < _ROTATION_RADIUS_LIMIT)
+        kin.append((px, py, pr, orb, ang, moving))
+
+    prev = [(k[0], k[1]) for k in kin]
+    fx_prev, fy_prev = fx0, fy0
+    for step in range(1, max_ticks + 1):
+        fx = fx0 + math.cos(angle) * speed * step
+        fy = fy0 + math.sin(angle) * speed * step
+        for i, (px, py, pr, ang_orb, ang0, mv) in enumerate(kin):
+            if mv:
+                a = ang0 + omega * step
+                cx, cy = _CENTER + ang_orb * math.cos(a), _CENTER + ang_orb * math.sin(a)
+            else:
+                cx, cy = px, py
+            ppx, ppy = prev[i]
+            if _swept_pair_hit((fx_prev, fy_prev), (fx, fy), (ppx, ppy), (cx, cy), pr):
+                return step
+            prev[i] = (cx, cy)
+        if not (0.0 <= fx <= _BOARD_SIZE and 0.0 <= fy <= _BOARD_SIZE):
+            return None                       # flew off the board
+        if _point_to_segment_distance((_CENTER, _CENTER),
+                                      (fx_prev, fy_prev), (fx, fy)) < _SUN_RADIUS:
+            return None                       # consumed by the sun
+        fx_prev, fy_prev = fx, fy
+    return None
+
+
+class LaunchDistancePenalty:
+    """Penalise launching a fleet by how LONG it must fly to reach its target.
+
+    For every fleet the agent launches this step (id present in new_obs, absent
+    in obs, owned by player_id), the fleet's straight-line flight is replayed
+    against the engine's swept-collision model to find the tick at which it first
+    reaches a planet.  The penalty is
+
+        −scale × (ticks_to_target / time_norm)   per fleet that reaches a planet
+        −scale × (max_ticks       / time_norm)   per fleet that reaches none
+
+    A fleet aimed at an adjacent planet (a handful of ticks) costs almost nothing;
+    one flung across the map costs a lot; a fleet that misses everything is
+    charged the full horizon.  Unlike ProximityCaptureBonus (which only pays once
+    the far capture finally lands), this fires at the *moment of launch*, giving
+    denser, faster credit against long-range opening sends.
+
+    Charged by arrival TIME, not raw distance: larger fleets fly faster
+    (_fleet_speed), so a big fast fleet to a mid-range planet costs less than a
+    small slow one to the same planet — matching how long the agent is committed.
+
+    NOTE: the most expensive reward component — it forward-simulates each launched
+    fleet up to `max_ticks`.  Launches per step are few, but lower `max_ticks` if
+    you need the speed.
+
+    Parameters
+    ----------
+    scale     : float, default 1.0  — penalty magnitude per fleet at full cost
+    time_norm : float, default 20.0 — flight ticks that map to one unit of cost
+    max_ticks : int,   default 120  — flight-sim horizon; also the miss cost (ticks)
+    """
+
+    def __init__(self, scale: float = 1.0, time_norm: float = 20.0,
+                 max_ticks: int = 120):
+        self.scale     = scale
+        self.time_norm = max(1e-6, time_norm)
+        self.max_ticks = int(max_ticks)
+
+    def __call__(self, obs, new_obs, player_id: int, done: bool,
+                 n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
+        _, fleets_old, omega_old, _, _ = _obs_to_arrays(obs)
+        planets_new, fleets_new, omega_new, _, _ = _obs_to_arrays(new_obs)
+        if fleets_new.shape[0] == 0:
+            return 0.0
+
+        old_ids = ({int(r[0]) for r in fleets_old}
+                   if fleets_old.shape[0] > 0 else set())
+        omega = omega_new if omega_new else omega_old
+
+        total_ticks = 0.0
+        for f in fleets_new:
+            if int(f[0]) in old_ids or int(f[1]) != player_id:
+                continue                      # not a fleet we launched this step
+            fx, fy, angle, ships = float(f[2]), float(f[3]), float(f[4]), float(f[6])
+            src = int(f[5])
+            ticks = _fleet_flight_ticks(fx, fy, angle, ships, planets_new, omega,
+                                        self.max_ticks, skip_id=src)
+            total_ticks += self.max_ticks if ticks is None else ticks
+        return float(-self.scale * total_ticks / self.time_norm)
 
 
 class StepPenalty:
@@ -846,7 +1027,7 @@ class OrbitWarsEnv(gym.Env):
 
     MAX_PLANETS: int = 40
     MAX_FLEETS:  int = 100
-    STATE_DIM:   int = 14
+    STATE_DIM:   int = 13
     ACTION_DIM:  int = 4
 
     metadata = {"render_modes": ["human", "ansi"]}
@@ -974,7 +1155,7 @@ class OrbitWarsEnv(gym.Env):
     def step(self, action: np.ndarray):
         assert self._trainer is not None, "Call reset() before step()."
 
-        planets_np, fleets_np, omega, _, comet_ids_np = _obs_to_arrays(self._current_obs)
+        planets_np, fleets_np, omega, _, _ = _obs_to_arrays(self._current_obs)
         s_planets, _ = _swap_perspective(
             planets_np, _EMPTY_FLEETS.copy(), self.player_id
         )
@@ -986,11 +1167,11 @@ class OrbitWarsEnv(gym.Env):
         # Snapshot pre-step state as plain numpy arrays.  The kaggle environment
         # mutates obs0.planets / obs0.fleets in-place, so self._current_obs would
         # otherwise silently reflect post-step values by the time reward is computed.
+        # planets_np is already comet-stripped by _obs_to_arrays.
         obs_pre = {
             "planets":          planets_np,
             "fleets":           fleets_np,
             "angular_velocity": float(omega),
-            "comet_planet_ids": comet_ids_np,
         }
 
         raw_obs, _kaggle_reward, done, info = self._trainer.step(moves)

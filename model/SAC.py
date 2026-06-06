@@ -13,14 +13,15 @@ from utils.pos_encoding import (
 
 class Encoder:
     # planets - [id, owner, x, y, radius, ships, production]
-    # out - [owner[4], radius, ships, production, moving/static, angular_velocity, comet, is_planet, x, y, time_step]
+    # out - [owner[4], radius, ships, production, moving/static, angular_velocity, is_planet, x, y, time_step]
     # fleets - [id, owner, x, y, angle, from_planet_id, ships] or empty array
-    # out - [owner[4], angle, ships, speed, dummy[3], is_planet, x, y, time_step] or empty array
-    
-    def __init__(self, max_planets=40, max_fleets=100, max_comet_planet_ids=10, max_speed=6.0):  
+    # out - [owner[4], angle, ships, speed, dummy[2], is_planet, x, y, time_step] or empty array
+    # (Comets are stripped from the observation upstream in env._obs_to_arrays, so
+    #  there is no comet feature here — state width is 13.)
+
+    def __init__(self, max_planets=40, max_fleets=100, max_speed=6.0):
         self.max_planets = max_planets
-        self.max_fleets = max_fleets 
-        self.max_comet_planet_ids = max_comet_planet_ids
+        self.max_fleets = max_fleets
         self.max_speed = max_speed
         self.sun = np.array([50, 50])
         #limits of the box in which planets can move
@@ -55,12 +56,12 @@ class Encoder:
 
         return padded_arr, mask
 
-    def encode(self, planets, fleets, initial_planets, angular_velocity, comet_planet_ids, time_step, apply_padding=True):
-       
-        
+    def encode(self, planets, fleets, initial_planets, angular_velocity, time_step, apply_padding=True):
+
+
         #assert the shape of planets
         assert planets.shape[-1] == 7, f"Expected planets to have 7 features, but got {planets.shape[-1]}"
-        
+
         # Handle empty fleets array
         if fleets.size == 0:
             fleets = np.empty((0, 7))
@@ -71,15 +72,9 @@ class Encoder:
 
         planets_owner = planets[:, 1].astype(int)
         planet_pos = planets[:, 2:4]
-        
+
         angular_velocity = np.array([angular_velocity for _ in range(planets.shape[0])]).reshape(-1, 1)
-        
-        # Handle empty comet_planet_ids
-        if comet_planet_ids.size == 0:
-            comet_planet = np.zeros((planets.shape[0], 1))
-        else:
-            comet_planet = np.array([1 if planet_id in comet_planet_ids else 0 for planet_id in planets[:, 0]]).reshape(-1, 1)
-        
+
         planets_mapping = self.get_planet_mapping(initial_planets)
         moving_planets = np.array([planets_mapping.get(planet_id, 0) for planet_id in planets[:, 0]]).reshape(-1, 1)
         #replace nan with 0
@@ -93,13 +88,13 @@ class Encoder:
         #adding time step as feature to planets and fleets
         times_step_array = np.array([time_step for _ in range(planets.shape[0])]).reshape(-1, 1)
         is_planet = np.zeros((planets.shape[0], 1))
-        planets_encoded = np.hstack((planets_owner_one_hot, planets[:, 4:], moving_planets, angular_velocity, 
-                             comet_planet, is_planet, planet_pos,  times_step_array))
-        
+        planets_encoded = np.hstack((planets_owner_one_hot, planets[:, 4:], moving_planets, angular_velocity,
+                             is_planet, planet_pos,  times_step_array))
+
         # Handle empty fleets
         if fleets.shape[0] == 0:
-            # Create empty fleets_encoded with correct feature dimension (14 features)
-            fleets_encoded = np.empty((0, 14))
+            # Create empty fleets_encoded with correct feature dimension (13 features)
+            fleets_encoded = np.empty((0, 13))
         else:
             #fleets
             fleets_owner = fleets[:, 1].astype(int)
@@ -113,7 +108,7 @@ class Encoder:
                 if fleets_owner[i] != -1:
                     fleets_owner_one_hot[i] = np.eye(4)[fleets_owner[i]]
 
-            dummy = np.zeros((fleets.shape[0], 3))
+            dummy = np.zeros((fleets.shape[0], 2))
             is_fleet = np.ones((fleets.shape[0], 1))
             fleet_pos = fleets[:, 2:4]
             times_step_array_fleet = np.array([time_step for _ in range(fleets.shape[0])]).reshape(-1, 1)
@@ -135,17 +130,16 @@ class Encoder:
             state = np.vstack((planets_encoded, fleets_encoded))
             return state, None
     
-    def encode_batch(self, batched_planets, batched_fleets, batched_initial_planets, batched_angular_velocity, 
-                     batched_comet_planet_ids, batch_time_steps=None, apply_padding=True):
+    def encode_batch(self, batched_planets, batched_fleets, batched_initial_planets, batched_angular_velocity,
+                     batch_time_steps=None, apply_padding=True):
         """
         Encode a batch of states.
-        
+
         Args:
             batched_planets: list of planet arrays, each [n_planets, 7]
             batched_fleets: list of fleet arrays, each [n_fleets, 7] or empty
             batched_initial_planets: list of initial planet arrays, each [n_initial, 7]
             batched_angular_velocity: array or list of angular velocities, shape [batch_size]
-            batched_comet_planet_ids: list of comet planet id arrays or empty
             batch_time_steps: array/list of time steps for each batch item, or single value for all
             apply_padding: whether to apply padding and return masks
             
@@ -170,7 +164,6 @@ class Encoder:
                 batched_fleets[i],
                 batched_initial_planets[i],
                 batched_angular_velocity[i],
-                batched_comet_planet_ids[i],
                 batch_time_steps[i],
                 apply_padding=apply_padding
             )
@@ -189,9 +182,51 @@ class Encoder:
 
 
     
+_META_DIM = 12  # 4 players × [planet_count, production, ships]
+
+
+def _aggregate_meta_features(state):
+    """Per-player global summary derived from an encoded state batch.
+
+    A learned projection of this vector is prepended to the transformer as a
+    single "metadata" token, so every token can read the overall picture
+    (how many planets / how much production / how many ships each player holds)
+    directly, instead of having to reconstruct it by attending over the
+    individual planet/fleet tokens.
+
+    Parameters
+    ----------
+    state : [B, seq, 13] — encoder layout: owner one-hot at 0:4, ships at 5,
+            production at 6 (planets only; fleets carry speed there), is_fleet
+            flag at 9. Neutral planets and padding rows have an all-zero owner
+            one-hot, so they contribute to no player's totals.
+
+    Returns
+    -------
+    [B, 12] — concat over players 0..3 of [planet_count, log1p(production),
+    log1p(ships)]. After the perspective swap player 0 is our agent and 1..3 are
+    opponents; players absent in a 2-player game are simply zero. Ships include
+    in-flight fleets, so it is the player's *total* ship strength. Ship and
+    production totals are log1p-compressed (they reach into the thousands).
+    """
+    owner     = state[:, :, 0:4]                 # [B, seq, 4] one-hot (neutral/pad = 0)
+    ships     = state[:, :, 5:6]                 # [B, seq, 1]
+    prod      = state[:, :, 6:7]                 # [B, seq, 1] (planets only)
+    is_fleet  = state[:, :, 9:10]                # [B, seq, 1] 1 = fleet, 0 = planet/pad
+    is_planet = 1.0 - is_fleet
+
+    planet_cnt = (owner * is_planet).sum(dim=1)              # [B, 4]
+    ships_tot  = (owner * ships).sum(dim=1)                  # [B, 4] (planets + fleets)
+    prod_tot   = (owner * prod * is_planet).sum(dim=1)       # [B, 4]
+
+    ships_tot = torch.log1p(ships_tot.clamp(min=0.0))
+    prod_tot  = torch.log1p(prod_tot.clamp(min=0.0))
+    return torch.cat([planet_cnt, prod_tot, ships_tot], dim=-1)  # [B, 12]
+
+
 class Q_network(nn.Module):
     def __init__(self,
-                 state_dim=14,
+                 state_dim=13,
                  action_dim=4,   # matches OrbitWarsEnv.ACTION_DIM
                  max_planets=40,
                  max_fleets=100, 
@@ -216,6 +251,10 @@ class Q_network(nn.Module):
         self.A = nn.Linear(action_dim, d_model)
 
         self.pos_encoder = LearnedFourierPosEncoding(d_model)
+
+        # Projects the per-player aggregate summary into a single "metadata" token
+        # (see _aggregate_meta_features) that is prepended to the transformer.
+        self.meta_proj = nn.Linear(_META_DIM, d_model)
 
         self.value_head = nn.Linear(d_model, 1)
 
@@ -267,14 +306,18 @@ class Q_network(nn.Module):
         # judge precisely whether a fleet's trajectory will strike a target planet.
         # (For planets index 4 is radius; self.P simply learns to downweight it.)
         angle_block = self.angle_encoder(state[:, :, 4:5])
-        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:10],
+        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:9],
                                  ship_block, angle_block], dim=-1)
         planets = self.P(token_feats * planets_mask.unsqueeze(-1))
         fleets  = self.F(token_feats * fleets_mask.unsqueeze(-1))
 
         time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
-        pos = state[:, :, 11:13]  # Assuming position is at indices 11 and 12
+        pos = state[:, :, 10:12]  # position is at indices 10 and 11 (13-wide state)
         pos_encoding = self.pos_encoder(pos, time_step)
+
+        # Global summary token, built from the raw input state (before it is
+        # overwritten below) and prepended to the transformer sequence.
+        meta_token = self.meta_proj(_aggregate_meta_features(state)).unsqueeze(1)
 
         action = self.A(action)
 
@@ -290,7 +333,7 @@ class Q_network(nn.Module):
         sep_token = self.sep_token.expand(batch_size, -1, -1)  # [1, batch_size, d_model]
 
         # Concatenate: [batch_size, seq_len, d_model]
-        src = torch.cat((cls_token, state,  sep_token, action), dim=1)
+        src = torch.cat((cls_token, meta_token, state,  sep_token, action), dim=1)
 
         out_ = self.transformer(src)
         out_cls = out_[:, 0, :]  # [batch_size, 1, d_model]
@@ -301,7 +344,7 @@ class Q_network(nn.Module):
 
 class V_network(nn.Module):
     def __init__(self, 
-                 state_dim=14,
+                 state_dim=13,
                  max_planets=40,
                  max_fleets=100,
                  d_model=128, 
@@ -324,6 +367,10 @@ class V_network(nn.Module):
         self.F = nn.Linear(_proj_in, d_model)
 
         self.pos_encoder = LearnedFourierPosEncoding(d_model)
+
+        # Projects the per-player aggregate summary into a single "metadata" token
+        # (see _aggregate_meta_features) that is prepended to the transformer.
+        self.meta_proj = nn.Linear(_META_DIM, d_model)
 
         self.value_head = nn.Linear(d_model, 1)
 
@@ -359,14 +406,18 @@ class V_network(nn.Module):
         # judge precisely whether a fleet's trajectory will strike a target planet.
         # (For planets index 4 is radius; self.P simply learns to downweight it.)
         angle_block = self.angle_encoder(state[:, :, 4:5])
-        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:10],
+        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:9],
                                  ship_block, angle_block], dim=-1)
         planets = self.P(token_feats * planets_mask.unsqueeze(-1))
         fleets  = self.F(token_feats * fleets_mask.unsqueeze(-1))
 
         time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
-        pos = state[:, :, 11:13]  # Assuming position is at indices 11 and 12
+        pos = state[:, :, 10:12]  # position is at indices 10 and 11 (13-wide state)
         pos_encoding = self.pos_encoder(pos, time_step)
+
+        # Global summary token, built from the raw input state (before it is
+        # overwritten below) and prepended to the transformer sequence.
+        meta_token = self.meta_proj(_aggregate_meta_features(state)).unsqueeze(1)
 
         state = planets + fleets
         state = state + pos_encoding
@@ -375,7 +426,7 @@ class V_network(nn.Module):
         batch_size = state.shape[0]
         cls_token = self.cls_token.expand(batch_size, -1,  -1)  # [1, batch_size, d_model]
 
-        src = torch.cat((cls_token, state), dim=1)
+        src = torch.cat((cls_token, meta_token, state), dim=1)
         out_ = self.transformer(src)
         out_cls = out_[:, 0, :]  # [batch_size, 1, d_model]
         value = self.value_head(out_cls)  # [batch_size, 1]
@@ -386,7 +437,7 @@ class V_network(nn.Module):
 class P_network(nn.Module):
     def __init__(self,
                  d_model=128,
-                 state_dim=14,
+                 state_dim=13,
                  action_dim=4,   # matches OrbitWarsEnv.ACTION_DIM
                  max_planets=40,
                  max_fleets=100, 
@@ -410,6 +461,10 @@ class P_network(nn.Module):
         self.F = nn.Linear(_proj_in, d_model)
 
         self.pos_encoder = LearnedFourierPosEncoding(d_model)
+
+        # Projects the per-player aggregate summary into a single "metadata" token
+        # (see _aggregate_meta_features) that is prepended to the transformer.
+        self.meta_proj = nn.Linear(_META_DIM, d_model)
 
         self.mu_head = nn.Linear(d_model, action_dim)
         self.sigma_head = nn.Linear(d_model, action_dim)
@@ -445,25 +500,30 @@ class P_network(nn.Module):
         # judge precisely whether a fleet's trajectory will strike a target planet.
         # (For planets index 4 is radius; self.P simply learns to downweight it.)
         angle_block = self.angle_encoder(state[:, :, 4:5])
-        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:10],
+        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:9],
                                  ship_block, angle_block], dim=-1)
         planets = self.P(token_feats * planets_mask.unsqueeze(-1))
         fleets  = self.F(token_feats * fleets_mask.unsqueeze(-1))
 
         time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
-        pos = state[:, :, 11:13]  # Assuming position is at indices 11 and 12
+        pos = state[:, :, 10:12]  # position is at indices 10 and 11 (13-wide state)
         pos_encoding = self.pos_encoder(pos, time_step)
+
+        # Global summary token, built from the raw input state (before it is
+        # overwritten below) and prepended to the transformer sequence.
+        meta_token = self.meta_proj(_aggregate_meta_features(state)).unsqueeze(1)
 
         state = planets + fleets
         state = state + pos_encoding
 
-        # Process through transformer
-        src = state  # [batch_size, seq_len, d_model]
-        out_ = self.transformer(src)  # [batch_size, seq_len, d_model]
+        # Process through transformer. The metadata token sits at position 0, so
+        # the planet tokens (which drive the per-planet action heads) start at 1.
+        src = torch.cat((meta_token, state), dim=1)  # [batch_size, 1 + seq_len, d_model]
+        out_ = self.transformer(src)  # [batch_size, 1 + seq_len, d_model]
 
         #only pass num planets tokens through heads, as action is only for planets
-        mu = self.mu_head(out_[:, :self.max_planets, :])
-        sigma = F.softplus(self.sigma_head(out_[:, :self.max_planets, :])) + 1e-5
+        mu = self.mu_head(out_[:, 1:1 + self.max_planets, :])
+        sigma = F.softplus(self.sigma_head(out_[:, 1:1 + self.max_planets, :])) + 1e-5
         # Clamp sigma to a bounded range so the entropy term cannot drive it to
         # extremes: too small spikes -log(sigma) in the log-prob, too large blows
         # up the (now tanh-squashed) action. exp(-5)≈6.7e-3, exp(2)≈7.39.

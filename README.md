@@ -6,6 +6,59 @@
 mixed_random_ratio_decay = None -> spawn all training episodes
 
 
+## Metadata token (global summary)
+
+The transformer is fed an extra **metadata token** prepended to the planet/fleet
+sequence. It encodes a per-player global summary so the model doesn't have to
+reconstruct the overall picture by attending across individual tokens.
+
+For each of the 4 player slots (player 0 = our agent after the perspective swap,
+1–3 = opponents) it carries:
+
+- **planet count**
+- **total production** (`log1p`-compressed)
+- **total ships** — planets **and** in-flight fleets (`log1p`-compressed)
+
+= a 12-dim vector (`_aggregate_meta_features` in [model/SAC.py](model/SAC.py)),
+computed inside `forward` from the encoded state, projected by a learned
+`nn.Linear(12, d_model)` (`meta_proj`), and prepended as token 0. Because the
+encoder is full self-attention, every planet/fleet token (and the `cls` value
+token) can read it directly.
+
+Implementation notes:
+- Derived in-network from the state tensor, so the **state interface (140×13) and
+  the replay buffer are unchanged** — nothing to migrate.
+- `Q`/`V` read the `cls` token at position 0 (now followed by the metadata token);
+  `P` reads per-planet outputs, which shift to `out[:, 1:1+max_planets]`.
+- Neutral planets and padding rows have an all-zero owner one-hot, so they
+  contribute to no player's totals.
+
+
+## Comets removed from the pipeline
+
+Comets (transient planets the kaggle engine spawns at fixed steps) are stripped
+from every observation at the parsing boundary in `env.orbit_wars._obs_to_arrays`.
+Their planet rows are dropped before anything downstream sees them, so they no
+longer:
+
+- enter the **state** (this removed the per-planet "comet" feature, taking the
+  state width from **14 → 13**),
+- appear as **targets** or as obstacles in the launch-angle search / flight-path
+  raycasts (they were a source of mis-aimed fleets),
+- contribute to **reward** schemes.
+
+The engine still simulates comets internally; we simply never expose them to the
+agent. The opponent `RuleBasedAgent` already ignored comets as targets, so it is
+unchanged.
+
+> **Breaking change — retrain from scratch.** The state width changed (14 → 13),
+> so the networks' input projection shape changed. **Old checkpoints and saved
+> replay buffers (`replay_buffer.npz`) are incompatible** and cannot be resumed.
+> Set `execution.resume = null` and delete/relocate any old `replay_buffer.npz`
+> in the checkpoint dir before training. (`STATE_DIM` lives on `OrbitWarsEnv`;
+> the networks default to `state_dim=13`.)
+
+
 ## Reward schemes
 
 Rewards are **composable**. The `"reward"` list in the config holds one or more
@@ -29,8 +82,10 @@ terminal step, and `step`/`max_steps` are the current tick and the episode limit
 | `RelativePlanetAdvantage` | `planet_scale × [ Δmy_planet_cnt − Σ Δopp_planet_cnt ]` | Taking more planets than opponents (each planet counts equally). |
 | `ShipGrowth` | `ship_scale × Δmy_ships` | Growing your own fleet, opponents ignored (pure self-improvement). |
 | `ProductionPlanetDelta` | `planet_scale × (Σ prod gained − Σ prod lost)` | Capturing planets, weighted by their production. |
+| `ProximityCaptureBonus` | `Σ_captured scale × exp(−d / ref_dist)` | Capturing planets **close** to your territory (`d` = distance from the captured planet to your nearest owned planet). Biases the agent to expand into nearby planets first instead of flinging fleets across the map. Rewards the capture event only — pair with `ProductionPlanetDelta` for value-weighting. |
 | `AbsoluteHoldings` | `ship_scale × my_ships_now + planet_scale × my_prod_now` | *Holding* territory — scored every step, so it pays to keep high-production planets. Does **not** telescope: keep `ship_scale` small. |
 | `FleetLaunchPenalty` | `−ship_scale × n_new_fleets` | (Penalty) discourages fleet spam — flat cost per fleet launched, regardless of size/destination. |
+| `LaunchDistancePenalty` | `−scale × ticks_to_target / time_norm` per launched fleet (miss = `max_ticks`) | (Penalty) charges each launched fleet by how long it must **fly** to its target — replays the fleet's path against the engine's swept-collision model. Adjacent target ≈ free, cross-map send costs a lot, a fleet that hits nothing pays the full horizon. The *launch-time* counterpart to `ProximityCaptureBonus` (denser, fires immediately). Most expensive component — forward-simulates each launch up to `max_ticks`. |
 | `StepPenalty` | `−weight` (every step) | (Penalty) a flat per-step "living cost" that adds the value of *time*: any capture is worth more the sooner it lands, so the agent prefers nearby planets and quick games. Pair with a win bonus (e.g. `TimeDecayWinBonus`) so it rewards winning *fast*, not just ending fast. |
 
 ### Terminal win-bonus components

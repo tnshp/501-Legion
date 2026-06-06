@@ -19,3 +19,8 @@
 
 #commit - v9
 - added learned forurier encodings for x, y, ships and angle 
+
+#commit - v11
+- added proximity based reward schemes
+- removed comets
+- added metadata token 

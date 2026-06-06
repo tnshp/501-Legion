@@ -40,8 +40,8 @@ from env.orbit_wars import (
     OrbitWarsEnv,
     # composable reward components
     RelativeShipAdvantage, RelativePlanetAdvantage,
-    ShipGrowth, ProductionPlanetDelta,
-    AbsoluteHoldings, FleetLaunchPenalty, StepPenalty,
+    ShipGrowth, ProductionPlanetDelta, ProximityCaptureBonus,
+    AbsoluteHoldings, FleetLaunchPenalty, LaunchDistancePenalty, StepPenalty,
     TerminalWinBonus, TimeDecayWinBonus,
     # legacy numbered schemes (backward compatibility)
     RewardScheme1, RewardScheme2, RewardScheme3, RewardScheme4,
@@ -522,8 +522,10 @@ if __name__ == "__main__":
         "RelativePlanetAdvantage": RelativePlanetAdvantage,
         "ShipGrowth":              ShipGrowth,
         "ProductionPlanetDelta":   ProductionPlanetDelta,
+        "ProximityCaptureBonus":   ProximityCaptureBonus,
         "AbsoluteHoldings":        AbsoluteHoldings,
         "FleetLaunchPenalty":      FleetLaunchPenalty,
+        "LaunchDistancePenalty":   LaunchDistancePenalty,
         "StepPenalty":             StepPenalty,
         "TerminalWinBonus":        TerminalWinBonus,
         "TimeDecayWinBonus":       TimeDecayWinBonus,
