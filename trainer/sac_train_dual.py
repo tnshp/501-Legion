@@ -1066,14 +1066,21 @@ class SACTrainer:
     #         with open(path[:-2] + "json", "w", encoding="utf-8") as file:
     #             json.dump(train_dict, file, indent=4)
             
+    @staticmethod
+    def _strip_orig_mod(sd: dict) -> dict:
+        return {
+            (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+            for k, v in sd.items()
+        }
+
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        self.policy_net.load_state_dict(ckpt["policy_net"])
-        self.q1_net.load_state_dict(ckpt["q1_net"])
-        self.q2_net.load_state_dict(ckpt["q2_net"])
+        self.policy_net.load_state_dict(self._strip_orig_mod(ckpt["policy_net"]))
+        self.q1_net.load_state_dict(self._strip_orig_mod(ckpt["q1_net"]))
+        self.q2_net.load_state_dict(self._strip_orig_mod(ckpt["q2_net"]))
         if not self.use_lambda_returns and "q1_target" in ckpt:
-            self.q1_target.load_state_dict(ckpt["q1_target"])
-            self.q2_target.load_state_dict(ckpt["q2_target"])
+            self.q1_target.load_state_dict(self._strip_orig_mod(ckpt["q1_target"]))
+            self.q2_target.load_state_dict(self._strip_orig_mod(ckpt["q2_target"]))
         if self.auto_alpha and "log_alpha" in ckpt:
             self.log_alpha.data.fill_(ckpt["log_alpha"])
             self.alpha = self.log_alpha.exp().item()
