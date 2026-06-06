@@ -105,7 +105,7 @@ def compute_reward_for_player(obs_prev, obs_next, player_id: int, num_opps: int)
         negatives_fleets = sum(
             float(f[-1]) for f in o.fleets if int(f[1]) != player_id
         )/num_opps
-        transition_score = positives_planets - negatives_planets + 0.75*(positives_fleets - negatives_fleets)
+        transition_score = positives_planets - negatives_planets + 0.5*(positives_fleets - negatives_fleets)
         return transition_score
     return score(obs_next) - score(obs_prev)
 

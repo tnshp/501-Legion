@@ -288,9 +288,10 @@ class SACTrainer:
         # prefix) match the uncompiled state dict, and after all deepcopy() calls
         # so opponent/target snapshots remain separate uncompiled modules.
         if str(device).startswith("cuda"):
-            self.policy_net = torch.compile(self.policy_net)
-            self.q1_net     = torch.compile(self.q1_net)
-            self.q2_net     = torch.compile(self.q2_net)
+            self.policy_net   = torch.compile(self.policy_net)
+            self.q1_net       = torch.compile(self.q1_net)
+            self.q2_net       = torch.compile(self.q2_net)
+            self.opponent_net = torch.compile(self.opponent_net)
             if not self.use_lambda_returns:
                 self.q1_target = torch.compile(self.q1_target)
                 self.q2_target = torch.compile(self.q2_target)
@@ -303,8 +304,9 @@ class SACTrainer:
         target.load_state_dict(source.state_dict())
 
     def _soft_update(self, target: nn.Module, source: nn.Module):
-        for tp, sp in zip(target.parameters(), source.parameters()):
-            tp.data.copy_(self.tau * sp.data + (1.0 - self.tau) * tp.data)
+        with torch.no_grad():
+            for tp, sp in zip(target.parameters(), source.parameters()):
+                tp.lerp_(sp, self.tau)
 
     def _grad_norm(self, net: nn.Module) -> float:
         total = 0.0
@@ -375,17 +377,17 @@ class SACTrainer:
                 torch.min(q1_next, q2_next) - self.alpha * lp_next
             )
 
-        # ── Q1 update ─────────────────────────────────────────────────────────
+        # ── Q1 + Q2 update (single backward over disjoint parameter sets) ────
         with _amp:
             q1_pred = self.q1_net(states, actions).unsqueeze(-1)
-            q1_loss = F.mse_loss(q1_pred, q_target)
-        self.q1_optimizer.zero_grad(); q1_loss.backward(); self.q1_optimizer.step()
-
-        # ── Q2 update ─────────────────────────────────────────────────────────
-        with _amp:
             q2_pred = self.q2_net(states, actions).unsqueeze(-1)
+            q1_loss = F.mse_loss(q1_pred, q_target)
             q2_loss = F.mse_loss(q2_pred, q_target)
-        self.q2_optimizer.zero_grad(); q2_loss.backward(); self.q2_optimizer.step()
+        self.q1_optimizer.zero_grad()
+        self.q2_optimizer.zero_grad()
+        (q1_loss + q2_loss).backward()
+        self.q1_optimizer.step()
+        self.q2_optimizer.step()
 
         # ── Policy update ─────────────────────────────────────────────────────
         with _amp:
@@ -788,23 +790,19 @@ class SACTrainer:
 
         _amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=self._amp)
 
-        # ── Q updates toward the precomputed λ-return (shared by Q1 & Q2) ─────
+        # ── Q updates toward the precomputed λ-return (single backward) ──────
         with _amp:
             q1_pred = self.q1_net(states, actions).unsqueeze(-1)
-            q1_loss = nn.MSELoss()(q1_pred, targets)
+            q2_pred = self.q2_net(states, actions).unsqueeze(-1)
+            q1_loss = F.mse_loss(q1_pred, targets)
+            q2_loss = F.mse_loss(q2_pred, targets)
         self.q1_optimizer.zero_grad()
-        q1_loss.backward()
+        self.q2_optimizer.zero_grad()
+        (q1_loss + q2_loss).backward()
         if self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.q1_net.parameters(), self.max_grad_norm)
-        self.q1_optimizer.step()
-
-        with _amp:
-            q2_pred = self.q2_net(states, actions).unsqueeze(-1)
-            q2_loss = nn.MSELoss()(q2_pred, targets)
-        self.q2_optimizer.zero_grad()
-        q2_loss.backward()
-        if self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.q2_net.parameters(), self.max_grad_norm)
+        self.q1_optimizer.step()
         self.q2_optimizer.step()
 
         # ── Policy update — identical SAC actor objective ─────────────────────
