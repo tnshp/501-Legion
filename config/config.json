@@ -8,7 +8,7 @@
     "learning_rate_alpha" : 1e-3,
     "batch_size" : 128,
     "replay_buffer_size" : 50000,
-    "max_grad_norm" : 10.0,
+    "max_grad_norm" : 200.0,
     "auto_alpha" : true,
 
     "use_lambda_returns" : true,
@@ -22,10 +22,10 @@
 
     "checkpoint_interval" : 20,
     "checkpoint_path" : "checkpoints",
-    "checkpoint_load_path" : "checkpoints/EP440_.pt",
-    "training_data_load_path" : "checkpoints/EP440_.json",
+    "checkpoint_load_path" : "checkpoints/EP600_.pt",
+    "training_data_load_path" : "checkpoints/EP600_.json",
 
-    "replay_buffer_load_path" : "checkpoints/EP400_replay_buffer.pt",
+    "replay_buffer_load_path" : "checkpoints/EP600_replay_buffer.pt",
     "replay_storage_interval" : 50,
 
     "rule_based_ratio" : 1.0,
