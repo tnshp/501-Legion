@@ -1009,10 +1009,13 @@ class SACTrainer:
     # =========================================================================
     def save_checkpoint(self, path: str, train_dict = None, replay_buffer = None):
         ckpt = {
-            "policy_net": self.policy_net.state_dict(),
-            "q1_net":     self.q1_net.state_dict(),
-            "q2_net":     self.q2_net.state_dict(),
-            "train_step": self.train_step,
+            "policy_net":       self.policy_net.state_dict(),
+            "q1_net":           self.q1_net.state_dict(),
+            "q2_net":           self.q2_net.state_dict(),
+            "policy_optimizer": self.policy_optimizer.state_dict(),
+            "q1_optimizer":     self.q1_optimizer.state_dict(),
+            "q2_optimizer":     self.q2_optimizer.state_dict(),
+            "train_step":       self.train_step,
         }
         # Target nets only exist on the 1-step path.
         if not self.use_lambda_returns:
@@ -1078,6 +1081,12 @@ class SACTrainer:
         self.policy_net.load_state_dict(self._strip_orig_mod(ckpt["policy_net"]))
         self.q1_net.load_state_dict(self._strip_orig_mod(ckpt["q1_net"]))
         self.q2_net.load_state_dict(self._strip_orig_mod(ckpt["q2_net"]))
+        if "policy_optimizer" in ckpt:
+            self.policy_optimizer.load_state_dict(ckpt["policy_optimizer"])
+        if "q1_optimizer" in ckpt:
+            self.q1_optimizer.load_state_dict(ckpt["q1_optimizer"])
+        if "q2_optimizer" in ckpt:
+            self.q2_optimizer.load_state_dict(ckpt["q2_optimizer"])
         if not self.use_lambda_returns and "q1_target" in ckpt:
             self.q1_target.load_state_dict(self._strip_orig_mod(ckpt["q1_target"]))
             self.q2_target.load_state_dict(self._strip_orig_mod(ckpt["q2_target"]))
