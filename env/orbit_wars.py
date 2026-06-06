@@ -614,29 +614,31 @@ class ProductionPlanetDelta:
 
 
 class ProximityCaptureBonus:
-    """Extra reward for capturing planets CLOSE to your existing territory.
+    """Bonus for capturing a planet WELL-CONNECTED to your existing territory.
 
-        for each planet captured this step:
-            + scale × exp(−d / ref_dist)
+    Fires only on the step a planet is captured (nothing on any other step — a
+    light, event-only signal). For each planet captured this step it SUMS a
+    distance-decayed closeness to EVERY planet we already owned (pre-step):
 
-    where d is the distance (board units) from the captured planet to your
-    NEAREST other owned planet, measured in the pre-step state — a faithful proxy
-    for how far the capturing fleet had to travel.
+        bonus = scale × Σ_{p in owned_before} exp(−d_p / ref_dist)
 
-    A capture right next to your base (small d) earns ≈ +scale; a capture flung
-    across the map (large d) earns ≈ 0. This biases the agent toward expanding
-    into nearby planets first instead of sending fleets far away: long-range
-    sends both arrive late (the opponent grabs the easy planets meanwhile) AND
-    now pay a smaller bonus, so the opening stops bleeding tempo.
+    where d_p is the distance (board units) from the captured planet to owned
+    planet p. Because the contributions ADD, a planet captured *between two* (or
+    among several) owned planets scores high — it is close to multiple owned
+    planets at once — whereas a capture next to a single planet scores ≈ scale and
+    a capture far from all your territory scores ≈ 0. This rewards consolidating
+    and connecting territory rather than grabbing isolated planets.
 
-    The board is 100×100; `ref_dist` sets the falloff — at d = ref_dist the bonus
-    is e⁻¹ ≈ 0.37 × scale. This rewards the capture EVENT only (like
-    ProductionPlanetDelta); pair it with that scheme if you also want value- /
-    production-weighting, and with a win bonus for the terminal objective.
+    The board is 100×100; `ref_dist` sets the falloff — a single owned planet at
+    d = ref_dist contributes e⁻¹ ≈ 0.37 × scale. A capture made with no prior
+    territory scores 0 (there is nothing to be close to). Rewards the capture
+    EVENT only, like ProductionPlanetDelta; pair with that for value-weighting and
+    with a win bonus for the terminal objective.
 
     Parameters
     ----------
-    scale    : float, default 1.0  — bonus for an adjacent capture (d → 0)
+    scale    : float, default 1.0  — per-neighbour closeness weight (a capture
+               adjacent to N owned planets earns up to ≈ N × scale)
     ref_dist : float, default 25.0 — distance decay constant, in board units
     """
 
@@ -654,19 +656,19 @@ class ProximityCaptureBonus:
         was_mine = {int(r[0]) for r in planets_old if int(r[1]) == player_id}
         my_old_xy = [(float(r[2]), float(r[3])) for r in planets_old
                      if int(r[1]) == player_id]
+        if not my_old_xy:
+            return 0.0                        # no prior territory → nothing to connect to
 
         total = 0.0
         for r in planets_new:
             if int(r[1]) != player_id or int(r[0]) in was_mine:
                 continue                      # not a fresh capture for us
             px, py = float(r[2]), float(r[3])
-            if not my_old_xy:
-                closeness = 1.0               # no prior territory → treat as adjacent
-            else:
-                d = min(math.hypot(px - ox, py - oy) for ox, oy in my_old_xy)
-                closeness = math.exp(-d / self.ref_dist)
-            total += self.scale * closeness
-        return float(total)
+            # Sum closeness to every owned planet: a capture between several owned
+            # planets is close to all of them at once, so the bonus stacks.
+            total += sum(math.exp(-math.hypot(px - ox, py - oy) / self.ref_dist)
+                         for ox, oy in my_old_xy)
+        return float(self.scale * total)
 
 
 class AbsoluteHoldings:
