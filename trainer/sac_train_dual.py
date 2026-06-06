@@ -1001,7 +1001,7 @@ class SACTrainer:
                 win_count_consec = 0
                 opponent_noise-=opp_noise_inc
 
-        self.save_checkpoint(checkpoint_path + f"replayBuffers/EP{ep+1}_.pt", train_dict)
+        self.save_checkpoint(checkpoint_path + f"/final/EP{ep+1}_.pt", train_dict)
         return ep_rewards
 
     # =========================================================================
@@ -1009,10 +1009,13 @@ class SACTrainer:
     # =========================================================================
     def save_checkpoint(self, path: str, train_dict = None, replay_buffer = None):
         ckpt = {
-            "policy_net": self.policy_net.state_dict(),
-            "q1_net":     self.q1_net.state_dict(),
-            "q2_net":     self.q2_net.state_dict(),
-            "train_step": self.train_step,
+            "policy_net":       self.policy_net.state_dict(),
+            "q1_net":           self.q1_net.state_dict(),
+            "q2_net":           self.q2_net.state_dict(),
+            "policy_optimizer": self.policy_optimizer.state_dict(),
+            "q1_optimizer":     self.q1_optimizer.state_dict(),
+            "q2_optimizer":     self.q2_optimizer.state_dict(),
+            "train_step":       self.train_step,
         }
         # Target nets only exist on the 1-step path.
         if not self.use_lambda_returns:
