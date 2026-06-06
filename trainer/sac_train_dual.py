@@ -288,12 +288,12 @@ class SACTrainer:
         # prefix) match the uncompiled state dict, and after all deepcopy() calls
         # so opponent/target snapshots remain separate uncompiled modules.
         if str(device).startswith("cuda"):
-            self.policy_net = torch.compile(self.policy_net, mode="reduce-overhead")
-            self.q1_net     = torch.compile(self.q1_net,     mode="reduce-overhead")
-            self.q2_net     = torch.compile(self.q2_net,     mode="reduce-overhead")
+            self.policy_net = torch.compile(self.policy_net)
+            self.q1_net     = torch.compile(self.q1_net)
+            self.q2_net     = torch.compile(self.q2_net)
             if not self.use_lambda_returns:
-                self.q1_target = torch.compile(self.q1_target, mode="reduce-overhead")
-                self.q2_target = torch.compile(self.q2_target, mode="reduce-overhead")
+                self.q1_target = torch.compile(self.q1_target)
+                self.q2_target = torch.compile(self.q2_target)
 
     # =========================================================================
     # Utilities
