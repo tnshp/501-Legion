@@ -255,18 +255,6 @@ class SACTrainer:
         for p in self.opponent_net.parameters():
             p.requires_grad_(False)
 
-        # ── torch.compile (CUDA only) ─────────────────────────────────────────
-        # Must come after all deepcopy() calls so opponent/target snapshots are
-        # separate uncompiled modules (they get load_state_dict periodically and
-        # aren't on the hot update path, so compiling them isn't worth it).
-        if str(device).startswith("cuda"):
-            self.policy_net = torch.compile(self.policy_net, mode="reduce-overhead")
-            self.q1_net     = torch.compile(self.q1_net,     mode="reduce-overhead")
-            self.q2_net     = torch.compile(self.q2_net,     mode="reduce-overhead")
-            if not self.use_lambda_returns:
-                self.q1_target = torch.compile(self.q1_target, mode="reduce-overhead")
-                self.q2_target = torch.compile(self.q2_target, mode="reduce-overhead")
-
         # ── optimisers ────────────────────────────────────────────────────────
         self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
         self.q1_optimizer     = optim.Adam(self.q1_net.parameters(),     lr=learning_rate)
@@ -286,7 +274,6 @@ class SACTrainer:
 
         if checkpoint_load_path is not None:
             self.load_checkpoint(checkpoint_load_path)
-        
 
         self.saved_buffer = None
         if replay_buffer_load_path is not None:
@@ -295,6 +282,18 @@ class SACTrainer:
         self.pitime = 0
         self.envtime = 0
         self.updatetime = 0
+
+        # ── torch.compile (CUDA only) ─────────────────────────────────────────
+        # Must come after load_checkpoint() so the checkpoint keys (no _orig_mod.
+        # prefix) match the uncompiled state dict, and after all deepcopy() calls
+        # so opponent/target snapshots remain separate uncompiled modules.
+        if str(device).startswith("cuda"):
+            self.policy_net = torch.compile(self.policy_net, mode="reduce-overhead")
+            self.q1_net     = torch.compile(self.q1_net,     mode="reduce-overhead")
+            self.q2_net     = torch.compile(self.q2_net,     mode="reduce-overhead")
+            if not self.use_lambda_returns:
+                self.q1_target = torch.compile(self.q1_target, mode="reduce-overhead")
+                self.q2_target = torch.compile(self.q2_target, mode="reduce-overhead")
 
     # =========================================================================
     # Utilities
