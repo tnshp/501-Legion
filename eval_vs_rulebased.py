@@ -66,7 +66,7 @@ def sac_act(policy: P_network, encoder: Encoder, obs, initial_planets: np.ndarra
     """Encode obs from SAC's perspective, run policy, decode to kaggle moves."""
     state_np = encode_obs_as_player(encoder, obs, initial_planets, player_id=sac_player)
     s = torch.FloatTensor(state_np).unsqueeze(0).to(device)
-    action, _ = policy.sample(s)
+    action, _, _ = policy.sample(s)
     action_np = action.squeeze(0).cpu().numpy()  # [max_planets, action_dim]
 
     planets_now = np.array(obs.planets, dtype=np.float32)

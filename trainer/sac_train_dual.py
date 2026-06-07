@@ -150,7 +150,7 @@ class SACTrainer:
     SAC v2 trainer for Orbit Wars with self-play and optional rule-based opponents.
 
     Network interface:
-        policy_net.sample(state)     -> (action [B, MAX_PLANETS, ACTION_DIM], log_prob [B, 1])
+        policy_net.sample(state)     -> (action [B, MAX_PLANETS, ACTION_DIM], log_prob [B, 1], n_valid_planets [B, 1])
         q_net.forward(state, action) -> [B]
     """
 
@@ -224,8 +224,17 @@ class SACTrainer:
                 self.training_data = json.load(file)
         
         self.auto_alpha = auto_alpha
+        # Per-sample action dimensionality used to scale a *dynamic* target
+        # entropy by how many planets actually exist this step (see below) —
+        # the static -prod(act_shape) heuristic overcounts padded planet slots.
+        self._action_dim = int(act_shape[-1])
         if auto_alpha:
-            self.target_entropy  = float(target_entropy) if target_entropy is not None else -float(np.prod(act_shape))
+            # If the user pins target_entropy explicitly, honour it as a fixed
+            # scalar (back-compat / experimentation). Otherwise leave it None:
+            # update()/_lambda_update() then compute a per-sample target of
+            # -n_valid_planets * action_dim, since log_prob is now masked to
+            # only sum over planets that exist this step (see P_network.sample).
+            self.target_entropy  = float(target_entropy) if target_entropy is not None else None
             self.log_alpha       = nn.Parameter(torch.zeros(1, device=device))
             self.alpha_optimizer = optim.Adam([self.log_alpha], lr=learning_rate_alpha)
             # Bounds on alpha — keeps the dual-gradient auto-tuning from running
@@ -320,6 +329,19 @@ class SACTrainer:
         with torch.no_grad():
             self.log_alpha.data.clamp_(self._log_alpha_min, self._log_alpha_max)
 
+    def _target_entropy_for(self, n_valid: torch.Tensor):
+        """Per-sample target entropy for the auto-alpha dual gradient.
+
+        Uses a fixed override if one was supplied; otherwise scales with how
+        many planets actually exist this step (-n_valid * action_dim), since
+        log_prob (from P_network.sample) is masked to sum only over those
+        planets. A static -prod(act_shape) target assumes every padded slot
+        carries real entropy, which is unreachable and drives alpha to 0.
+        """
+        if self.target_entropy is not None:
+            return self.target_entropy
+        return -(n_valid.float() * self._action_dim)
+
     def _grad_norm(self, net: nn.Module) -> float:
         total = 0.0
         for p in net.parameters():
@@ -342,13 +364,13 @@ class SACTrainer:
         """state_np [seq, feat] → action_np [MAX_PLANETS, ACTION_DIM]."""
         s = torch.from_numpy(state_np).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            action, _ = self.policy_net.sample(s)
+            action, _, _ = self.policy_net.sample(s)
         return action.squeeze(0).cpu().numpy()
 
     def select_opponent_action(self, state_np: np.ndarray) -> np.ndarray:
         s = torch.from_numpy(state_np).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            action, _ = self.opponent_net.sample(s)
+            action, _, _ = self.opponent_net.sample(s)
         return action.squeeze(0).cpu().numpy()
 
     # =========================================================================
@@ -371,19 +393,9 @@ class SACTrainer:
 
         _amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=self._amp)
 
-        # ── Auto-alpha ────────────────────────────────────────────────────────
-        if self.auto_alpha:
-            with _amp:
-                alpha_loss = -(self.log_alpha.exp() * (lp.detach() + self.target_entropy)).mean()
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
-            self._clamp_log_alpha()
-            self.alpha = self.log_alpha.exp().item()
-
         # ── Q-targets ─────────────────────────────────────────────────────────
         with _amp, torch.no_grad():
-            a_next, lp_next = self.policy_net.sample(next_states)
+            a_next, lp_next, _ = self.policy_net.sample(next_states)
             q1_next = self.q1_target(next_states, a_next).unsqueeze(-1)
             q2_next = self.q2_target(next_states, a_next).unsqueeze(-1)
             q_target = rewards + (1.0 - dones) * self.gamma * (
@@ -404,7 +416,7 @@ class SACTrainer:
 
         # ── Policy update ─────────────────────────────────────────────────────
         with _amp:
-            a_tilde, lp = self.policy_net.sample(states)
+            a_tilde, lp, n_valid = self.policy_net.sample(states)
             q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
             q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
             policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
@@ -413,6 +425,17 @@ class SACTrainer:
         # ── Polyak-update target Q-networks ───────────────────────────────────
         self._soft_update(self.q1_target, self.q1_net)
         self._soft_update(self.q2_target, self.q2_net)
+
+        # ── Auto-alpha ────────────────────────────────────────────────────────
+        if self.auto_alpha:
+            with _amp:
+                target_entropy = self._target_entropy_for(n_valid)
+                alpha_loss = -(self.log_alpha.exp() * (lp.detach() + target_entropy)).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            self._clamp_log_alpha()
+            self.alpha = self.log_alpha.exp().item()
 
         self._update_count += 1
 
@@ -703,7 +726,7 @@ class SACTrainer:
         with torch.no_grad(), _amp:
             for i in range(0, len(next_states_np), chunk):
                 ns = self.state_preprocessor(self._to(torch.from_numpy(next_states_np[i:i + chunk])))
-                a, lp = self.policy_net.sample(ns)
+                a, lp, _ = self.policy_net.sample(ns)
                 q1 = self.q1_net(ns, a).unsqueeze(-1)
                 q2 = self.q2_net(ns, a).unsqueeze(-1)
                 v  = torch.min(q1, q2) - self.alpha * lp
@@ -820,7 +843,7 @@ class SACTrainer:
 
         # ── Policy update — identical SAC actor objective ─────────────────────
         with _amp:
-            a_tilde, lp = self.policy_net.sample(states)
+            a_tilde, lp, n_valid = self.policy_net.sample(states)
             q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
             q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
             policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
@@ -835,7 +858,8 @@ class SACTrainer:
         # ── Auto-alpha ────────────────────────────────────────────────────────
         if self.auto_alpha:
             with _amp:
-                alpha_loss = -(self.log_alpha.exp() * (lp.detach() + self.target_entropy)).mean()
+                target_entropy = self._target_entropy_for(n_valid)
+                alpha_loss = -(self.log_alpha.exp() * (lp.detach() + target_entropy)).mean()
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
@@ -849,6 +873,7 @@ class SACTrainer:
             self.writer.add_scalar("Loss/q2",              q2_loss.item(),     s)
             self.writer.add_scalar("Loss/policy",          policy_loss.item(), s)
             self.writer.add_scalar("Policy/mean_log_prob", lp.mean().item(),   s)
+            self.writer.add_scalar("Policy/mean_n_valid_planets", n_valid.float().mean().item(), s)
             self.writer.add_scalar("Q/target_mean",        targets.mean().item(), s)
             self.writer.add_scalar("Alpha/value",          self.alpha,         s)
             self.writer.add_scalar("GradNorm/policy", self._grad_norm(self.policy_net), s)
@@ -856,6 +881,10 @@ class SACTrainer:
             self.writer.add_scalar("GradNorm/q2",     self._grad_norm(self.q2_net),    s)
             if self.auto_alpha:
                 self.writer.add_scalar("Loss/alpha", alpha_loss.item(), s)
+                self.writer.add_scalar("Alpha/target_entropy_mean",
+                                       target_entropy.float().mean().item()
+                                       if torch.is_tensor(target_entropy) else target_entropy,
+                                       s)
 
         self._update_count += 1
         return {

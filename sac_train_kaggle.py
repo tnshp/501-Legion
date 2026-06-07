@@ -274,14 +274,14 @@ class SACKaggle:
     def select_action(self, state_np: np.ndarray) -> np.ndarray:
         """state_np [seq, feat] → action_np [max_planets, action_dim]."""
         s = torch.FloatTensor(state_np).unsqueeze(0).to(self.device)
-        action, _ = self.policy.sample(s)
+        action, _, _ = self.policy.sample(s)
         return action.squeeze(0).cpu().numpy()
 
     @torch.no_grad()
     def select_opponent_action(self, state_np: np.ndarray) -> np.ndarray:
         """Same as select_action but uses the frozen opponent snapshot."""
         s = torch.FloatTensor(state_np).unsqueeze(0).to(self.device)
-        action, _ = self.opponent_policy.sample(s)
+        action, _, _ = self.opponent_policy.sample(s)
         return action.squeeze(0).cpu().numpy()
 
     # ── gradient step ─────────────────────────────────────────────────────────
@@ -311,7 +311,7 @@ class SACKaggle:
 
         # Update V  (soft target: min Q - α log π)
         with torch.no_grad():
-            a_tilde, lp = self.policy.sample(s)
+            a_tilde, lp, _ = self.policy.sample(s)
             v_soft = (
                 torch.min(
                     self.q1(s, a_tilde).unsqueeze(-1),
@@ -323,7 +323,7 @@ class SACKaggle:
         self.opt_v.zero_grad(); v_loss.backward(); self.opt_v.step()
 
         # Update policy  (maximize min Q - α log π)
-        a_tilde, lp = self.policy.sample(s)
+        a_tilde, lp, _ = self.policy.sample(s)
         pi_loss = (
             self.alpha * lp
             - torch.min(
