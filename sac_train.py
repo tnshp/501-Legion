@@ -106,7 +106,7 @@ class SACTrainer:
     SAC v2 trainer for Orbit Wars with self-play.
 
     Network interface:
-        policy_net.sample(state)     -> (action [B, MAX_PLANETS, ACTION_DIM], log_prob [B, 1])
+        policy_net.sample(state)     -> (action [B, MAX_PLANETS, ACTION_DIM], log_prob [B, 1], n_valid_planets [B, 1])
         q_net.forward(state, action) -> [B]
     """
 
@@ -191,13 +191,13 @@ class SACTrainer:
         """state_np [seq, feat] → action_np [MAX_PLANETS, ACTION_DIM]."""
         s = torch.FloatTensor(state_np).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            action, _ = self.policy_net.sample(s)
+            action, _, _ = self.policy_net.sample(s)
         return action.squeeze(0).cpu().numpy()
 
     def select_opponent_action(self, state_np: np.ndarray) -> np.ndarray:
         s = torch.FloatTensor(state_np).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            action, _ = self.opponent_net.sample(s)
+            action, _, _ = self.opponent_net.sample(s)
         return action.squeeze(0).cpu().numpy()
 
     # =========================================================================
@@ -217,7 +217,7 @@ class SACTrainer:
 
         # ── Q-targets ─────────────────────────────────────────────────────────
         with torch.no_grad():
-            a_next, lp_next = self.policy_net.sample(next_states)
+            a_next, lp_next, _ = self.policy_net.sample(next_states)
             q1_next = self.q1_target(next_states, a_next).unsqueeze(-1)
             q2_next = self.q2_target(next_states, a_next).unsqueeze(-1)
             q_target = rewards + (1.0 - dones) * self.gamma * (
@@ -235,7 +235,7 @@ class SACTrainer:
         self.q2_optimizer.zero_grad(); q2_loss.backward(); self.q2_optimizer.step()
 
         # ── Policy update ─────────────────────────────────────────────────────
-        a_tilde, lp = self.policy_net.sample(states)
+        a_tilde, lp, _ = self.policy_net.sample(states)
         q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
         q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
         policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
