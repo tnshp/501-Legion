@@ -439,8 +439,9 @@ class P_network(nn.Module):
 
         Returns:
             action          : [B, max_planets, action_dim]
-            log_prob        : [B, 1]   — summed over planets that exist this step only
-            n_valid_planets : [B, 1]   — count of non-padding planet slots per sample
+            log_prob        : [B, 1]   — summed over owned planets only (the
+                                         only ones decode_action acts on)
+            n_owned_planets : [B, 1]   — count of agent-owned planet slots per sample
         """
         mu, log_std = self.forward(state)
         sigma = torch.exp(log_std)
@@ -456,16 +457,20 @@ class P_network(nn.Module):
         )
         log_prob = log_prob - torch.log(1.0 - action ** 2 + 1e-6)
 
-        # Padding planet slots are zero-filled (see Encoder._pad_array), and a
-        # real planet always has positive radius (state[..., 4] for planet
-        # tokens) — so this recovers, per sample, which of the max_planets
-        # slots are real without needing to thread a mask through the buffer.
-        planet_valid = (state[:, :self.max_planets, 4] > 0).float()      # [B, P]
-        log_prob = log_prob * planet_valid.unsqueeze(-1)                  # [B, P, A]
+        # decode_action only issues moves from planets the agent owns (owner
+        # == 0 post perspective-swap, see env_utils.decode_action) — actions
+        # emitted for enemy/neutral/padding slots are silently discarded. The
+        # owner one-hot lives at state[..., 0:4], with index 0 = "owned by
+        # the agent"; this also naturally zeroes out padding slots, which are
+        # all-zero (see Encoder._pad_array). So masking on ownership recovers
+        # exactly the planets whose action actually affects the environment —
+        # without needing to thread a mask through the replay buffer.
+        planet_owned = (state[:, :self.max_planets, 0] > 0.5).float()    # [B, P]
+        log_prob = log_prob * planet_owned.unsqueeze(-1)                  # [B, P, A]
         log_prob = log_prob.sum(dim=(-2, -1), keepdim=True).squeeze(-1)   # [B, 1]
-        n_valid_planets = planet_valid.sum(dim=-1, keepdim=True)          # [B, 1]
+        n_owned_planets = planet_owned.sum(dim=-1, keepdim=True)          # [B, 1]
 
-        return action, log_prob, n_valid_planets
+        return action, log_prob, n_owned_planets
     
 # class ActionDecoder(nn.Module):
 #     # Unused — action decoding is handled by decode_action() in env/dummy.py,
