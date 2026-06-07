@@ -1010,7 +1010,7 @@ class SACTrainer:
                 print(f"  Render saved → {render_path}")
             if won and use_rulebased:
                 win_count_consec+=1
-            else:
+            elif use_rulebased and not won:
                 win_count_consec = 0
             if win_count_consec>=3:
                 win_count_consec = 0
@@ -1178,6 +1178,7 @@ if __name__ == "__main__":
         auto_alpha = config.get("auto_alpha", False),
         alpha_min = config.get("alpha_min", 0.05),
         alpha_max = config.get("alpha_max", 1.0),
+        target_entropy= config.get("target_entropy")
     )
 
     print(f"TensorBoard: tensorboard --logdir ./runs/latest")

@@ -22,10 +22,10 @@
 
     "checkpoint_interval" : 20,
     "checkpoint_path" : "checkpoints",
-    "checkpoint_load_path" : null,
-    "training_data_load_path" : null,
+    "checkpoint_load_path" : "checkpoints/EP460_.pt",
+    "training_data_load_path" : "checkpoints/EP460_.json",
 
-    "replay_buffer_load_path" : null,
+    "replay_buffer_load_path" : "checkpoints/EP450_replay_buffer.pt",
     "replay_storage_interval" : 50,
 
     "rule_based_ratio" : 0.7,
