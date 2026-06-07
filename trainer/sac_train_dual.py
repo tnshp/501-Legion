@@ -185,6 +185,8 @@ class SACTrainer:
         max_grad_norm: Optional[float] = None,
         auto_alpha: bool = False,
         target_entropy: Optional[float] = None,
+        alpha_min: float = 0.05,
+        alpha_max: float = 1.0,
     ):
         self.device     = device
         self._amp       = str(device).startswith("cuda")
@@ -226,6 +228,10 @@ class SACTrainer:
             self.target_entropy  = float(target_entropy) if target_entropy is not None else -float(np.prod(act_shape))
             self.log_alpha       = nn.Parameter(torch.zeros(1, device=device))
             self.alpha_optimizer = optim.Adam([self.log_alpha], lr=learning_rate_alpha)
+            # Bounds on alpha — keeps the dual-gradient auto-tuning from running
+            # away to ~0 (policy collapse) or blowing up, without disabling it.
+            self._log_alpha_min  = float(np.log(alpha_min))
+            self._log_alpha_max  = float(np.log(alpha_max))
         else:
             self.target_entropy  = None
             self.log_alpha       = None
@@ -309,6 +315,11 @@ class SACTrainer:
             for tp, sp in zip(target.parameters(), source.parameters()):
                 tp.lerp_(sp, self.tau)
 
+    def _clamp_log_alpha(self):
+        """Keep alpha within [alpha_min, alpha_max] after each dual-gradient step."""
+        with torch.no_grad():
+            self.log_alpha.data.clamp_(self._log_alpha_min, self._log_alpha_max)
+
     def _grad_norm(self, net: nn.Module) -> float:
         total = 0.0
         for p in net.parameters():
@@ -367,6 +378,7 @@ class SACTrainer:
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
+            self._clamp_log_alpha()
             self.alpha = self.log_alpha.exp().item()
 
         # ── Q-targets ─────────────────────────────────────────────────────────
@@ -438,7 +450,7 @@ class SACTrainer:
             ep_reward_p0: float
         """
         env = make_kaggle_env("orbit_wars", debug=False)
-        env.reset(num_opps)
+        env.reset(num_opps+1)
 
         obs = env.steps[0][0].observation
         planets_np, _, _, _, _ = _obs_to_arrays(obs)
@@ -470,7 +482,7 @@ class SACTrainer:
 
             opp_moves = []
             opp_actions = []
-            for num in num_opps:
+            for num in range(num_opps):
                 # ── Player 1: frozen opponent snapshot ────────────────────────────
                 if in_warmup:
                     action = np.random.randn(MAX_PLANETS, ACTION_DIM).astype(np.float32)
@@ -537,8 +549,8 @@ class SACTrainer:
                 new_state_p3 = encode_obs_as_player(self.encoder, new_obs, initial_planets, player_id=3)
 
                 #transitions
-                transitions.append((state_p2, opp_actions[2], r_p2, new_state_p2, float(done)))
-                transitions.append((state_p3, opp_actions[3], r_p3, new_state_p3, float(done)))
+                transitions.append((state_p2, opp_actions[1], r_p2, new_state_p2, float(done)))
+                transitions.append((state_p3, opp_actions[2], r_p3, new_state_p3, float(done)))
 
                 state_p2 = new_state_p2
                 state_p3 = new_state_p3
@@ -827,6 +839,7 @@ class SACTrainer:
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
+            self._clamp_log_alpha()
             self.alpha = self.log_alpha.exp().item()
 
         # ── TensorBoard ───────────────────────────────────────────────────────
@@ -950,12 +963,13 @@ class SACTrainer:
             if self.writer is not None:
                 mode_tag = "rulebased" if use_rulebased else "selfplay"
                 ep_steps = len(transitions) // (1 if use_rulebased else 2)
-                self.writer.add_scalar(f"Reward/episode_{mode_tag}", ep_reward,               ep)
-                self.writer.add_scalar("Misc/buffer_fill",           len(self.replay_buffer), ep)
-                self.writer.add_scalar("Misc/env_steps",             self.train_step,         ep)
-                self.writer.add_scalar("Misc/episode_length",        ep_steps,                ep)
-                self.writer.add_scalar("Misc/opponent_noise",        opponent_noise,          ep)
-                self.writer.add_scalar("Reward/won",                 float(won),              ep)
+                self.writer.add_scalar(f"Reward/episode_{mode_tag}", ep_reward,                     ep)
+                self.writer.add_scalar(f"Reward/{mode_tag}_normed", ep_reward/_REWARD_NORM, ep)
+                self.writer.add_scalar("Misc/buffer_fill",           len(self.replay_buffer),       ep)
+                self.writer.add_scalar("Misc/env_steps",             self.train_step,               ep)
+                self.writer.add_scalar("Misc/episode_length",        ep_steps,                      ep)
+                self.writer.add_scalar("Misc/opponent_noise",        opponent_noise,                ep)
+                self.writer.add_scalar("Reward/won",                 float(won),                    ep)
 
             if profile:
                 _ep_times.append(time.perf_counter() - _t0)
@@ -994,11 +1008,11 @@ class SACTrainer:
                 with open(render_path, "w") as f:
                     f.write(html)
                 print(f"  Render saved → {render_path}")
-            if won:
+            if won and use_rulebased:
                 win_count_consec+=1
             else:
                 win_count_consec = 0
-            if use_rulebased and win_count_consec>=3:
+            if win_count_consec>=3:
                 win_count_consec = 0
                 opponent_noise-=opp_noise_inc
 
@@ -1087,6 +1101,7 @@ class SACTrainer:
             self.q2_target.load_state_dict(self._strip_orig_mod(ckpt["q2_target"]))
         if self.auto_alpha and "log_alpha" in ckpt:
             self.log_alpha.data.fill_(ckpt["log_alpha"])
+            self._clamp_log_alpha()
             self.alpha = self.log_alpha.exp().item()
             if "alpha_optimizer" in ckpt:
                 self.alpha_optimizer.load_state_dict(ckpt["alpha_optimizer"])
@@ -1161,6 +1176,8 @@ if __name__ == "__main__":
         refresh_freq = config["refresh_freq"],
         max_grad_norm = config.get("max_grad_norm"),
         auto_alpha = config.get("auto_alpha", False),
+        alpha_min = config.get("alpha_min", 0.05),
+        alpha_max = config.get("alpha_max", 1.0),
     )
 
     print(f"TensorBoard: tensorboard --logdir ./runs/latest")
