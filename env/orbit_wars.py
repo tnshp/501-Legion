@@ -588,13 +588,25 @@ class RelativePlanetAdvantage:
 class ShipGrowth:
     """Reward the change in your OWN ship total, ignoring opponents.
 
-        ship_scale × my_ships_Δ
+        ship_scale × my_ships_Δ            (when my_ships_Δ ≥ 0)
+        ship_scale × loss_scale × my_ships_Δ   (when my_ships_Δ < 0)
 
     A pure self-improvement signal (ship half of the old RewardScheme2).
+
+    `loss_scale` makes the signal ASYMMETRIC: with loss_scale > 1 losing ships
+    hurts more than gaining the same number helps, so the agent becomes more
+    loss-averse (protects its fleet). loss_scale = 1.0 (default) is symmetric.
+
+    Parameters
+    ----------
+    ship_scale : float, default 0.01 — per-ship weight on the gain side
+    loss_scale : float, default 1.0  — extra multiplier applied only when the
+                 ship delta is negative (≥ 1 ⇒ losses penalised more than gains)
     """
 
-    def __init__(self, ship_scale: float = 0.01):
+    def __init__(self, ship_scale: float = 0.01, loss_scale: float = 1.0):
         self.ship_scale = ship_scale
+        self.loss_scale = loss_scale
 
     def __call__(self, obs, new_obs, player_id: int, done: bool,
                  n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
@@ -602,21 +614,49 @@ class ShipGrowth:
         planets_new, fleets_new, _, _, _ = _obs_to_arrays(new_obs)
         my_δ = (_owned_ships(planets_new, fleets_new, player_id)
                 - _owned_ships(planets_old, fleets_old, player_id))
-        return float(self.ship_scale * my_δ)
+        scale = self.ship_scale * (self.loss_scale if my_δ < 0 else 1.0)
+        return float(scale * my_δ)
 
 
 class ProductionPlanetDelta:
-    """Reward captured planets and penalise lost ones, weighted by production.
+    """Reward captured planets and penalise lost ones, weighted by production,
+    minus a per-capture ship cost.
 
-        planet_scale × ( Σ production of planets gained this step
-                         − Σ production of planets lost this step )
+        planet_scale × ( Σ prod_gained − loss_scale × Σ prod_lost )
+        − ship_scale × Σ_captured log1p(defender_ships)
 
+    Production term
+    ---------------
     Taking a high-production planet is worth more than a low-production one.
-    (Planet half of the old RewardScheme2.)
+    `loss_scale` makes it ASYMMETRIC: with loss_scale > 1 losing a planet's
+    production hurts more than capturing the same production helps, so the agent
+    becomes more loss-averse about its territory. loss_scale = 1.0 is symmetric.
+
+    Ship-cost term (prioritise CHEAPER planets)
+    -------------------------------------------
+    For each planet captured this step we subtract `ship_scale × log1p(d)` where
+    d is the planet's garrison BEFORE the capture (its defenders). So a heavily
+    defended — i.e. expensive — planet yields less net reward than a lightly
+    defended one of equal production, nudging the agent toward cheaper targets.
+    log1p keeps a 0-ship (free) planet cost-free and compresses large garrisons.
+    ship_scale = 0.0 (default) disables the term.
+
+    (Planet half of the old RewardScheme2; with loss_scale=1, ship_scale=0 it is
+    identical to the original.)
+
+    Parameters
+    ----------
+    planet_scale : float, default 1.0 — weight on the production delta
+    loss_scale   : float, default 1.0 — extra multiplier on LOST production
+                   (≥ 1 ⇒ losses penalised more than equal gains reward)
+    ship_scale   : float, default 0.0 — weight on the per-capture log-ship cost
     """
 
-    def __init__(self, planet_scale: float = 1.0):
+    def __init__(self, planet_scale: float = 1.0, loss_scale: float = 1.0,
+                 ship_scale: float = 0.0):
         self.planet_scale = planet_scale
+        self.loss_scale   = loss_scale
+        self.ship_scale   = ship_scale
 
     def __call__(self, obs, new_obs, player_id: int, done: bool,
                  n_players: int = 2, step: int = 0, max_steps: int = 500) -> float:
@@ -625,9 +665,21 @@ class ProductionPlanetDelta:
 
         old_owned = {int(r[0]): float(r[6]) for r in planets_old if int(r[1]) == player_id}
         new_owned = {int(r[0]): float(r[6]) for r in planets_new if int(r[1]) == player_id}
-        captured = sum(prod for k, prod in new_owned.items() if k not in old_owned)
-        lost     = sum(prod for k, prod in old_owned.items() if k not in new_owned)
-        return float(self.planet_scale * (captured - lost))
+        # Garrison of every planet BEFORE this step (defender count for captures).
+        old_ships = {int(r[0]): float(r[5]) for r in planets_old}
+
+        captured_ids = [k for k in new_owned if k not in old_owned]
+        lost_ids     = [k for k in old_owned if k not in new_owned]
+        captured_prod = sum(new_owned[k] for k in captured_ids)
+        lost_prod     = sum(old_owned[k] for k in lost_ids)
+
+        # Per-capture ship cost: log1p of the planet's pre-capture defenders, so
+        # capturing a well-defended (expensive) planet nets less than a cheap one.
+        ship_cost = sum(math.log1p(max(0.0, old_ships.get(k, 0.0)))
+                        for k in captured_ids)
+
+        return float(self.planet_scale * (captured_prod - self.loss_scale * lost_prod)
+                     - self.ship_scale * ship_cost)
 
 
 class ProximityCaptureBonus:
