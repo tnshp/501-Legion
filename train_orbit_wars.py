@@ -39,7 +39,7 @@ from sac_train      import SACTrainer
 from env.orbit_wars import (
     OrbitWarsEnv,
     # composable reward components
-    RelativeShipAdvantage, RelativePlanetAdvantage,
+    RelativeShipAdvantage, RelativeProductionAdvantage,
     ShipGrowth, ProductionPlanetDelta, ProximityCaptureBonus,
     AbsoluteHoldings, FleetLaunchPenalty, LaunchDistancePenalty, StepPenalty,
     TerminalWinBonus, TimeDecayWinBonus,
@@ -530,13 +530,13 @@ if __name__ == "__main__":
     # selects the class; every *other* key is passed straight to its constructor,
     # so a config only specifies the params that scheme actually declares
     # (e.g. ship_scale, planet_scale, win_bonus). Compose a full reward by listing
-    # several components — e.g. RelativeShipAdvantage + RelativePlanetAdvantage +
+    # several components — e.g. RelativeShipAdvantage + RelativeProductionAdvantage +
     # TimeDecayWinBonus reproduces (and improves on) the old RewardScheme1.
     reward_cfg_list = config.get("reward", [])
     reward_scheme_map = {
         # composable single-responsibility components
-        "RelativeShipAdvantage":   RelativeShipAdvantage,
-        "RelativePlanetAdvantage": RelativePlanetAdvantage,
+        "RelativeShipAdvantage":     RelativeShipAdvantage,
+        "RelativeProductionAdvantage": RelativeProductionAdvantage,
         "ShipGrowth":              ShipGrowth,
         "ProductionPlanetDelta":   ProductionPlanetDelta,
         "ProximityCaptureBonus":   ProximityCaptureBonus,

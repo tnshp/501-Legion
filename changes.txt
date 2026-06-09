@@ -24,3 +24,7 @@
 - added proximity based reward schemes
 - removed comets
 - added metadata token 
+
+#commit - v12
+- assymetric production and ship reward 
+- planet fleet cost 

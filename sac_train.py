@@ -213,6 +213,19 @@ class SACTrainer:
     ):
         self.env           = env
         self.device        = device
+        # Enable TF32 matmul/conv on Ampere+ GPUs: the transformer is matmul-bound
+        # and TF32 runs those ~1.5-2x faster with precision loss that is immaterial
+        # for RL. Harmless no-op on CPU / older GPUs.
+        self._dev_type     = torch.device(device).type
+        if self._dev_type == "cuda":
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        # bf16 autocast for all network forwards (~2x on the transformer here).
+        # bf16 keeps fp32's exponent range (no overflow / no GradScaler needed) and
+        # autocast auto-runs log/exp/softmax/loss in fp32, so the log-prob math
+        # stays precise. Master weights remain fp32 (backward runs outside).
+        self._amp_enabled  = self._dev_type == "cuda"
         self.gamma         = gamma
         self.tau           = tau
         self.batch_size    = batch_size
@@ -254,7 +267,8 @@ class SACTrainer:
             self.target_entropy = target_entropy
             self.log_alpha      = torch.zeros(1, requires_grad=True, device=device)
             self.alpha          = self.log_alpha.exp().item()
-            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=learning_rate)
+            _alpha_kw = {"fused": True} if torch.device(device).type == "cuda" else {}
+            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=learning_rate, **_alpha_kw)
         else:
             self.alpha = alpha
 
@@ -283,9 +297,17 @@ class SACTrainer:
             self._hard_update(self.q2_target, self.q2_net)
 
         # ── optimisers ────────────────────────────────────────────────────────
-        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
-        self.q1_optimizer     = optim.Adam(self.q1_net.parameters(),     lr=learning_rate)
-        self.q2_optimizer     = optim.Adam(self.q2_net.parameters(),     lr=learning_rate)
+        # On CUDA use the *fused* Adam kernel: it updates all parameters in one
+        # on-device launch and, crucially, keeps the step counter on the GPU. The
+        # default single-tensor path calls `_get_value(step).item()` once PER
+        # parameter, forcing ~one CPU↔GPU sync per param per update (~390 syncs /
+        # update here) — a large, pure-overhead cost. fused=True removes it.
+        adam_kw = {}
+        if torch.device(self.device).type == "cuda":
+            adam_kw["fused"] = True
+        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate, **adam_kw)
+        self.q1_optimizer     = optim.Adam(self.q1_net.parameters(),     lr=learning_rate, **adam_kw)
+        self.q2_optimizer     = optim.Adam(self.q2_net.parameters(),     lr=learning_rate, **adam_kw)
 
         # ── replay buffer (pre-allocated, shape-aware) ────────────────────────
         self.replay_buffer = ReplayBuffer(replay_buffer_size, obs_shape, act_shape)
@@ -304,14 +326,22 @@ class SACTrainer:
 
     @staticmethod
     def _grad_norm(net: nn.Module) -> float:
-        return sum(
-            p.grad.data.norm(2).item() ** 2
-            for p in net.parameters() if p.grad is not None
-        ) ** 0.5
+        # Compute the global grad norm with a SINGLE host sync (one .item()) by
+        # stacking per-param norms on-device, instead of .item() per parameter
+        # (which was ~65 CPU↔GPU syncs per call, ×3 nets, on every logged update).
+        grads = [p.grad for p in net.parameters() if p.grad is not None]
+        if not grads:
+            return 0.0
+        return torch.norm(torch.stack([g.norm(2) for g in grads]), 2).item()
 
     def _to(self, t: torch.Tensor) -> torch.Tensor:
         """Move tensor to device with non-blocking transfer (overlaps with GPU compute)."""
         return t.to(self.device, non_blocking=True)
+
+    def _autocast(self):
+        """bf16 mixed-precision context for network forwards (no-op off CUDA)."""
+        return torch.autocast(device_type=self._dev_type, dtype=torch.bfloat16,
+                              enabled=self._amp_enabled)
 
     # =========================================================================
     # Action selection
@@ -321,9 +351,9 @@ class SACTrainer:
         """Single-env action — stochastic during training."""
         state_t = self._to(torch.FloatTensor(state).unsqueeze(0))
         state_t = self.state_preprocessor(state_t)
-        with torch.no_grad():
+        with torch.no_grad(), self._autocast():
             action, _ = self.policy_net.sample(state_t)
-        return self.action_postprocessor(action.cpu().numpy()[0])
+        return self.action_postprocessor(action.float().cpu().numpy()[0])
 
     def select_action_batch(self, states: np.ndarray) -> np.ndarray:
         """
@@ -332,9 +362,9 @@ class SACTrainer:
         """
         states_t = self._to(torch.FloatTensor(states))
         states_t = self.state_preprocessor(states_t)
-        with torch.no_grad():
+        with torch.no_grad(), self._autocast():
             actions, _ = self.policy_net.sample(states_t)
-        actions_np = actions.cpu().numpy()
+        actions_np = actions.float().cpu().numpy()
         # apply postprocessor per-env (handles transformer padding etc.)
         return np.stack([self.action_postprocessor(a) for a in actions_np])
 
@@ -364,13 +394,13 @@ class SACTrainer:
         dones       = self._to(dones)
 
         # ── Q-targets ─────────────────────────────────────────────────────────
-        with torch.no_grad():
+        with torch.no_grad(), self._autocast():
             a_next, lp_next = self.policy_net.sample(next_states)
             q1_next = self.q1_target(next_states, a_next).unsqueeze(-1)
             q2_next = self.q2_target(next_states, a_next).unsqueeze(-1)
-            q_target = rewards + (1.0 - dones) * self.gamma * (
+            q_target = (rewards + (1.0 - dones) * self.gamma * (
                 torch.min(q1_next, q2_next) - self.alpha * lp_next
-            )
+            )).float()
 
         # NaN/Inf guard: if the target is non-finite, skip this batch entirely so
         # one bad sample cannot poison the weights (clip_grad_norm_ would just
@@ -382,8 +412,9 @@ class SACTrainer:
             return None
 
         # ── Q1 update ─────────────────────────────────────────────────────────
-        q1_pred = self.q1_net(states, actions).unsqueeze(-1)
-        q1_loss = nn.MSELoss()(q1_pred, q_target)
+        with self._autocast():
+            q1_pred = self.q1_net(states, actions).unsqueeze(-1)
+            q1_loss = nn.MSELoss()(q1_pred, q_target)
         self.q1_optimizer.zero_grad()
         q1_loss.backward()
         if self.max_grad_norm is not None:
@@ -391,8 +422,9 @@ class SACTrainer:
         self.q1_optimizer.step()
 
         # ── Q2 update ─────────────────────────────────────────────────────────
-        q2_pred = self.q2_net(states, actions).unsqueeze(-1)
-        q2_loss = nn.MSELoss()(q2_pred, q_target)
+        with self._autocast():
+            q2_pred = self.q2_net(states, actions).unsqueeze(-1)
+            q2_loss = nn.MSELoss()(q2_pred, q_target)
         self.q2_optimizer.zero_grad()
         q2_loss.backward()
         if self.max_grad_norm is not None:
@@ -400,10 +432,11 @@ class SACTrainer:
         self.q2_optimizer.step()
 
         # ── Policy update ──────────────────────────────────────────────────────
-        a_tilde, lp = self.policy_net.sample(states)
-        q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
-        q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
-        policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
+        with self._autocast():
+            a_tilde, lp = self.policy_net.sample(states)
+            q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
+            q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
+            policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
         if self.max_grad_norm is not None:
@@ -477,7 +510,7 @@ class SACTrainer:
         chunks under no_grad. Returns a 1-D numpy array (NaN/Inf → 0)."""
         out   = []
         chunk = max(self.batch_size, 256)
-        with torch.no_grad():
+        with torch.no_grad(), self._autocast():
             for i in range(0, len(next_states_np), chunk):
                 ns = torch.from_numpy(next_states_np[i:i + chunk])
                 ns = self.state_preprocessor(self._to(ns))
@@ -485,7 +518,7 @@ class SACTrainer:
                 q1 = self.q1_net(ns, a).unsqueeze(-1)              # [c,1]
                 q2 = self.q2_net(ns, a).unsqueeze(-1)              # [c,1]
                 v  = torch.min(q1, q2) - self.alpha * lp           # [c,1]
-                out.append(v.squeeze(-1).cpu().numpy())
+                out.append(v.squeeze(-1).float().cpu().numpy())
         v_all = np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
         return np.nan_to_num(v_all, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
@@ -580,16 +613,18 @@ class SACTrainer:
             return None
 
         # ── Q updates toward the precomputed λ-return (shared by Q1 & Q2) ─────
-        q1_pred = self.q1_net(states, actions).unsqueeze(-1)
-        q1_loss = nn.MSELoss()(q1_pred, targets)
+        with self._autocast():
+            q1_pred = self.q1_net(states, actions).unsqueeze(-1)
+            q1_loss = nn.MSELoss()(q1_pred, targets)
         self.q1_optimizer.zero_grad()
         q1_loss.backward()
         if self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.q1_net.parameters(), self.max_grad_norm)
         self.q1_optimizer.step()
 
-        q2_pred = self.q2_net(states, actions).unsqueeze(-1)
-        q2_loss = nn.MSELoss()(q2_pred, targets)
+        with self._autocast():
+            q2_pred = self.q2_net(states, actions).unsqueeze(-1)
+            q2_loss = nn.MSELoss()(q2_pred, targets)
         self.q2_optimizer.zero_grad()
         q2_loss.backward()
         if self.max_grad_norm is not None:
@@ -597,10 +632,11 @@ class SACTrainer:
         self.q2_optimizer.step()
 
         # ── Policy update — identical SAC actor objective ─────────────────────
-        a_tilde, lp = self.policy_net.sample(states)
-        q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
-        q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
-        policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
+        with self._autocast():
+            a_tilde, lp = self.policy_net.sample(states)
+            q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
+            q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
+            policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
         if self.max_grad_norm is not None:

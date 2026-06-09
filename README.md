@@ -97,7 +97,7 @@ terminal step, and `step`/`max_steps` are the current tick and the episode limit
 | Component | Formula (per step) | What it rewards |
 |---|---|---|
 | `RelativeShipAdvantage` | `ship_scale × [ Δmy_ships − Σ Δopp_ships ]` | Gaining ships faster than opponents. Ships in flight are counted, so launching a fleet is neutral until it fights. |
-| `RelativePlanetAdvantage` | `planet_scale × [ Δmy_planet_cnt − Σ Δopp_planet_cnt ]` | Taking more planets than opponents (each planet counts equally). |
+| `RelativeProductionAdvantage` | `planet_scale × [ Δmy_production − Σ Δopp_production ]` | Growing your owned **production** faster than opponents (sums each planet's output, so high-output planets count for more). |
 | `ShipGrowth` | `ship_scale × Δmy_ships` (×`loss_scale` when Δ<0) | Growing your own fleet, opponents ignored. `loss_scale>1` makes losing ships hurt more than gaining (loss-averse). |
 | `ProductionPlanetDelta` | `planet_scale × (Σ prod gained − loss_scale × Σ prod lost) − ship_scale × Σ_captured log1p(defender_ships)` | Capturing planets by production, with two extras: `loss_scale>1` penalises lost production more than equal gains; the `ship_scale` term subtracts a per-capture cost based on the target's pre-capture garrison, so **cheaper (lightly defended) planets** are preferred. Both default off (`loss_scale=1`, `ship_scale=0`). |
 | `ProximityCaptureBonus` | `Σ_captured scale × Σ_{owned} exp(−d / ref_dist)` | Capturing planets **well-connected** to your territory. For each capture it **sums** closeness to *every* owned planet, so a planet taken **between two** (or among several) owned planets stacks the bonus and scores high, while an isolated capture scores ≈0. Capture-event only (nothing on other steps); first capture with no territory = 0. Pair with `ProductionPlanetDelta` for value-weighting. |
@@ -134,7 +134,7 @@ keep working. Prefer composing the named components in new configs.
 
 | Legacy | Equivalent composition |
 |---|---|
-| `RewardScheme1(ship_scale, planet_scale, win_bonus)` | `RelativeShipAdvantage(ship_scale)` + `RelativePlanetAdvantage(planet_scale)` + `TerminalWinBonus(win_bonus)` |
+| `RewardScheme1(ship_scale, planet_scale, win_bonus)` | `RelativeShipAdvantage(ship_scale)` + `RelativeProductionAdvantage(planet_scale)` + `TerminalWinBonus(win_bonus)` |
 | `RewardScheme2(ship_scale, planet_scale, win_bonus)` | `ShipGrowth(ship_scale)` + `ProductionPlanetDelta(planet_scale)` + `TerminalWinBonus(win_bonus)` |
 | `RewardScheme3(ship_scale)` | `FleetLaunchPenalty(ship_scale)` |
 | `RewardScheme4(ship_scale, planet_scale, win_bonus)` | `AbsoluteHoldings(ship_scale, planet_scale)` + `TerminalWinBonus(win_bonus)` |

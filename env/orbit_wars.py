@@ -561,13 +561,20 @@ class RelativeShipAdvantage:
         return float(self.ship_scale * (my_δ - opp_δ))
 
 
-class RelativePlanetAdvantage:
-    """Reward the change in planet-count advantage *relative to the opponents*.
+class RelativeProductionAdvantage:
+    """Reward the change in total-PRODUCTION advantage *relative to the opponents*.
 
-        planet_scale × [ (my_planet_cnt_Δ) − Σ_opp(opp_planet_cnt_Δ) ]
+        planet_scale × [ (my_production_Δ) − Σ_opp(opp_production_Δ) ]
 
-    Each planet counts equally (use ProductionPlanetDelta to weight by output).
-    (Planet half of the old RewardScheme1.)
+    Sums the production of every owned planet (not just the count), so gaining a
+    high-output planet — or denying one to an opponent — is worth proportionally
+    more than taking a low-output planet. Positive when your owned-production grows
+    faster than your opponents'. (Was RelativePlanetAdvantage, which counted
+    planets equally; this weights by output.)
+
+    Parameters
+    ----------
+    planet_scale : float, default 1.0 — per-unit-production weight
     """
 
     def __init__(self, planet_scale: float = 1.0):
@@ -579,8 +586,8 @@ class RelativePlanetAdvantage:
         planets_new, _, _, _, _ = _obs_to_arrays(new_obs)
         opponent_ids = [p for p in range(n_players) if p != player_id]
 
-        my_δ  = _planet_count(planets_new, player_id) - _planet_count(planets_old, player_id)
-        opp_δ = sum(_planet_count(planets_new, o) - _planet_count(planets_old, o)
+        my_δ  = _owned_production(planets_new, player_id) - _owned_production(planets_old, player_id)
+        opp_δ = sum(_owned_production(planets_new, o) - _owned_production(planets_old, o)
                     for o in opponent_ids)
         return float(self.planet_scale * (my_δ - opp_δ))
 
@@ -987,7 +994,12 @@ class TimeDecayWinBonus:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RewardScheme1:
-    """Legacy: RelativeShipAdvantage + RelativePlanetAdvantage + TerminalWinBonus."""
+    """Legacy: RelativeShipAdvantage + RelativeProductionAdvantage + TerminalWinBonus.
+
+    Note: the planet term now measures relative *production* advantage (the old
+    RelativePlanetAdvantage was renamed to RelativeProductionAdvantage). With
+    uniform planet production this matches the original count-based behaviour.
+    """
 
     def __init__(self, ship_scale: float = 0.01, planet_scale: float = 1.0,
                  win_bonus: float = 100.0):
@@ -995,7 +1007,7 @@ class RewardScheme1:
         self.planet_scale = planet_scale
         self.win_bonus    = win_bonus
         self._parts = (RelativeShipAdvantage(ship_scale),
-                       RelativePlanetAdvantage(planet_scale),
+                       RelativeProductionAdvantage(planet_scale),
                        TerminalWinBonus(win_bonus))
 
     def __call__(self, obs, new_obs, player_id: int, done: bool,
@@ -1252,13 +1264,23 @@ class OrbitWarsEnv(gym.Env):
         # other players fight on, but once our agent owns no planets AND no fleets
         # it is out of the game and can take no meaningful action. Treat that as a
         # terminal (lost) state so the episode ends for us instead of idling.
-        planets_new, fleets_new, _, _, _ = _obs_to_arrays(raw_obs)
+        planets_new, fleets_new, omega_new, _, _ = _obs_to_arrays(raw_obs)
         n_my_planets = int((planets_new[:, 1] == self.player_id).sum())
         n_my_fleets  = (int((fleets_new[:, 1] == self.player_id).sum())
                         if fleets_new.shape[0] > 0 else 0)
         eliminated   = (n_my_planets == 0) and (n_my_fleets == 0)
         # Total fleets in play (all players) — the quantity truncated to MAX_FLEETS.
         self.last_n_fleets = int(fleets_new.shape[0])
+
+        # Share the already-parsed (comet-stripped) post-step arrays with all the
+        # reward schemes instead of letting each one re-parse the raw kaggle obs.
+        # _obs_to_arrays on this dict hits the ndarray fast path, so N schemes cost
+        # one parse, not N.
+        obs_post = {
+            "planets":          planets_new,
+            "fleets":           fleets_new,
+            "angular_velocity": float(omega_new),
+        }
 
         truncated  = self._time_step >= self.max_steps
         terminated = (bool(done) or eliminated) and not truncated
@@ -1270,7 +1292,7 @@ class OrbitWarsEnv(gym.Env):
         reward = 0
         for r in self.reward_scheme:
             reward += r(
-                obs_pre, raw_obs, self.player_id,
+                obs_pre, obs_post, self.player_id,
                 done=terminated or truncated,
                 n_players=self.n_players,
                 step=self._time_step,
