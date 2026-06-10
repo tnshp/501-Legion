@@ -1,6 +1,40 @@
 # 501-Legion
 
 
+## Benchmarking the training loop
+
+`benchmark_train_loop.py` profiles the per-step cost of the SAC inner loop from a
+real train config and locates the bottleneck (CPU env / host→device transfer /
+GPU compute). It reports steps/sec, **transitions/sec**, a per-phase breakdown
+tagged CPU vs GPU, GPU utilization (sampled from `nvidia-smi`), and a
+transfer-vs-compute split of `update()`.
+
+```bash
+python benchmark_train_loop.py --config train.json                       # single env
+python benchmark_train_loop.py --config train.json --num-envs 8 --vec-mode async
+python benchmark_train_loop.py --config train.json --num-envs 4 --vec-mode sync
+```
+
+**Parallel (vectorized) environments.** With `--num-envs N > 1` the loop collects
+`N` environments per step via a gymnasium vector env, mirroring `SACTrainer`'s own
+VecEnv path (`select_action_batch` + `add_batch`). The update-to-data ratio is
+held identical to the single-env run (1 update per `update_freq` transitions), so
+the printed **speedup** is an apples-to-apples transitions/sec comparison.
+
+- `--vec-mode async` (default): one **worker process per env** (fork start
+  method) → the pure-Python game sim runs in true parallel across CPU cores. Use
+  this on a fast GPU where the env is the bottleneck.
+- `--vec-mode sync`: envs stepped sequentially in-process; the only win is
+  batching the GPU calls (one forward for `N` envs).
+
+On a small, update-compute-bound GPU (e.g. RTX 3050 Ti) the speedup is modest
+(~1.2×) because `update()` dominates and is UTD-matched; on a fast GPU (e.g. A30)
+`update()` shrinks, the parallel-env collection and batched action-selection
+dominate the savings, and async vectorization gives a much larger speedup. The
+`OrbitWarsEnv.step` return (`won` instead of a gym `info` dict) is bridged by a
+thin `OrbitGymAdapter` so the env plugs into gymnasium's `Sync/AsyncVectorEnv`.
+
+
 ## JSON train args
 
 mixed_random_ratio_decay = None -> spawn all training episodes
