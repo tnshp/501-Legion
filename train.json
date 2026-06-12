@@ -40,6 +40,7 @@
   },
   "jax_env": {
     "num_envs":     256,
+    "jax_buffer": true,
     "num_players":  2,
     "episode_steps": 500,
     "reward_type":  "ship_advantage",

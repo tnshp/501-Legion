@@ -585,6 +585,7 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     win_bonus     = jax_cfg.get("win_bonus",     100.0)
     tanh_scale    = env_cfg.get("tanh_scale",    0.2)
     min_fleet_ships = env_cfg.get("min_fleet_ships", 3)
+    use_jax_buffer  = jax_cfg.get("jax_buffer",  False)
 
     opponent = env_cfg.get("opponent", "random")
     ratio_4p = env_cfg.get("ratio_4p", 0.0)
@@ -673,6 +674,7 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         block_size        = block_size,
         refresh_freq      = refresh_freq,
         log_dir           = log_dir,
+        use_jax_buffer    = use_jax_buffer,
     )
 
     resume = exec_cfg.get("resume")
