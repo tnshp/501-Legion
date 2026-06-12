@@ -286,12 +286,12 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
     # ── networks — action_dim=4 to match OrbitWarsEnv.ACTION_DIM ─────────────
     d_model = model_cfg.get("d_model", 128)
     net_kw = dict(
-        state_dim   = OrbitWarsEnv.STATE_DIM,    # 14
-        action_dim  = OrbitWarsEnv.ACTION_DIM,   # 4
-        max_planets = OrbitWarsEnv.MAX_PLANETS,  # 40
-        max_fleets  = OrbitWarsEnv.MAX_FLEETS,   # 100
-        d_model     = d_model,
-        # Additional transformer parameters can be added here if needed
+        state_dim       = OrbitWarsEnv.STATE_DIM,    # 14
+        action_dim      = OrbitWarsEnv.ACTION_DIM,   # 4
+        max_planets     = OrbitWarsEnv.MAX_PLANETS,  # 40
+        max_fleets      = OrbitWarsEnv.MAX_FLEETS,   # 100
+        d_model         = d_model,
+        dim_feedforward = model_cfg.get("ff_dim", 512),
     )
     policy_net = P_network(**net_kw)
     q1_net     = Q_network(**net_kw)
@@ -627,11 +627,12 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     # ── Networks ──────────────────────────────────────────────────────────────
     d_model = model_cfg.get("d_model", 128)
     net_kw  = dict(
-        state_dim   = OrbitWarsEnv.STATE_DIM,
-        action_dim  = OrbitWarsEnv.ACTION_DIM,
-        max_planets = MAX_PLANETS,
-        max_fleets  = MAX_FLEETS,
-        d_model     = d_model,
+        state_dim       = OrbitWarsEnv.STATE_DIM,
+        action_dim      = OrbitWarsEnv.ACTION_DIM,
+        max_planets     = MAX_PLANETS,
+        max_fleets      = MAX_FLEETS,
+        d_model         = d_model,
+        dim_feedforward = model_cfg.get("ff_dim", 512),
     )
     policy_net = P_network(**net_kw)
     q1_net     = Q_network(**net_kw)

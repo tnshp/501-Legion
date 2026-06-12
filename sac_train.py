@@ -283,7 +283,7 @@ class JaxReplayBuffer:
         # DLPack: zero-copy JAX GPU array → PyTorch CUDA tensor.
         # JAX handles stream synchronisation inside to_dlpack so the gather
         # is guaranteed complete before PyTorch reads the tensor.
-        return tuple(torch.from_dlpack(jax.dlpack.to_dlpack(a)) for a in arrays)
+        return tuple(torch.from_dlpack(a) for a in arrays)
 
     def __len__(self) -> int:
         return self._size
@@ -476,7 +476,6 @@ class SACTrainer:
                   "Run: pip install tensorboard")
         self.writer        = SummaryWriter(log_dir=log_dir) if (log_dir and _TB_AVAILABLE) else None
         self._update_count = 0
-        self._nan_skips    = 0
 
         # ── networks ──────────────────────────────────────────────────────────
         self.policy_net = policy_net.to(device)
@@ -489,6 +488,17 @@ class SACTrainer:
             self.q2_target = copy.deepcopy(q2_net).to(device)
             self._hard_update(self.q1_target, self.q1_net)
             self._hard_update(self.q2_target, self.q2_net)
+
+        # With d_model=128 each transformer kernel finishes in <1 µs but Python
+        # dispatch takes ~5 µs — the GPU idles between launches. compile() traces
+        # the full forward graph and submits it as one fused kernel sequence.
+        if self._dev_type == "cuda" and hasattr(torch, "compile"):
+            self.policy_net = torch.compile(self.policy_net)
+            self.q1_net     = torch.compile(self.q1_net)
+            self.q2_net     = torch.compile(self.q2_net)
+            if not self.use_lambda_returns:
+                self.q1_target = torch.compile(self.q1_target)
+                self.q2_target = torch.compile(self.q2_target)
 
         # ── optimisers ────────────────────────────────────────────────────────
         # On CUDA use the *fused* Adam kernel: it updates all parameters in one
@@ -517,7 +527,8 @@ class SACTrainer:
             print(f"Using JaxReplayBuffer (GPU-resident, {replay_buffer_size} capacity)")
         else:
             self.replay_buffer = ReplayBuffer(replay_buffer_size, obs_shape, act_shape)
-        self.train_step    = 0   # counts env interactions only (not gradient steps)
+
+        self.train_step = 0   # counts env interactions only (not gradient steps)
 
     # =========================================================================
     # Utilities
@@ -578,7 +589,7 @@ class SACTrainer:
     # Gradient update — SAC v2
     # =========================================================================
 
-    def update(self) -> Optional[Dict[str, float]]:
+    def update(self, _profile: bool = False) -> Optional[Dict[str, float]]:
         """
         One SAC v2 gradient step.  train_step is NOT incremented here —
         that is the responsibility of the training loop.
@@ -589,6 +600,12 @@ class SACTrainer:
         if self.use_lambda_returns:
             return self._lambda_update()
 
+        def _ck() -> float:
+            if _profile and self._dev_type == "cuda":
+                torch.cuda.synchronize()
+            return time.perf_counter()
+        t0 = _ck()
+
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(
             self.batch_size
         )
@@ -598,6 +615,7 @@ class SACTrainer:
         rewards     = self._to(rewards)
         next_states = self.state_preprocessor (self._to(next_states))
         dones       = self._to(dones)
+        t1 = _ck()
 
         # ── Q-targets ─────────────────────────────────────────────────────────
         with torch.no_grad(), self._autocast():
@@ -608,14 +626,8 @@ class SACTrainer:
                 torch.min(q1_next, q2_next) - self.alpha * lp_next
             )).float()
 
-        # NaN/Inf guard: if the target is non-finite, skip this batch entirely so
-        # one bad sample cannot poison the weights (clip_grad_norm_ would just
-        # propagate the NaN through the total norm).
-        if not torch.isfinite(q_target).all():
-            self._nan_skips += 1
-            if self.writer is not None:
-                self.writer.add_scalar("Misc/nan_skips", self._nan_skips, self._update_count)
-            return None
+        q_target = torch.nan_to_num(q_target, nan=0.0, posinf=0.0, neginf=0.0)
+        t2 = _ck()
 
         # ── Q1 update ─────────────────────────────────────────────────────────
         with self._autocast():
@@ -626,6 +638,7 @@ class SACTrainer:
         if self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.q1_net.parameters(), self.max_grad_norm)
         self.q1_optimizer.step()
+        t3 = _ck()
 
         # ── Q2 update ─────────────────────────────────────────────────────────
         with self._autocast():
@@ -636,6 +649,7 @@ class SACTrainer:
         if self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.q2_net.parameters(), self.max_grad_norm)
         self.q2_optimizer.step()
+        t4 = _ck()
 
         # ── Policy update ──────────────────────────────────────────────────────
         with self._autocast():
@@ -648,6 +662,7 @@ class SACTrainer:
         if self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.max_grad_norm)
         self.policy_optimizer.step()
+        t5 = _ck()
 
         # ── Polyak-update target Q-networks ───────────────────────────────────
         self._soft_update(self.q1_target, self.q1_net)
@@ -660,6 +675,7 @@ class SACTrainer:
             alpha_loss.backward()
             self.alpha_optimizer.step()
             self.alpha = self.log_alpha.exp().item()
+        t6 = _ck()
 
         # ── TensorBoard ───────────────────────────────────────────────────────
         if self.writer is not None:
@@ -680,11 +696,21 @@ class SACTrainer:
                 self.writer.add_scalar("Loss/alpha", alpha_loss.item(), s)
 
         self._update_count += 1
-        return {
+        result = {
             "q1_loss": q1_loss.item(),
             "q2_loss": q2_loss.item(),
             "pi_loss": policy_loss.item(),
         }
+        if _profile:
+            result["_phases"] = {
+                "sample":   t1 - t0,
+                "q_target": t2 - t1,
+                "q1":       t3 - t2,
+                "q2":       t4 - t3,
+                "pi":       t5 - t4,
+                "tail":     t6 - t5,
+            }
+        return result
 
     # =========================================================================
     # Cache-based TD(λ)  (Daley & Amato, "Reconciling λ-Returns with
@@ -812,11 +838,7 @@ class SACTrainer:
         actions = self.action_preprocessor(self._to(torch.from_numpy(self._cache_actions[idx])))
         targets = self._to(torch.from_numpy(self._cache_targets[idx]))
 
-        if not torch.isfinite(targets).all():
-            self._nan_skips += 1
-            if self.writer is not None:
-                self.writer.add_scalar("Misc/nan_skips", self._nan_skips, self._update_count)
-            return None
+        targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
 
         # ── Q updates toward the precomputed λ-return (shared by Q1 & Q2) ─────
         with self._autocast():

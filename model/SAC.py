@@ -230,10 +230,10 @@ class Q_network(nn.Module):
                  action_dim=4,   # matches OrbitWarsEnv.ACTION_DIM
                  max_planets=40,
                  max_fleets=100, 
-                 d_model=128, 
-                 nhead=4, 
-                 num_layers=3,  
-                 dim_feedforward=2048, 
+                 d_model=128,
+                 nhead=4,
+                 num_layers=3,
+                 dim_feedforward=512,
                  dropout=0.1):
         
         super(Q_network, self).__init__()

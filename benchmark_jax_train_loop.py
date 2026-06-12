@@ -161,11 +161,12 @@ def _build_trainer(config: dict, env: JaxVecEnvAdapter, device: str,
     m   = config.get("model",     {})
     tdl = config.get("td_lambda", {})
     net_kw = dict(
-        state_dim   = OrbitWarsEnv.STATE_DIM,
-        action_dim  = OrbitWarsEnv.ACTION_DIM,
-        max_planets = 40,
-        max_fleets  = 200,
-        d_model     = m.get("d_model", 128),
+        state_dim       = OrbitWarsEnv.STATE_DIM,
+        action_dim      = OrbitWarsEnv.ACTION_DIM,
+        max_planets     = 40,
+        max_fleets      = 200,
+        d_model         = m.get("d_model", 128),
+        dim_feedforward = m.get("ff_dim", 512),
     )
     return SACTrainer(
         env                = env,
@@ -219,8 +220,10 @@ def _run(
     Without it the scatter would bleed into the 'update' phase wall time,
     making 'add' look free and 'update' look artificially slow.
     """
-    is_cuda  = (device == "cuda")
-    phases   = {k: 0.0 for k in ("select", "envstep", "add", "update")}
+    is_cuda     = (device == "cuda")
+    phases      = {k: 0.0 for k in ("select", "envstep", "add", "update")}
+    _upd_phases = {k: 0.0 for k in ("sample", "q_target", "q1", "q2", "pi", "tail")}
+    _n_upd_calls = 0
     n_upds   = 0
     upd_debt = 0.0
 
@@ -263,7 +266,11 @@ def _run(
             upd_debt += num_envs / update_freq
             while upd_debt >= 1.0:
                 for _ in range(grad_steps):
-                    trainer.update()
+                    _ures = trainer.update(_profile=is_cuda)
+                    if _ures and "_phases" in _ures:
+                        for _k, _v in _ures["_phases"].items():
+                            _upd_phases[_k] += _v
+                    _n_upd_calls += 1
                 n_upds   += 1
                 upd_debt -= 1.0
             if is_cuda:
@@ -279,7 +286,9 @@ def _run(
     n_tr   = n_vsteps * num_envs
 
     if label:
-        _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device, jax_buffer)
+        _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device, jax_buffer,
+                      upd_phases=_upd_phases if is_cuda and _n_upd_calls > 0 else None,
+                      n_upd_calls=_n_upd_calls)
 
     # With JaxReplayBuffer, 'add' is GPU work (JAX scatter); attribute it to
     # the GPU side so the bottleneck verdict is accurate.
@@ -291,11 +300,13 @@ def _run(
         gpu_ms = (phases["select"]  + phases["update"]) / n_vsteps * 1000
 
     return {"tps": n_tr / wall, "cpu_ms": cpu_ms, "gpu_ms": gpu_ms,
-            "wall": wall, "n_updates": n_upds}
+            "wall": wall, "n_updates": n_upds, "upd_phases": _upd_phases,
+            "n_upd_calls": _n_upd_calls}
 
 
 def _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device,
-                  jax_buffer: bool = False):
+                  jax_buffer: bool = False,
+                  upd_phases: dict | None = None, n_upd_calls: int = 0):
     tps = n_tr / wall
     print(f"\n=== {label} ===")
     print(f"  {n_vsteps} vsteps × {n_tr//n_vsteps} envs = {n_tr} transitions"
@@ -335,6 +346,25 @@ def _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device,
     else:
         print("    → network inference / SAC updates dominate. "
               "Increase batch_size or use a bigger model to improve GPU utilisation.")
+
+    if upd_phases is not None and n_upd_calls > 0:
+        total = sum(upd_phases.values())
+        print(f"\n  update sub-phases  ({n_upd_calls} gradient calls; "
+              f"sync between phases adds ~5 µs overhead each):")
+        labels = {
+            "sample":   "sample+H2D",
+            "q_target": "q_target (no_grad)",
+            "q1":       "q1 fwd+bwd+optim",
+            "q2":       "q2 fwd+bwd+optim",
+            "pi":       "pi  fwd+bwd+optim",
+            "tail":     "polyak + alpha",
+        }
+        for k, v in upd_phases.items():
+            ms = v / n_upd_calls * 1000
+            pct = v / max(total, 1e-9) * 100
+            print(f"    {labels.get(k, k):22s}: {ms:7.3f} ms/call  ({pct:5.1f}%)")
+        print(f"    {'── total':22s}: {total/n_upd_calls*1000:.3f} ms/call  "
+              f"[actual update={phases['update']/n_vsteps*1000:.3f} ms/vstep]")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
