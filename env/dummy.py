@@ -1,7 +1,7 @@
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-from stable_baselines3.common.env_checker import check_env
+# from stable_baselines3.common.env_checker import check_env
 
 
 class MatrixEnv(gym.Env):
@@ -93,10 +93,10 @@ if __name__ == "__main__":
     # Initialize env with custom matrix sizes (e.g., 5 x 2)
     env = MatrixEnv(state_dim=14, action_dim=8, max_state=144, max_action=44)
 
-    print("Checking environment compatibility with SB3...")
-    # check_env will raise an error or warning if something is wrong
-    check_env(env, warn=True)
-    print("Environment is 100% compatible with Stable-Baselines3!")
+    # print("Checking environment compatibility with SB3...")
+    # # check_env will raise an error or warning if something is wrong
+    # check_env(env, warn=True)
+    # print("Environment is 100% compatible with Stable-Baselines3!")
 
     # Quick test run
     obs, info = env.reset()

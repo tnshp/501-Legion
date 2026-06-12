@@ -1,24 +1,43 @@
 """
 SAC training for Kaggle Orbit Wars.
 
-Alternates between 2-player and 4-player episodes at a configurable ratio.
-Opponents can be rule-based, random, or "mixed" — a per-step blend of the two
-controlled by `mixed_random_ratio` (1.0 = fully random, 0.0 = fully rule-based).
+Two environment backends are available, selected via ``environment.backend``
+in the JSON config:
 
-Mixed-ratio curriculum
-----------------------
-When opponent is "mixed", the random_ratio can be linearly annealed over training
-via `curriculum.mixed_random_ratio_start/_end/_decay`. Typically start high
-(more random → easier opponent) and decay to a lower value (more rule-based →
-harder). Set `_decay` to null to decay over the full `num_episodes`.
+  "python" (default)
+    Single Kaggle-Python environment.  Supports rule-based / random / mixed
+    opponents, composable reward shaping, HTML replays, and 2p/4p ratio.
+    Run one episode at a time.
+
+  "jax"
+    N parallel JAX environments (VectorizedEnv).  All simulation runs on
+    CPU/GPU via XLA.  Opponents receive random actions.  Reward is a per-step
+    ship-advantage delta + win/loss bonus (configure via ``jax_env`` section).
+    No HTML replays; runs a step-based loop instead of an episode loop.
+
+    Key config section:
+        "jax_env": {
+            "num_envs":       256,
+            "num_players":    2,
+            "episode_steps":  500,
+            "ship_speed":     6.0,
+            "comet_speed":    4.0,
+            "reward_type":    "ship_advantage",   // "native" = terminal ±1 only
+            "reward_scale":   0.01,
+            "win_bonus":      100.0
+        }
+
+Mixed-ratio curriculum (python backend only)
+---------------------------------------------
+When opponent is "mixed", the random_ratio can be linearly annealed over
+training via ``curriculum.mixed_random_ratio_start/_end/_decay``.
 
 Usage
 -----
     python train_orbit_wars.py                          # uses train.json
     python train_orbit_wars.py --config my_config.json  # custom config
 
-All hyperparameters live in the JSON config file (model, training, environment,
-curriculum, reward, io, execution sections).
+All hyperparameters live in the JSON config file.
 """
 
 from __future__ import annotations
@@ -27,12 +46,16 @@ import argparse
 import json
 import math
 import os
+import pickle
 import random
+import subprocess
+import sys
 import time
 from collections import deque
 
 import numpy as np
 import torch
+import jax
 
 from model.SAC      import P_network, Q_network
 from sac_train      import SACTrainer
@@ -52,6 +75,12 @@ try:
     import kaggle_environments.envs.orbit_wars.orbit_wars as _ow
 except ImportError:
     _ow = None
+
+try:
+    from jax_env import JaxVecEnvAdapter
+    _JAX_AVAILABLE = True
+except ImportError:
+    _JAX_AVAILABLE = False
 
 
 def _linear_schedule(episode: int, start: float, end: float, decay_episodes: int) -> float:
@@ -486,6 +515,400 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# JAX vectorised training loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> list[float]:
+    """Train SAC using the parallel JAX environment backend.
+
+    Runs until ``num_episodes`` episodes have completed across all envs.
+    Each vector-step adds ``num_envs`` transitions to the replay buffer.
+
+    4-player support: ``ratio_4p`` fraction of envs run 4-player games; the
+    remainder run 2-player games.  Both sets share the same replay buffer and
+    policy network.
+
+    Opponent modes (``environment.opponent`` in config):
+      "random"     — uniform random actions for all opponent slots
+      "rule_based" — vectorised greedy (score-based target + direct aim)
+      "self_play"  — same policy network for all players
+
+    Parameters
+    ----------
+    config       : full JSON config dict
+    reward_scheme: unused (JAX backend uses its own reward; kept for API parity)
+    MAX_PLANETS, MAX_FLEETS : network shape constants
+    """
+    if not _JAX_AVAILABLE:
+        raise RuntimeError(
+            "JAX backend requested but jax / jax_env could not be imported. "
+            "Install JAX: https://github.com/google/jax#installation"
+        )
+
+    train_cfg  = config.get("training",    {})
+    env_cfg    = config.get("environment", {})
+    io_cfg     = config.get("io",          {})
+    exec_cfg   = config.get("execution",   {})
+    model_cfg  = config.get("model",       {})
+    jax_cfg    = config.get("jax_env",     {})
+    tdl_cfg    = config.get("td_lambda",   {})
+
+    cpu_force = exec_cfg.get("cpu_force", False)
+    device    = "cuda" if torch.cuda.is_available() and not cpu_force else "cpu"
+    print(f"Device: {device}")
+
+    ckpt_dir   = io_cfg.get("ckpt_dir",   "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    buffer_path = os.path.join(ckpt_dir, "replay_buffer.npz")
+
+    num_episodes   = train_cfg.get("num_episodes",   250)
+    max_steps      = train_cfg.get("max_steps",      500)
+    warmup_steps   = train_cfg.get("warmup_steps",   500)
+    update_freq    = train_cfg.get("update_freq",    4)
+    gradient_steps = train_cfg.get("gradient_steps", 1)
+    batch_size     = train_cfg.get("batch_size",     64)
+
+    log_interval    = io_cfg.get("log_interval",    1)
+    save_interval   = io_cfg.get("save_interval",   100)
+    render_interval = io_cfg.get("render_interval", 0)   # 0 = disabled
+    render_dir      = io_cfg.get("render_dir",      "replays")
+    log_dir         = io_cfg.get("log_dir")
+
+    # ── JAX env config ────────────────────────────────────────────────────────
+    num_envs      = jax_cfg.get("num_envs",      256)
+    episode_steps = jax_cfg.get("episode_steps", max_steps)
+    ship_speed    = jax_cfg.get("ship_speed",    6.0)
+    comet_speed   = jax_cfg.get("comet_speed",   4.0)
+    reward_type   = jax_cfg.get("reward_type",   "ship_advantage")
+    reward_scale  = jax_cfg.get("reward_scale",  0.01)
+    win_bonus     = jax_cfg.get("win_bonus",     100.0)
+    tanh_scale    = env_cfg.get("tanh_scale",    0.2)
+    min_fleet_ships = env_cfg.get("min_fleet_ships", 3)
+
+    opponent = env_cfg.get("opponent", "random")
+    ratio_4p = env_cfg.get("ratio_4p", 0.0)
+
+    # ── Split envs between 2p and 4p ─────────────────────────────────────────
+    num_envs_4p = int(num_envs * ratio_4p) if ratio_4p > 0 else 0
+    num_envs_2p = num_envs - num_envs_4p
+
+    # reward_cfg mirrors the Python backend's "reward" list for apples-to-apples
+    # comparisons. reward_type/scale/win_bonus are passed as fallback for callers
+    # that construct the adapter directly without a config.
+    _reward_cfg = config.get("reward") or []
+    _env_kw = dict(
+        episode_steps=episode_steps,
+        ship_speed=ship_speed,
+        comet_speed=comet_speed,
+        tanh_scale=tanh_scale,
+        min_fleet_ships=min_fleet_ships,
+        reward_type=reward_type,
+        reward_scale=reward_scale,
+        win_bonus=win_bonus,
+        reward_cfg=_reward_cfg,
+        opponent=opponent,
+    )
+    env_2p = JaxVecEnvAdapter(num_envs=num_envs_2p, num_players=2, **_env_kw)
+    env_4p = (JaxVecEnvAdapter(num_envs=num_envs_4p, num_players=4, **_env_kw)
+              if num_envs_4p > 0 else None)
+
+    tag = (f"{num_envs_2p}×2p"
+           + (f" + {num_envs_4p}×4p" if env_4p else ""))
+    _reward_names = [c.get("scheme") for c in _reward_cfg] if _reward_cfg else [reward_type]
+    print(
+        f"JAX backend: {tag} | opponent={opponent} | reward={_reward_names}"
+    )
+
+    # ── Networks ──────────────────────────────────────────────────────────────
+    d_model = model_cfg.get("d_model", 128)
+    net_kw  = dict(
+        state_dim   = OrbitWarsEnv.STATE_DIM,
+        action_dim  = OrbitWarsEnv.ACTION_DIM,
+        max_planets = MAX_PLANETS,
+        max_fleets  = MAX_FLEETS,
+        d_model     = d_model,
+    )
+    policy_net = P_network(**net_kw)
+    q1_net     = Q_network(**net_kw)
+    q2_net     = Q_network(**net_kw)
+
+    # ── SACTrainer ────────────────────────────────────────────────────────────
+    lr          = train_cfg.get("lr",           3e-4)
+    gamma       = train_cfg.get("gamma",        0.99)
+    tau         = train_cfg.get("tau",          5e-3)
+    alpha       = train_cfg.get("alpha",        0.2)
+    auto_alpha  = train_cfg.get("auto_alpha",   False)
+    target_ent  = train_cfg.get("target_entropy")
+    buffer_size = train_cfg.get("buffer_size",  100_000)
+    max_grad_norm = train_cfg.get("grad_clip",  1.0)
+
+    use_lambda    = tdl_cfg.get("enabled",      False)
+    lambda_return = tdl_cfg.get("lambda",       0.9)
+    cache_size    = tdl_cfg.get("cache_size",   8000)
+    block_size    = tdl_cfg.get("block_size",   50)
+    refresh_freq  = tdl_cfg.get("refresh_freq", 1000)
+
+    trainer = SACTrainer(
+        env               = env_2p,   # reference env for obs/act shape
+        policy_net        = policy_net,
+        q1_net            = q1_net,
+        q2_net            = q2_net,
+        device            = device,
+        learning_rate     = lr,
+        gamma             = gamma,
+        tau               = tau,
+        alpha             = alpha,
+        auto_alpha        = auto_alpha,
+        target_entropy    = target_ent,
+        replay_buffer_size= buffer_size,
+        batch_size        = batch_size,
+        max_grad_norm     = max_grad_norm,
+        use_lambda_returns= use_lambda,
+        lambda_return     = lambda_return,
+        cache_size        = cache_size,
+        block_size        = block_size,
+        refresh_freq      = refresh_freq,
+        log_dir           = log_dir,
+    )
+
+    resume = exec_cfg.get("resume")
+    if resume:
+        trainer.load_checkpoint(resume)
+        trainer.load_replay_buffer(buffer_path)
+
+    # Wire self-play policy after trainer is built so opponents use live weights
+    if opponent == "self_play":
+        env_2p.set_policy(trainer.select_action_batch)
+        if env_4p is not None:
+            env_4p.set_policy(trainer.select_action_batch)
+
+    # ── Reset envs ────────────────────────────────────────────────────────────
+    obs_2p, _ = env_2p.reset()
+    if env_4p is not None:
+        obs_4p, _ = env_4p.reset()
+        obs_batch = np.concatenate([obs_2p, obs_4p], axis=0)
+    else:
+        obs_batch = obs_2p
+
+    # ── Training state ────────────────────────────────────────────────────────
+    episode_wins:    list[bool]  = []
+    episode_rewards: list[float] = []
+    reward_window: deque[float]  = deque(maxlen=100)
+    fleets_window: deque[int]    = deque(maxlen=50)
+    max_fleets_seen = 0
+
+    ep_rewards    = np.zeros(num_envs, dtype=np.float64)
+    ep_steps      = np.zeros(num_envs, dtype=np.int32)
+    episodes_done = 0
+    last_log_ep   = 0
+    last_ckpt_ep  = 0
+    last_render_ep = 0
+
+    # ── Render state ──────────────────────────────────────────────────────────
+    # At most one render subprocess runs at a time; new requests are dropped
+    # while one is in progress.  States are captured by recording env_2p[0]
+    # before every step — no checkpoint needed, the actual training episode
+    # is what gets rendered.
+    _render_script  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "render_jax_episode.py")
+    _render_states_file = os.path.join(ckpt_dir, "render_states.pkl")
+    _render_proc: subprocess.Popen | None = None
+    _render_seed    = 0
+    # Per-episode state buffer for env_2p[0].  Each element is a squeezed
+    # numpy GameState recorded at the START of each tick (before actions).
+    _ep_states_0: list = []
+    _ep_states_0_complete: list | None = None   # most recently sealed episode
+    _ep_states_0_won: bool = False
+    if render_interval > 0:
+        os.makedirs(render_dir, exist_ok=True)
+    # Fractional update debt: accumulate num_envs/update_freq per vector step so
+    # gradient updates scale with data regardless of whether num_envs%update_freq==0.
+    upd_debt      = 0.0
+
+    t0 = time.perf_counter()
+
+    print(f"Running until {num_episodes} episodes complete...")
+
+    # ── Main loop — runs until num_episodes completed ─────────────────────────
+    while episodes_done < num_episodes:
+        # ── action selection ─────────────────────────────────────────────────
+        if trainer.train_step < warmup_steps:
+            actions = np.stack([
+                env_2p.action_space.sample() for _ in range(num_envs)
+            ])
+        else:
+            actions = trainer.select_action_batch(obs_batch)
+
+        # ── record env_2p[0] state for rendering (before the step) ──────────────
+        if render_interval > 0:
+            _ep_states_0.append(jax.tree_util.tree_map(
+                lambda x: np.asarray(x[0]), env_2p._state
+            ))
+
+        # ── env step(s) ───────────────────────────────────────────────────────
+        if env_4p is not None:
+            acts_2p = actions[:num_envs_2p]
+            acts_4p = actions[num_envs_2p:]
+            next_2p, rew_2p, done_2p, _, won_2p = env_2p.step(acts_2p)
+            next_4p, rew_4p, done_4p, _, won_4p = env_4p.step(acts_4p)
+            next_obs = np.concatenate([next_2p, next_4p], axis=0)
+            rewards  = np.concatenate([rew_2p,  rew_4p])
+            dones    = np.concatenate([done_2p, done_4p])
+            wons     = np.concatenate([won_2p,  won_4p])
+            fleets_sent = env_2p.last_fleets_sent + env_4p.last_fleets_sent
+            n_fleets    = max(env_2p.last_n_fleets,  env_4p.last_n_fleets)
+        else:
+            next_obs, rewards, dones, _, wons = env_2p.step(actions)
+            fleets_sent = env_2p.last_fleets_sent
+            n_fleets    = env_2p.last_n_fleets
+
+        trainer.replay_buffer.add_batch(
+            obs_batch, actions, rewards, next_obs, dones.astype(np.float32)
+        )
+        trainer.train_step += num_envs
+
+        ep_rewards += rewards
+        ep_steps   += 1
+
+        # ── per-step diagnostics ──────────────────────────────────────────────
+        for r in rewards:
+            reward_window.append(float(r))
+        fleets_window.append(fleets_sent)
+        max_fleets_seen = max(max_fleets_seen, n_fleets)
+
+        if trainer.writer:
+            trainer.writer.add_scalar("Reward/step_ma100",
+                                      float(np.mean(reward_window)),
+                                      trainer.train_step)
+            trainer.writer.add_scalar("Policy/fleets_sent_ma50",
+                                      float(np.mean(fleets_window)),
+                                      trainer.train_step)
+            trainer.writer.add_scalar("Env/fleets_present",
+                                      n_fleets, trainer.train_step)
+            trainer.writer.add_scalar("Env/fleets_present_max",
+                                      max_fleets_seen, trainer.train_step)
+
+        # ── track finished episodes ───────────────────────────────────────────
+        for i in range(num_envs):
+            if dones[i]:
+                episode_wins.append(bool(wons[i]))
+                episode_rewards.append(float(ep_rewards[i]))
+                ep_idx = episodes_done
+                if trainer.writer:
+                    trainer.writer.add_scalar("Misc/episode_length",
+                                              int(ep_steps[i]), ep_idx)
+                    trainer.writer.add_scalar("Misc/buffer_fill",
+                                              len(trainer.replay_buffer), ep_idx)
+                    trainer.writer.add_scalar("Misc/env_steps",
+                                              trainer.train_step, ep_idx)
+                    trainer.writer.add_scalar("Reward/win",
+                                              1.0 if wons[i] else 0.0, ep_idx)
+                    trainer.writer.add_scalar("Reward/win_rate_10ep",
+                                              float(np.mean(episode_wins[-10:])) * 100,
+                                              ep_idx)
+                episodes_done += 1
+                ep_rewards[i] = 0.0
+                ep_steps[i]   = 0
+
+                # Seal the env_2p[0] episode buffer when that env finishes.
+                # i==0 corresponds to env_2p[0] in both the 2p-only and 2p+4p
+                # cases (env_2p occupies indices 0..num_envs_2p-1 in dones).
+                if render_interval > 0 and i == 0:
+                    _ep_states_0_complete = _ep_states_0
+                    _ep_states_0_won      = bool(wons[0])
+                    _ep_states_0          = []
+
+        # ── gradient updates ──────────────────────────────────────────────────
+        # Accumulate fractional updates so the ratio of gradient steps to env
+        # transitions matches the single-env rate (1 update per update_freq
+        # transitions), independent of num_envs.
+        if (
+            trainer.train_step >= warmup_steps
+            and len(trainer.replay_buffer) >= batch_size
+        ):
+            upd_debt += num_envs / update_freq
+            while upd_debt >= 1.0:
+                for _ in range(gradient_steps):
+                    trainer.update()
+                upd_debt -= 1.0
+
+        obs_batch = next_obs
+
+        # ── console log every log_interval completed episodes ─────────────────
+        if (episodes_done > 0
+                and episodes_done % log_interval < 4
+                and episodes_done != last_log_ep):
+            last_log_ep = episodes_done
+            recent_r   = episode_rewards[-log_interval:]
+            recent_w   = episode_wins[-log_interval:]
+            avg_reward = float(np.mean(recent_r))
+            win_rate   = float(np.mean(recent_w)) * 100 if recent_w else 0.0
+            elapsed    = time.perf_counter() - t0
+            print(
+                f"Ep {episodes_done:>5}/{num_episodes} | "
+                f"Avg({log_interval}): {avg_reward:+8.3f} | "
+                f"Win%: {win_rate:5.1f} | "
+                f"Buffer: {len(trainer.replay_buffer):>7} | "
+                f"Steps: {trainer.train_step:>9} | "
+                f"{elapsed:.0f}s"
+            )
+
+        # ── checkpoint ────────────────────────────────────────────────────────
+        if (episodes_done > 0
+                and episodes_done % save_interval == 0
+                and episodes_done != last_ckpt_ep):
+            last_ckpt_ep = episodes_done
+            ckpt_path = os.path.join(ckpt_dir, f"sac_ep{episodes_done:05d}.pt")
+            trainer.save_checkpoint(ckpt_path)
+            trainer.save_replay_buffer(buffer_path)
+
+        # ── JAX render (background subprocess) ───────────────────────────────
+        # Renders the actual training episode of env_2p[0], not a new one.
+        # Triggered every render_interval completed episodes.
+        # Add your own condition here to render on specific events instead.
+        if (render_interval > 0
+                and episodes_done > 0
+                and episodes_done % render_interval == 0
+                and episodes_done != last_render_ep
+                and _ep_states_0_complete is not None):
+            last_render_ep = episodes_done
+            # Drop if the previous render is still running.
+            if _render_proc is None or _render_proc.poll() is not None:
+                result_tag = "WIN" if _ep_states_0_won else "LOSS"
+                html_path  = os.path.join(
+                    render_dir, f"ep{episodes_done:05d}_jax_{result_tag}.html"
+                )
+                with open(_render_states_file, "wb") as _fh:
+                    pickle.dump(_ep_states_0_complete, _fh)
+                _render_proc = subprocess.Popen(
+                    [
+                        sys.executable, _render_script,
+                        "--states-file", _render_states_file,
+                        "--final-won",   "true" if _ep_states_0_won else "false",
+                        "--output",      html_path,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+    # ── final save ────────────────────────────────────────────────────────────
+    trainer.save_checkpoint(os.path.join(ckpt_dir, "sac_final.pt"))
+    trainer.save_replay_buffer(buffer_path)
+    trainer.close()
+    env_2p.close()
+    if env_4p is not None:
+        env_4p.close()
+
+    # Wait for any in-progress render to finish before exiting.
+    if _render_proc is not None and _render_proc.poll() is None:
+        print("Waiting for final render to complete...")
+        _render_proc.wait()
+
+    print(f"\nDone. {trainer.train_step} total env steps, {episodes_done} episodes.")
+    return episode_rewards
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -572,8 +995,16 @@ if __name__ == "__main__":
         reward_scheme = [RewardScheme1()]
         print("No reward schemes in config, using default RewardScheme1")
 
-    print(f"Training with {len(reward_scheme)} reward scheme(s)")
-    print()
-
-    # Start training
-    train(config, MAX_PLANETS=40, MAX_FLEETS=200, reward_scheme=reward_scheme)
+    # ── Dispatch to correct backend ───────────────────────────────────────────
+    backend = config.get("environment", {}).get("backend", "python")
+    if backend == "jax":
+        print(f"Training with JAX parallel backend (reward schemes from config are "
+              f"not used in JAX mode; see jax_env.reward_type instead)")
+        print()
+        train_jax(config, MAX_PLANETS=40, MAX_FLEETS=200, reward_scheme=reward_scheme)
+    else:
+        if backend != "python":
+            print(f"Warning: unknown backend {backend!r}, falling back to 'python'")
+        print(f"Training with {len(reward_scheme)} reward scheme(s)")
+        print()
+        train(config, MAX_PLANETS=40, MAX_FLEETS=200, reward_scheme=reward_scheme)

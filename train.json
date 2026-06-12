@@ -30,12 +30,21 @@
     "refresh_freq": 1000
   },
   "environment": {
+    "backend": "jax",
     "opponent": "rule_based",
     "n_players_default": 2,
     "ratio_4p": 0.3,
     "mixed_send_prob": 0.3,
     "tanh_scale": 0.2,
     "min_fleet_ships": 3
+  },
+  "jax_env": {
+    "num_envs":     256,
+    "num_players":  2,
+    "episode_steps": 500,
+    "reward_type":  "ship_advantage",
+    "reward_scale": 0.01,
+    "win_bonus":    100.0
   },
   "curriculum": {
     "mixed_random_ratio_start": 1.0,
