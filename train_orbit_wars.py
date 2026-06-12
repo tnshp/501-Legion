@@ -565,6 +565,7 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     max_steps      = train_cfg.get("max_steps",      500)
     warmup_steps   = train_cfg.get("warmup_steps",   500)
     update_freq    = train_cfg.get("update_freq",    4)
+
     gradient_steps = train_cfg.get("gradient_steps", 1)
     batch_size     = train_cfg.get("batch_size",     64)
 
@@ -591,6 +592,9 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     # ── Split envs between 2p and 4p ─────────────────────────────────────────
     num_envs_4p = int(num_envs * ratio_4p) if ratio_4p > 0 else 0
     num_envs_2p = num_envs - num_envs_4p
+
+    if update_freq is None:
+        update_freq = num_envs
 
     # reward_cfg mirrors the Python backend's "reward" list for apples-to-apples
     # comparisons. reward_type/scale/win_bonus are passed as fallback for callers

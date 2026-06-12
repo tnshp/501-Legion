@@ -9,9 +9,9 @@
   "training": {
     "num_episodes": 250,
     "warmup_steps": 500,
-    "batch_size": 64,
+    "batch_size": 256,
     "buffer_size": 100000,
-    "update_freq": 4,
+    "update_freq": null,
     "gradient_steps": 1,
     "lr": 3e-4,
     "grad_clip": 1.0,

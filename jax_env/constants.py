@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 
 # Array size caps — all environments share these static shapes
-MAX_PLANETS = 44          # 20-40 regular + up to 20 comets, padded to power of 2
+MAX_PLANETS = 60          # 20-40 regular + up to 20 comets, padded to power of 2
 MAX_FLEETS = 1024         # circular buffer; oldest evicted if exceeded
 MAX_COMET_GROUPS = 5      # exactly 5 spawn events per episode
 MAX_COMET_PATH_LEN = 40   # max on-board path length (generate_comet_paths: 5-40)

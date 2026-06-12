@@ -249,7 +249,7 @@ def reset(seed: int, num_players: int = 2,
     # ---- Planets -----------------------------------------------------------
     raw_planets = _generate_planets(rng)
     n_planets = len(raw_planets)
-    assert n_planets + MAX_COMET_GROUPS * 4 <= MAX_PLANETS, (
+    assert n_planets + 4 <= MAX_PLANETS, (
         f"Too many planets ({n_planets}) for MAX_PLANETS={MAX_PLANETS}"
     )
 

@@ -323,7 +323,8 @@ def main():
     jax_cfg = config.get("jax_env",  {})
 
     default_num_envs = args.num_envs or jax_cfg.get("num_envs", 256)
-    update_freq   = t_cfg.get("update_freq",    4)
+    update_freq_config   = t_cfg.get("update_freq",    default_num_envs)
+    update_freq = update_freq_config
     grad_steps    = t_cfg.get("gradient_steps", 1)
     batch_size    = t_cfg.get("batch_size",     64)
     warmup_steps  = t_cfg.get("warmup_steps",   500)
@@ -347,6 +348,8 @@ def main():
         print(f"\n{'='*70}")
         print(f"num_envs={num_envs}  num_players={args.num_players}")
         print(f"{'='*70}")
+        if update_freq_config is None:
+            update_freq = num_envs
 
         env     = _build_env(config, num_envs, args.num_players)
         trainer = _build_trainer(config, env, device)
