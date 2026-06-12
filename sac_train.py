@@ -335,6 +335,14 @@ class JaxReplayBuffer:
             self._ptr  = n % self._cap
         return True
 
+    def block_until_ready(self):
+        """Block until all pending JAX GPU operations (scatter/gather) complete.
+
+        Used by the benchmark to get accurate per-phase wall-clock timings.
+        Not needed in normal training — JAX dispatches are async by design.
+        """
+        jax.block_until_ready(self._obs)
+
 
 # =============================================================================
 # SAC Trainer
