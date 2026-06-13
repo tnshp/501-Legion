@@ -598,6 +598,30 @@ def _mp_env_actor_worker(conn, env_kw, num_envs_2p, num_envs_4p, capture_render)
 # JAX vectorised training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _log_vstep(vstep, num_episodes, episodes_done, episode_rewards,
+               episode_wins, trainer, t0):
+    """Console progress line for the JAX backend, keyed by vector-step.
+
+    Reward / win-rate are averaged over the last 50 completed episodes — a fixed
+    window, since the log cadence is now vector-steps rather than episodes (so a
+    `[-log_interval:]` slice would no longer mean "the last log_interval episodes").
+    """
+    recent_r = episode_rewards[-50:]
+    recent_w = episode_wins[-50:]
+    avg_reward = float(np.mean(recent_r)) if recent_r else 0.0
+    win_rate   = float(np.mean(recent_w)) * 100 if recent_w else 0.0
+    elapsed    = time.perf_counter() - t0
+    print(
+        f"vs {vstep:>6} | Ep {episodes_done:>5}/{num_episodes} | "
+        f"Avg(50ep): {avg_reward:+8.3f} | "
+        f"Win%: {win_rate:5.1f} | "
+        f"Buffer: {len(trainer.replay_buffer):>7} | "
+        f"Steps: {trainer.train_step:>9} | "
+        f"Upd: {trainer._update_count:>7} | "
+        f"{elapsed:.0f}s"
+    )
+
+
 def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> list[float]:
     """Train SAC using the parallel JAX environment backend.
 
@@ -649,6 +673,12 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     gradient_steps = train_cfg.get("gradient_steps", 1)
     batch_size     = train_cfg.get("batch_size",     64)
 
+    # Console-log / checkpoint / render cadence is measured in VECTOR-STEPS (one
+    # env-step batch of num_envs transitions), not episodes. With num_envs envs
+    # stepped together, episodes finish in bursts of ~num_envs at the same
+    # vector-step, so an episode-count interval smaller than num_envs can never
+    # fire at the configured rate. The vector-step counter ticks by exactly 1 per
+    # iteration, so e.g. save_interval=100 reliably checkpoints every 100 vsteps.
     log_interval    = io_cfg.get("log_interval",    1)
     save_interval   = io_cfg.get("save_interval",   100)
     render_interval = io_cfg.get("render_interval", 0)   # 0 = disabled
@@ -827,9 +857,11 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     ep_rewards    = np.zeros(num_envs, dtype=np.float64)
     ep_steps      = np.zeros(num_envs, dtype=np.int32)
     episodes_done = 0
-    last_log_ep   = 0
-    last_ckpt_ep  = 0
-    last_render_ep = 0
+    # Vector-step counter (ticks +1 per env-step batch). Drives the log /
+    # checkpoint / render cadence so it is independent of bursty episode
+    # completion (the mp_env and serial loops read it directly; the threaded
+    # loop republishes it via shared_vstep for its learner thread).
+    vstep         = 0
 
     # ── Render state ──────────────────────────────────────────────────────────
     # At most one render subprocess runs at a time; new requests are dropped
@@ -893,6 +925,7 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         parent_conn.send(prev_actions)
 
         while episodes_done < num_episodes:
+            vstep += 1
             # ── gradient updates — overlap the actor stepping prev_actions ────
             if (trainer.train_step >= warmup_steps
                     and len(trainer.replay_buffer) >= batch_size):
@@ -959,39 +992,25 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                 prev_obs     = obs_batch
                 parent_conn.send(prev_actions)
 
-            # ── console log ──────────────────────────────────────────────────
-            if episodes_done // log_interval > last_log_ep:
-                last_log_ep = episodes_done // log_interval
-                recent_r   = episode_rewards[-log_interval:]
-                recent_w   = episode_wins[-log_interval:]
-                avg_reward = float(np.mean(recent_r))
-                win_rate   = float(np.mean(recent_w)) * 100 if recent_w else 0.0
-                elapsed    = time.perf_counter() - t0
-                print(
-                    f"Ep {episodes_done:>5}/{num_episodes} | "
-                    f"Avg({log_interval}): {avg_reward:+8.3f} | "
-                    f"Win%: {win_rate:5.1f} | "
-                    f"Buffer: {len(trainer.replay_buffer):>7} | "
-                    f"Steps: {trainer.train_step:>9} | "
-                    f"Upd: {trainer._update_count:>7} | "
-                    f"{elapsed:.0f}s"
-                )
+            # ── console log (every log_interval vector-steps) ────────────────
+            if vstep % log_interval == 0:
+                _log_vstep(vstep, num_episodes, episodes_done, episode_rewards,
+                           episode_wins, trainer, t0)
 
-            # ── checkpoint ───────────────────────────────────────────────────
-            if episodes_done // save_interval > last_ckpt_ep:
-                last_ckpt_ep = episodes_done // save_interval
-                trainer.save_checkpoint(os.path.join(ckpt_dir, f"sac_ep{episodes_done:05d}.pt"))
+            # ── checkpoint (every save_interval vector-steps) ────────────────
+            if vstep % save_interval == 0:
+                trainer.save_checkpoint(
+                    os.path.join(ckpt_dir, f"sac_vs{vstep:06d}.pt"))
                 trainer.save_replay_buffer(buffer_path)
 
-            # ── render (background subprocess) ───────────────────────────────
+            # ── render (background subprocess; every render_interval vsteps) ──
             if (render_interval > 0
-                    and episodes_done // render_interval > last_render_ep
+                    and vstep % render_interval == 0
                     and _ep_states_0_complete is not None):
-                last_render_ep = episodes_done // render_interval
                 if _render_proc is None or _render_proc.poll() is not None:
                     result_tag = "WIN" if _ep_states_0_won else "LOSS"
                     html_path  = os.path.join(
-                        render_dir, f"ep{episodes_done:05d}_jax_{result_tag}.html")
+                        render_dir, f"vs{vstep:06d}_jax_{result_tag}.html")
                     with open(_render_states_file, "wb") as _fh:
                         pickle.dump(_ep_states_0_complete, _fh)
                     _render_proc = subprocess.Popen(
@@ -1064,6 +1083,9 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
 
         stop_evt  = threading.Event()
         shared_ep = {"done": 0}
+        # Vector-step counter published by the env thread; the learner thread polls
+        # it for the checkpoint cadence (it can't read the env thread's local).
+        shared_vstep = {"v": 0}
         # Backpressure cap: how many transitions the rollout may get ahead of the
         # learner's update budget.  Without this, a fast env thread (the update is
         # the heavier side here) would exhaust the episode budget before the
@@ -1091,12 +1113,14 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                     sync_actor()
                     last_sync = upd
                 # Periodic checkpoint — done on the learner thread because it owns
-                # the networks (the env thread never touches them).  Bucket-crossing
-                # test (see env_worker) so a chunked ep_done jump can't skip a save.
-                ed = shared_ep["done"]
-                if ed // save_interval > last_ckpt:
-                    last_ckpt = ed // save_interval
-                    trainer.save_checkpoint(os.path.join(ckpt_dir, f"sac_ep{ed:05d}.pt"))
+                # the networks (the env thread never touches them).  Keyed off the
+                # vector-step counter published by the env thread; bucket-crossing
+                # (>) rather than == because the learner polls asynchronously and
+                # may see vstep jump by more than one between iterations.
+                v = shared_vstep["v"]
+                if v // save_interval > last_ckpt:
+                    last_ckpt = v // save_interval
+                    trainer.save_checkpoint(os.path.join(ckpt_dir, f"sac_vs{v:06d}.pt"))
                     trainer.save_replay_buffer(buffer_path)
             sync_actor()   # final sync so the actor matches the last update
 
@@ -1104,8 +1128,10 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         def env_worker():
             nonlocal obs_batch, max_fleets_seen
             nonlocal _render_proc, _ep_states_0, _ep_states_0_complete, _ep_states_0_won
-            last_log = last_render = 0
+            vstep_local = 0
             while shared_ep["done"] < num_episodes and not stop_evt.is_set():
+                vstep_local += 1
+                shared_vstep["v"] = vstep_local   # publish for the learner thread
                 # ── backpressure: keep the rollout within lead_cap transitions of
                 #    the learner's update budget so the intended number of updates
                 #    actually runs (no effect during warmup) ──────────────────────
@@ -1193,40 +1219,20 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                             _ep_states_0          = []
 
                 obs_batch = next_obs
-                ep_done = shared_ep["done"]
 
-                # ── console log ─────────────────────────────────────────────────
-                # Bucket-crossing test: log once each time ep_done passes a multiple
-                # of log_interval.  A plain `ep_done % log_interval == 0` (or the old
-                # `% < 4` window) silently misses the log whenever ep_done jumps over
-                # the multiple — which it does every vstep here, since many of the
-                # num_envs episodes finish at once.
-                if ep_done // log_interval > last_log:
-                    last_log = ep_done // log_interval
-                    recent_r = episode_rewards[-log_interval:]
-                    recent_w = episode_wins[-log_interval:]
-                    avg_reward = float(np.mean(recent_r))
-                    win_rate   = float(np.mean(recent_w)) * 100 if recent_w else 0.0
-                    elapsed    = time.perf_counter() - t0
-                    print(
-                        f"Ep {ep_done:>5}/{num_episodes} | "
-                        f"Avg({log_interval}): {avg_reward:+8.3f} | "
-                        f"Win%: {win_rate:5.1f} | "
-                        f"Buffer: {len(trainer.replay_buffer):>7} | "
-                        f"Steps: {trainer.train_step:>9} | "
-                        f"Upd: {trainer._update_count:>7} | "
-                        f"{elapsed:.0f}s"
-                    )
+                # ── console log (every log_interval vector-steps) ───────────────
+                if vstep_local % log_interval == 0:
+                    _log_vstep(vstep_local, num_episodes, shared_ep["done"],
+                               episode_rewards, episode_wins, trainer, t0)
 
-                # ── JAX render (background subprocess) ──────────────────────────
+                # ── JAX render (background subprocess; every render_interval vsteps)
                 if (render_interval > 0
-                        and ep_done // render_interval > last_render
+                        and vstep_local % render_interval == 0
                         and _ep_states_0_complete is not None):
-                    last_render = ep_done // render_interval
                     if _render_proc is None or _render_proc.poll() is not None:
                         result_tag = "WIN" if _ep_states_0_won else "LOSS"
                         html_path  = os.path.join(
-                            render_dir, f"ep{ep_done:05d}_jax_{result_tag}.html")
+                            render_dir, f"vs{vstep_local:06d}_jax_{result_tag}.html")
                         with open(_render_states_file, "wb") as _fh:
                             pickle.dump(_ep_states_0_complete, _fh)
                         _render_proc = subprocess.Popen(
@@ -1255,6 +1261,7 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
 
     # ── Serial main loop (fallback; jax_env.actor="serial") ───────────────────
     while (not threaded) and (not mp_env) and episodes_done < num_episodes:
+        vstep += 1
         # ── action selection ─────────────────────────────────────────────────
         if trainer.train_step < warmup_steps:
             actions = np.stack([
@@ -1358,46 +1365,28 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
 
         obs_batch = next_obs
 
-        # ── console log every log_interval completed episodes ─────────────────
-        # Bucket-crossing test: with num_envs episodes finishing per vstep,
-        # episodes_done jumps in chunks, so `% log_interval == 0` (or the old
-        # `% < 4` window) silently skips logs.  Log once per multiple crossed.
-        if episodes_done // log_interval > last_log_ep:
-            last_log_ep = episodes_done // log_interval
-            recent_r   = episode_rewards[-log_interval:]
-            recent_w   = episode_wins[-log_interval:]
-            avg_reward = float(np.mean(recent_r))
-            win_rate   = float(np.mean(recent_w)) * 100 if recent_w else 0.0
-            elapsed    = time.perf_counter() - t0
-            print(
-                f"Ep {episodes_done:>5}/{num_episodes} | "
-                f"Avg({log_interval}): {avg_reward:+8.3f} | "
-                f"Win%: {win_rate:5.1f} | "
-                f"Buffer: {len(trainer.replay_buffer):>7} | "
-                f"Steps: {trainer.train_step:>9} | "
-                f"{elapsed:.0f}s"
-            )
+        # ── console log (every log_interval vector-steps) ─────────────────────
+        if vstep % log_interval == 0:
+            _log_vstep(vstep, num_episodes, episodes_done, episode_rewards,
+                       episode_wins, trainer, t0)
 
-        # ── checkpoint ────────────────────────────────────────────────────────
-        if episodes_done // save_interval > last_ckpt_ep:
-            last_ckpt_ep = episodes_done // save_interval
-            ckpt_path = os.path.join(ckpt_dir, f"sac_ep{episodes_done:05d}.pt")
+        # ── checkpoint (every save_interval vector-steps) ─────────────────────
+        if vstep % save_interval == 0:
+            ckpt_path = os.path.join(ckpt_dir, f"sac_vs{vstep:06d}.pt")
             trainer.save_checkpoint(ckpt_path)
             trainer.save_replay_buffer(buffer_path)
 
-        # ── JAX render (background subprocess) ───────────────────────────────
+        # ── JAX render (background subprocess; every render_interval vsteps) ──
         # Renders the actual training episode of env_2p[0], not a new one.
-        # Triggered every render_interval completed episodes.
         # Add your own condition here to render on specific events instead.
         if (render_interval > 0
-                and episodes_done // render_interval > last_render_ep
+                and vstep % render_interval == 0
                 and _ep_states_0_complete is not None):
-            last_render_ep = episodes_done // render_interval
             # Drop if the previous render is still running.
             if _render_proc is None or _render_proc.poll() is not None:
                 result_tag = "WIN" if _ep_states_0_won else "LOSS"
                 html_path  = os.path.join(
-                    render_dir, f"ep{episodes_done:05d}_jax_{result_tag}.html"
+                    render_dir, f"vs{vstep:06d}_jax_{result_tag}.html"
                 )
                 with open(_render_states_file, "wb") as _fh:
                     pickle.dump(_ep_states_0_complete, _fh)

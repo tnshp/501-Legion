@@ -317,10 +317,14 @@ def _resolve_combat(planets: PlanetState, fleets: FleetState,
     # index = hit_planet_idx[f] * num_players + owner[f]
     safe_idx = jnp.maximum(hit_planet_idx, 0)  # avoid -1 becoming large index
     flat_idx = safe_idx * num_players + fleets.owner  # [MAX_FLEETS]
-    flat_idx = jnp.where(fleet_hit & fleets.active, flat_idx, MAX_PLANETS * num_players)
+    # Use `fleet_hit` (not fleets.active): the colliding fleets were already
+    # deactivated by _move_fleets_and_detect_collisions, so keying off active
+    # would zero out every attacker and combat would never resolve.  A fleet
+    # with hit_planet_idx >= 0 was active when it struck and must contribute.
+    flat_idx = jnp.where(fleet_hit, flat_idx, MAX_PLANETS * num_players)
     # Use a pad slot for "no hit" contributions (index = MAX_PLANETS * num_players)
     attacking_flat = jax.ops.segment_sum(
-        fleets.ships * fleets.active.astype(jnp.float32),
+        fleets.ships * fleet_hit.astype(jnp.float32),
         flat_idx,
         MAX_PLANETS * num_players + 1,
     )  # [MAX_PLANETS * num_players + 1]
