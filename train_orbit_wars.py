@@ -293,6 +293,11 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
         max_fleets      = OrbitWarsEnv.MAX_FLEETS,   # 100
         d_model         = d_model,
         dim_feedforward = model_cfg.get("ff_dim", 512),
+        # Wire transformer depth/width from config — these were previously dropped,
+        # so the nets silently used the class default of num_layers=3 (config says 2),
+        # i.e. ~50% more transformer compute than intended.
+        num_layers      = model_cfg.get("num_layers", 2),
+        nhead           = model_cfg.get("num_heads", 4),
     )
     policy_net = P_network(**net_kw)
     q1_net     = Q_network(**net_kw)
@@ -342,6 +347,7 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
         block_size        = block_size,
         refresh_freq      = refresh_freq,
         log_dir           = log_dir,
+        compile_mode      = model_cfg.get("compile_mode", "default"),
     )
 
     resume = exec_cfg.get("resume")
@@ -649,6 +655,9 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         max_fleets      = MAX_FLEETS,
         d_model         = d_model,
         dim_feedforward = model_cfg.get("ff_dim", 512),
+        # Previously dropped → nets used the default num_layers=3 (config says 2).
+        num_layers      = model_cfg.get("num_layers", 2),
+        nhead           = model_cfg.get("num_heads", 4),
     )
     policy_net = P_network(**net_kw)
     q1_net     = Q_network(**net_kw)
@@ -693,6 +702,7 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         log_dir           = log_dir,
         use_jax_buffer    = use_jax_buffer,
         tb_log_every      = tb_log_every,
+        compile_mode      = model_cfg.get("compile_mode", "default"),
     )
 
     resume = exec_cfg.get("resume")
@@ -838,10 +848,11 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                     sync_actor()
                     last_sync = upd
                 # Periodic checkpoint — done on the learner thread because it owns
-                # the networks (the env thread never touches them).
+                # the networks (the env thread never touches them).  Bucket-crossing
+                # test (see env_worker) so a chunked ep_done jump can't skip a save.
                 ed = shared_ep["done"]
-                if ed > 0 and ed % save_interval == 0 and ed != last_ckpt:
-                    last_ckpt = ed
+                if ed // save_interval > last_ckpt:
+                    last_ckpt = ed // save_interval
                     trainer.save_checkpoint(os.path.join(ckpt_dir, f"sac_ep{ed:05d}.pt"))
                     trainer.save_replay_buffer(buffer_path)
             sync_actor()   # final sync so the actor matches the last update
@@ -942,8 +953,13 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                 ep_done = shared_ep["done"]
 
                 # ── console log ─────────────────────────────────────────────────
-                if (ep_done > 0 and ep_done % log_interval < 4 and ep_done != last_log):
-                    last_log = ep_done
+                # Bucket-crossing test: log once each time ep_done passes a multiple
+                # of log_interval.  A plain `ep_done % log_interval == 0` (or the old
+                # `% < 4` window) silently misses the log whenever ep_done jumps over
+                # the multiple — which it does every vstep here, since many of the
+                # num_envs episodes finish at once.
+                if ep_done // log_interval > last_log:
+                    last_log = ep_done // log_interval
                     recent_r = episode_rewards[-log_interval:]
                     recent_w = episode_wins[-log_interval:]
                     avg_reward = float(np.mean(recent_r))
@@ -960,11 +976,10 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                     )
 
                 # ── JAX render (background subprocess) ──────────────────────────
-                if (render_interval > 0 and ep_done > 0
-                        and ep_done % render_interval == 0
-                        and ep_done != last_render
+                if (render_interval > 0
+                        and ep_done // render_interval > last_render
                         and _ep_states_0_complete is not None):
-                    last_render = ep_done
+                    last_render = ep_done // render_interval
                     if _render_proc is None or _render_proc.poll() is not None:
                         result_tag = "WIN" if _ep_states_0_won else "LOSS"
                         html_path  = os.path.join(
@@ -1101,10 +1116,11 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         obs_batch = next_obs
 
         # ── console log every log_interval completed episodes ─────────────────
-        if (episodes_done > 0
-                and episodes_done % log_interval < 4
-                and episodes_done != last_log_ep):
-            last_log_ep = episodes_done
+        # Bucket-crossing test: with num_envs episodes finishing per vstep,
+        # episodes_done jumps in chunks, so `% log_interval == 0` (or the old
+        # `% < 4` window) silently skips logs.  Log once per multiple crossed.
+        if episodes_done // log_interval > last_log_ep:
+            last_log_ep = episodes_done // log_interval
             recent_r   = episode_rewards[-log_interval:]
             recent_w   = episode_wins[-log_interval:]
             avg_reward = float(np.mean(recent_r))
@@ -1120,10 +1136,8 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
             )
 
         # ── checkpoint ────────────────────────────────────────────────────────
-        if (episodes_done > 0
-                and episodes_done % save_interval == 0
-                and episodes_done != last_ckpt_ep):
-            last_ckpt_ep = episodes_done
+        if episodes_done // save_interval > last_ckpt_ep:
+            last_ckpt_ep = episodes_done // save_interval
             ckpt_path = os.path.join(ckpt_dir, f"sac_ep{episodes_done:05d}.pt")
             trainer.save_checkpoint(ckpt_path)
             trainer.save_replay_buffer(buffer_path)
@@ -1133,11 +1147,9 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         # Triggered every render_interval completed episodes.
         # Add your own condition here to render on specific events instead.
         if (render_interval > 0
-                and episodes_done > 0
-                and episodes_done % render_interval == 0
-                and episodes_done != last_render_ep
+                and episodes_done // render_interval > last_render_ep
                 and _ep_states_0_complete is not None):
-            last_render_ep = episodes_done
+            last_render_ep = episodes_done // render_interval
             # Drop if the previous render is still running.
             if _render_proc is None or _render_proc.poll() is not None:
                 result_tag = "WIN" if _ep_states_0_won else "LOSS"

@@ -168,6 +168,8 @@ def _build_trainer(config: dict, env: JaxVecEnvAdapter, device: str,
         max_fleets      = 200,
         d_model         = m.get("d_model", 128),
         dim_feedforward = m.get("ff_dim", 512),
+        num_layers      = m.get("num_layers", 2),
+        nhead           = m.get("num_heads", 4),
     )
     return SACTrainer(
         env                = env,
@@ -192,6 +194,7 @@ def _build_trainer(config: dict, env: JaxVecEnvAdapter, device: str,
         log_dir            = None,
         use_jax_buffer     = use_jax_buffer,
         tb_log_every       = config.get("io", {}).get("tb_log_every", 25),
+        compile_mode       = m.get("compile_mode", "default"),
     )
 
 
@@ -211,6 +214,7 @@ def _run(
     n_vsteps:      int,
     label:         str,
     jax_buffer:    bool = False,
+    profile_update: bool = False,
 ) -> dict:
     """Run one benchmark pass and return timing statistics.
 
@@ -268,7 +272,12 @@ def _run(
             upd_debt += num_envs / update_freq
             while upd_debt >= 1.0:
                 for _ in range(grad_steps):
-                    _ures = trainer.update(_profile=is_cuda)
+                    # Sub-phase profiling inserts ~7 cuda.synchronize() per update,
+                    # which serialises the GPU and both inflates the update time and
+                    # tanks measured util — so it is OFF by default; the coarse
+                    # select/envstep/add/update timing below stays accurate.  Enable
+                    # with --profile-update only when you want the sub-phase split.
+                    _ures = trainer.update(_profile=(is_cuda and profile_update))
                     if _ures and "_phases" in _ures:
                         for _k, _v in _ures["_phases"].items():
                             _upd_phases[_k] += _v
@@ -500,6 +509,10 @@ def main():
                     help="also run an actor-learner THREADED pass and report its "
                          "end-to-end trans/s next to the serial number (the serial "
                          "phase profile cannot show CPU/GPU overlap)")
+    ap.add_argument("--profile-update", action="store_true",
+                    help="break the update into sub-phases (sample/q_target/q1/q2/pi/"
+                         "tail).  Adds ~7 cuda syncs/update that distort total time + "
+                         "util, so leave OFF for representative throughput numbers.")
     args = ap.parse_args()
 
     config  = load_config(args.config)
@@ -564,7 +577,7 @@ def main():
                    batch_size=batch_size, device=device,
                    n_vsteps=args.steps,
                    label=f"JAX  num_envs={num_envs}  {args.num_players}p",
-                   jax_buffer=jax_buffer)
+                   jax_buffer=jax_buffer, profile_update=args.profile_update)
         sampler.stop()
 
         print("\n=== GPU UTILIZATION (serial) ===")

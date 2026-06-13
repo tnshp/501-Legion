@@ -422,8 +422,10 @@ class SACTrainer:
         log_dir: Optional[str] = None,
         use_jax_buffer: bool = False,
         tb_log_every: int = 1,
+        compile_mode: str = "default",
     ):
         self.env           = env
+        self._compile_mode = (compile_mode or "default")
         self.device        = device
         # Enable TF32 matmul/conv on Ampere+ GPUs: the transformer is matmul-bound
         # and TF32 runs those ~1.5-2x faster with precision loss that is immaterial
@@ -514,15 +516,28 @@ class SACTrainer:
             self._hard_update(self.q2_target, self.q2_net)
 
         # With d_model=128 each transformer kernel finishes in <1 µs but Python
-        # dispatch takes ~5 µs — the GPU idles between launches. compile() traces
-        # the full forward graph and submits it as one fused kernel sequence.
-        if self._dev_type == "cuda" and hasattr(torch, "compile"):
-            self.policy_net = torch.compile(self.policy_net)
-            self.q1_net     = torch.compile(self.q1_net)
-            self.q2_net     = torch.compile(self.q2_net)
+        # dispatch takes ~5 µs — the GPU idles between launches.  compile() traces
+        # the forward graph and submits it as one fused kernel sequence.
+        #
+        # compile_mode (config: model.compile_mode):
+        #   "none"            — disable torch.compile (eager)
+        #   "default"         — fuse kernels (reduces, but does not eliminate, dispatch)
+        #   "reduce-overhead" — CUDA graphs: capture the whole forward as one
+        #                       replayable unit, eliminating per-kernel dispatch.
+        #                       This is the right setting when the profile shows the
+        #                       GPU "starved between kernels" (low mean util, small
+        #                       model).  NOTE: nn.TransformerEncoder graph-breaks under
+        #                       compile, which limits the gain — see the README note.
+        #   "max-autotune"    — autotune GEMMs (long compile; best steady-state)
+        if (self._compile_mode != "none" and self._dev_type == "cuda"
+                and hasattr(torch, "compile")):
+            _ckw = {} if self._compile_mode == "default" else {"mode": self._compile_mode}
+            self.policy_net = torch.compile(self.policy_net, **_ckw)
+            self.q1_net     = torch.compile(self.q1_net,     **_ckw)
+            self.q2_net     = torch.compile(self.q2_net,     **_ckw)
             if not self.use_lambda_returns:
-                self.q1_target = torch.compile(self.q1_target)
-                self.q2_target = torch.compile(self.q2_target)
+                self.q1_target = torch.compile(self.q1_target, **_ckw)
+                self.q2_target = torch.compile(self.q2_target, **_ckw)
 
         # ── optimisers ────────────────────────────────────────────────────────
         # On CUDA use the *fused* Adam kernel: it updates all parameters in one
