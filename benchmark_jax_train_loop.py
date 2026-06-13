@@ -21,6 +21,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import copy
 import subprocess
 import threading
 import time
@@ -305,6 +306,113 @@ def _run(
             "n_upd_calls": _n_upd_calls}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Threaded (actor-learner) throughput runner
+#
+# Mirrors train_orbit_wars.train_jax's threaded loop — env-rollout thread +
+# learner thread sharing the trainer/buffer with a separate actor net synced
+# every `actor_sync_every` UPDATES.  The serial _run() measures per-phase cost
+# but cannot show CPU/GPU overlap; this measures the real end-to-end throughput
+# the threaded training loop achieves, so the two trans/s numbers are directly
+# comparable.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_threaded(
+    trainer, env, num_envs, update_freq, grad_steps, batch_size, device,
+    n_vsteps, actor_sync_every, rollout_lead, label,
+) -> dict:
+    is_cuda = (device == "cuda")
+
+    def _orig(m):
+        return getattr(m, "_orig_mod", m)
+
+    # Separate actor net (env thread reads it; learner syncs into it).
+    actor_net = copy.deepcopy(_orig(trainer.policy_net)).to(device).eval()
+    if is_cuda and hasattr(torch, "compile"):
+        actor_net = torch.compile(actor_net)
+    actor_lock = threading.Lock()
+
+    def sync_actor():
+        with actor_lock:
+            _orig(actor_net).load_state_dict(_orig(trainer.policy_net).state_dict())
+
+    sync_actor()
+
+    def actor_select(states):
+        st = trainer._to(torch.FloatTensor(states))
+        st = trainer.state_preprocessor(st)
+        with actor_lock, torch.no_grad(), trainer._autocast():
+            a, _ = trainer._sample(actor_net, st)
+        return a.float().cpu().numpy()
+
+    # Buffer is pre-filled by the warmup pass, so updates start immediately
+    # (warmup budget = 0 here).
+    lead_cap = max(rollout_lead * num_envs, batch_size)
+    stop  = threading.Event()
+    prod  = {"v": 0}
+    upds  = {"n": 0}
+
+    def env_worker():
+        obs, _ = env.reset()
+        while prod["v"] < n_vsteps and not stop.is_set():
+            expected = int(trainer._update_count / grad_steps * update_freq)
+            while (trainer.train_step - expected > lead_cap) and not stop.is_set():
+                time.sleep(0.0005)
+                expected = int(trainer._update_count / grad_steps * update_freq)
+            actions = actor_select(obs)
+            nobs, r, d, _, _ = env.step(actions)
+            trainer.replay_buffer.add_batch(obs, actions, r, nobs, d.astype(np.float32))
+            trainer.train_step += num_envs
+            obs = nobs
+            prod["v"] += 1
+        stop.set()
+
+    def learner_worker():
+        upd = last_sync = 0
+        while not stop.is_set():
+            ts = trainer.train_step
+            if len(trainer.replay_buffer) < batch_size:
+                time.sleep(0.001)
+                continue
+            target = int(ts / update_freq * grad_steps)
+            if upd >= target:
+                time.sleep(0.0005)
+                continue
+            trainer.update()
+            upd += 1
+            if upd - last_sync >= actor_sync_every:
+                sync_actor()
+                last_sync = upd
+        upds["n"] = upd
+
+    # Reset both counters so the ratio math (env: _update_count→expected;
+    # learner: train_step→target) is measured over just this pass and not
+    # offset by the warmup/serial passes that ran before it.
+    trainer.train_step    = 0
+    trainer._update_count = 0
+    if is_cuda:
+        torch.cuda.synchronize()
+    wall0 = time.perf_counter()
+    learner_t = threading.Thread(target=learner_worker, daemon=True)
+    env_t     = threading.Thread(target=env_worker,     daemon=True)
+    learner_t.start(); env_t.start()
+    env_t.join()
+    stop.set()
+    learner_t.join()
+    if is_cuda:
+        torch.cuda.synchronize()
+    wall = time.perf_counter() - wall0
+
+    n_tr = n_vsteps * num_envs
+    tps  = n_tr / wall
+    print(f"\n=== {label} ===")
+    print(f"  {n_vsteps} vsteps × {num_envs} envs = {n_tr} transitions"
+          f" | {upds['n']} gradient updates | device={device}  [actor-learner threads]")
+    print(f"  {'TOTAL wall':20s}: {wall*1000:9.1f} ms  "
+          f"({wall/n_tr*1000:.4f} ms/transition)  {tps:9.1f} trans/s")
+    return {"tps": tps, "wall": wall, "n_updates": upds["n"]}
+
+
 def _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device,
                   jax_buffer: bool = False,
                   upd_phases: dict | None = None, n_upd_calls: int = 0):
@@ -388,6 +496,10 @@ def main():
     ap.add_argument("--jax-buffer",   action="store_true", default=None,
                     help="use GPU-resident JaxReplayBuffer (overrides jax_env.jax_buffer "
                          "in config; requires JAX CUDA + enough VRAM)")
+    ap.add_argument("--threaded",     action="store_true",
+                    help="also run an actor-learner THREADED pass and report its "
+                         "end-to-end trans/s next to the serial number (the serial "
+                         "phase profile cannot show CPU/GPU overlap)")
     args = ap.parse_args()
 
     config  = load_config(args.config)
@@ -455,11 +567,32 @@ def main():
                    jax_buffer=jax_buffer)
         sampler.stop()
 
-        print("\n=== GPU UTILIZATION ===")
+        print("\n=== GPU UTILIZATION (serial) ===")
         gpu_util = sampler.report()
         if device == "cuda":
             print(f"  torch peak allocated: {torch.cuda.max_memory_allocated()/1024**2:6.0f} MiB")
         verdict(gpu_util, res["cpu_ms"], res["gpu_ms"], jax_buffer=jax_buffer)
+
+        # ── Threaded (actor-learner) pass ─────────────────────────────────────
+        if args.threaded:
+            sync_every   = jax_cfg.get("actor_sync_every", 2)
+            rollout_lead = jax_cfg.get("rollout_lead", 8)
+            t_sampler = GPUSampler(); t_sampler.start()
+            tres = _run_threaded(
+                trainer, env, num_envs, update_freq, grad_steps, batch_size,
+                device, n_vsteps=args.steps, actor_sync_every=sync_every,
+                rollout_lead=rollout_lead,
+                label=f"JAX THREADED  num_envs={num_envs}  {args.num_players}p")
+            t_sampler.stop()
+            print("\n=== GPU UTILIZATION (threaded) ===")
+            t_gpu = t_sampler.report()
+            speedup = tres["tps"] / res["tps"] if res["tps"] else float("nan")
+            s_util = f"  (GPU util {gpu_util:.0f}%)" if gpu_util is not None else ""
+            t_util = f"  (GPU util {t_gpu:.0f}%)"    if t_gpu    is not None else ""
+            print("\n=== SERIAL vs THREADED ===")
+            print(f"  serial   : {res['tps']:9.1f} trans/s{s_util}")
+            print(f"  threaded : {tres['tps']:9.1f} trans/s{t_util}")
+            print(f"  speedup  : {speedup:.2f}x  (overlap of CPU env.step with GPU update)")
 
         results.append((num_envs, res))
         env.close()

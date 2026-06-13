@@ -1,4 +1,5 @@
 import copy
+import math
 import os
 import threading
 import time
@@ -587,12 +588,33 @@ class SACTrainer:
     # Action selection
     # =========================================================================
 
+    def _sample(self, net, state):
+        """Tanh-squashed action + log π(a|s), routing the forward through the
+        module's ``__call__`` so torch.compile actually applies.
+
+        ``net.sample()`` BYPASSES the compiled graph — torch.compile only wraps
+        ``forward``/``__call__``, so a compiled module's ``.sample()`` falls back
+        to the eager forward (and eager backward).  In SAC the policy is only ever
+        used via sampling, so the whole transformer forward+backward ran eager —
+        ~50 % of the update time and the main cause of low GPU utilisation.  Here
+        the heavy ``net(state)`` is the compiled forward; only the cheap
+        elementwise sampling math runs eager.  Numerically identical to
+        P_network.sample.
+        """
+        mu, sigma  = net(state)
+        eps        = torch.randn_like(sigma)
+        action     = torch.tanh(mu + eps * sigma)
+        log_prob   = -0.5 * eps ** 2 - sigma.log() - 0.5 * math.log(2.0 * math.pi)
+        log_prob   = log_prob - torch.log(1.0 - action ** 2 + 1e-6)
+        log_prob   = log_prob.sum(dim=(-2, -1), keepdim=True).squeeze(-1)
+        return action, log_prob
+
     def select_action(self, state: np.ndarray) -> np.ndarray:
         """Single-env action — stochastic during training."""
         state_t = self._to(torch.FloatTensor(state).unsqueeze(0))
         state_t = self.state_preprocessor(state_t)
         with torch.no_grad(), self._autocast():
-            action, _ = self.policy_net.sample(state_t)
+            action, _ = self._sample(self.policy_net, state_t)
         return self.action_postprocessor(action.float().cpu().numpy()[0])
 
     def select_action_batch(self, states: np.ndarray) -> np.ndarray:
@@ -603,7 +625,7 @@ class SACTrainer:
         states_t = self._to(torch.FloatTensor(states))
         states_t = self.state_preprocessor(states_t)
         with torch.no_grad(), self._autocast():
-            actions, _ = self.policy_net.sample(states_t)
+            actions, _ = self._sample(self.policy_net, states_t)
         actions_np = actions.float().cpu().numpy()
         if not self._has_action_post:
             return actions_np
@@ -644,7 +666,7 @@ class SACTrainer:
 
         # ── Q-targets ─────────────────────────────────────────────────────────
         with torch.no_grad(), self._autocast():
-            a_next, lp_next = self.policy_net.sample(next_states)
+            a_next, lp_next = self._sample(self.policy_net, next_states)
             q1_next = self.q1_target(next_states, a_next).unsqueeze(-1)
             q2_next = self.q2_target(next_states, a_next).unsqueeze(-1)
             q_target = (rewards + (1.0 - dones) * self.gamma * (
@@ -678,7 +700,7 @@ class SACTrainer:
 
         # ── Policy update ──────────────────────────────────────────────────────
         with self._autocast():
-            a_tilde, lp = self.policy_net.sample(states)
+            a_tilde, lp = self._sample(self.policy_net, states)
             q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
             q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
             policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
@@ -776,7 +798,7 @@ class SACTrainer:
             for i in range(0, len(next_states_np), chunk):
                 ns = torch.from_numpy(next_states_np[i:i + chunk])
                 ns = self.state_preprocessor(self._to(ns))
-                a, lp = self.policy_net.sample(ns)                 # a:[c,...], lp:[c,1]
+                a, lp = self._sample(self.policy_net, ns)          # a:[c,...], lp:[c,1]
                 q1 = self.q1_net(ns, a).unsqueeze(-1)              # [c,1]
                 q2 = self.q2_net(ns, a).unsqueeze(-1)              # [c,1]
                 v  = torch.min(q1, q2) - self.alpha * lp           # [c,1]
@@ -891,7 +913,7 @@ class SACTrainer:
 
         # ── Policy update — identical SAC actor objective ─────────────────────
         with self._autocast():
-            a_tilde, lp = self.policy_net.sample(states)
+            a_tilde, lp = self._sample(self.policy_net, states)
             q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
             q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
             policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
@@ -1172,7 +1194,7 @@ class SACTrainer:
                 with torch.no_grad():
                     action_t = (
                         self.policy_net.deterministic_action(state_t) if use_det
-                        else self.policy_net.sample(state_t)[0]
+                        else self._sample(self.policy_net, state_t)[0]
                     )
                 state, reward, terminated, truncated, _ = eval_env.step(
                     self.action_postprocessor(action_t.cpu().numpy()[0])

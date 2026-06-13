@@ -599,7 +599,7 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     # threads so the (CPU-heavy) JAX env step overlaps with the (GPU-heavy)
     # gradient update instead of running serially.  See _run_actor_learner.
     threaded        = jax_cfg.get("threaded", True)
-    actor_sync_every = jax_cfg.get("actor_sync_every", 2)   # updates between actor weight syncs
+    actor_sync_every = jax_cfg.get("actor_sync_every", 2)   # gradient UPDATES between actor weight syncs
     rollout_lead    = jax_cfg.get("rollout_lead", 8)        # max vsteps the env may lead the learner
 
     opponent = env_cfg.get("opponent", "random")
@@ -800,7 +800,7 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
             st = trainer._to(torch.FloatTensor(states))
             st = trainer.state_preprocessor(st)
             with actor_lock, torch.no_grad(), trainer._autocast():
-                a, _ = actor_net.sample(st)
+                a, _ = trainer._sample(actor_net, st)   # compiled forward path
             return a.float().cpu().numpy()
 
         # Self-play opponents read the (slightly stale) actor weights too.
