@@ -41,6 +41,9 @@
   "jax_env": {
     "num_envs":     256,
     "jax_buffer": true,
+    "threaded": true,
+    "actor_sync_every": 2,
+    "rollout_lead": 8,
     "num_players":  2,
     "episode_steps": 500,
     "reward_type":  "ship_advantage",
@@ -70,6 +73,7 @@
   ],
   "io": {
     "log_dir": null,
+    "tb_log_every": 25,
     "ckpt_dir": "checkpoints",
     "render_dir": "replays",
     "render_interval": 10,

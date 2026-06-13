@@ -190,6 +190,7 @@ def _build_trainer(config: dict, env: JaxVecEnvAdapter, device: str,
         refresh_freq       = tdl.get("refresh_freq", 1000),
         log_dir            = None,
         use_jax_buffer     = use_jax_buffer,
+        tb_log_every       = config.get("io", {}).get("tb_log_every", 25),
     )
 
 

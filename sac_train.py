@@ -1,5 +1,6 @@
 import copy
 import os
+import threading
 import time
 import numpy as np
 import torch
@@ -67,6 +68,10 @@ class ReplayBuffer:
         self._max  = int(max_size)
         self._ptr  = 0
         self._size = 0
+        # Guards add/sample so a writer (env thread) and reader (learner thread)
+        # in the threaded training loop can't tear a transition.  Uncontended
+        # acquire is ~50 ns, so it is effectively free for the single-thread path.
+        self._lock = threading.Lock()
 
         self.states      = np.zeros((self._max, *state_shape),  dtype=np.float32)
         self.actions     = np.zeros((self._max, *action_shape), dtype=np.float32)
@@ -75,35 +80,40 @@ class ReplayBuffer:
         self.dones       = np.zeros((self._max, 1),             dtype=np.float32)
 
     def add(self, state, action, reward, next_state, done):
-        self.states     [self._ptr] = state
-        self.actions    [self._ptr] = action
-        self.rewards    [self._ptr] = reward
-        self.next_states[self._ptr] = next_state
-        self.dones      [self._ptr] = done
-        self._ptr  = (self._ptr + 1) % self._max
-        self._size = min(self._size + 1, self._max)
+        with self._lock:
+            self.states     [self._ptr] = state
+            self.actions    [self._ptr] = action
+            self.rewards    [self._ptr] = reward
+            self.next_states[self._ptr] = next_state
+            self.dones      [self._ptr] = done
+            self._ptr  = (self._ptr + 1) % self._max
+            self._size = min(self._size + 1, self._max)
 
     def add_batch(self, states, actions, rewards, next_states, dones):
         """Write n transitions in one pass — for vectorised environment collection."""
         n    = len(states)
-        idxs = np.arange(self._ptr, self._ptr + n) % self._max
-        self.states     [idxs] = states
-        self.actions    [idxs] = actions
-        self.rewards    [idxs] = np.asarray(rewards, dtype=np.float32).reshape(-1, 1)
-        self.next_states[idxs] = next_states
-        self.dones      [idxs] = np.asarray(dones,   dtype=np.float32).reshape(-1, 1)
-        self._ptr  = int((self._ptr + n) % self._max)
-        self._size = min(self._size + n, self._max)
+        with self._lock:
+            idxs = np.arange(self._ptr, self._ptr + n) % self._max
+            self.states     [idxs] = states
+            self.actions    [idxs] = actions
+            self.rewards    [idxs] = np.asarray(rewards, dtype=np.float32).reshape(-1, 1)
+            self.next_states[idxs] = next_states
+            self.dones      [idxs] = np.asarray(dones,   dtype=np.float32).reshape(-1, 1)
+            self._ptr  = int((self._ptr + n) % self._max)
+            self._size = min(self._size + n, self._max)
 
     def sample(self, batch_size: int):
-        idxs = np.random.randint(0, self._size, size=batch_size)
-        return (
-            torch.from_numpy(self.states     [idxs]),
-            torch.from_numpy(self.actions    [idxs]),
-            torch.from_numpy(self.rewards    [idxs]),
-            torch.from_numpy(self.next_states[idxs]),
-            torch.from_numpy(self.dones      [idxs]),
-        )
+        with self._lock:
+            idxs = np.random.randint(0, self._size, size=batch_size)
+            # numpy advanced indexing already returns fresh copies, so the
+            # returned tensors are safe once the lock is released.
+            return (
+                torch.from_numpy(self.states     [idxs]),
+                torch.from_numpy(self.actions    [idxs]),
+                torch.from_numpy(self.rewards    [idxs]),
+                torch.from_numpy(self.next_states[idxs]),
+                torch.from_numpy(self.dones      [idxs]),
+            )
 
     def __len__(self):
         return self._size
@@ -200,6 +210,10 @@ class JaxReplayBuffer:
         self._cap  = int(capacity)
         self._ptr  = 0
         self._size = 0
+        # Serialises add_batch (donates/reassigns the buffer arrays) against
+        # sample (reads them) so the threaded loop's env and learner threads
+        # can't race on the donated GPU arrays.
+        self._lock = threading.Lock()
 
         # Pre-allocate all arrays on the JAX default device (GPU).
         self._obs  = jnp.zeros((self._cap, *obs_shape),    dtype=jnp.float32)
@@ -247,20 +261,21 @@ class JaxReplayBuffer:
 
     def add_batch(self, obs, acts, rews, nxts, dons):
         n    = len(obs)
-        idxs = (jnp.arange(n, dtype=jnp.int32) + self._ptr) % self._cap
-        (self._obs, self._acts, self._rews, self._nxts, self._dons) = (
-            self._jit_write(
-                self._obs, self._acts, self._rews, self._nxts, self._dons,
-                jnp.asarray(obs,  dtype=jnp.float32),
-                jnp.asarray(acts, dtype=jnp.float32),
-                jnp.asarray(rews, dtype=jnp.float32).reshape(-1, 1),
-                jnp.asarray(nxts, dtype=jnp.float32),
-                jnp.asarray(dons, dtype=jnp.float32).reshape(-1, 1),
-                idxs,
+        with self._lock:
+            idxs = (jnp.arange(n, dtype=jnp.int32) + self._ptr) % self._cap
+            (self._obs, self._acts, self._rews, self._nxts, self._dons) = (
+                self._jit_write(
+                    self._obs, self._acts, self._rews, self._nxts, self._dons,
+                    jnp.asarray(obs,  dtype=jnp.float32),
+                    jnp.asarray(acts, dtype=jnp.float32),
+                    jnp.asarray(rews, dtype=jnp.float32).reshape(-1, 1),
+                    jnp.asarray(nxts, dtype=jnp.float32),
+                    jnp.asarray(dons, dtype=jnp.float32).reshape(-1, 1),
+                    idxs,
+                )
             )
-        )
-        self._ptr  = int((self._ptr + n) % self._cap)
-        self._size = min(self._size + n, self._cap)
+            self._ptr  = int((self._ptr + n) % self._cap)
+            self._size = min(self._size + n, self._cap)
 
     def add(self, obs, act, rew, nxt, don):
         """Single-transition add (delegates to add_batch for a batch of 1)."""
@@ -273,13 +288,14 @@ class JaxReplayBuffer:
 
     def sample(self, batch_size: int):
         """GPU gather → DLPack → PyTorch CUDA tensors (zero PCIe transfer)."""
-        self._rng, subkey = jr.split(self._rng)
-        arrays = self._jit_sample(
-            subkey,
-            self._obs, self._acts, self._rews, self._nxts, self._dons,
-            jnp.int32(self._size),  # dynamic: changes as buffer fills
-            batch_size,             # static: compile-time shape constant
-        )
+        with self._lock:
+            self._rng, subkey = jr.split(self._rng)
+            arrays = self._jit_sample(
+                subkey,
+                self._obs, self._acts, self._rews, self._nxts, self._dons,
+                jnp.int32(self._size),  # dynamic: changes as buffer fills
+                batch_size,             # static: compile-time shape constant
+            )
         # DLPack: zero-copy JAX GPU array → PyTorch CUDA tensor.
         # JAX handles stream synchronisation inside to_dlpack so the gather
         # is guaranteed complete before PyTorch reads the tensor.
@@ -404,6 +420,7 @@ class SACTrainer:
         action_postprocessor: Optional[Callable] = None,
         log_dir: Optional[str] = None,
         use_jax_buffer: bool = False,
+        tb_log_every: int = 1,
     ):
         self.env           = env
         self.device        = device
@@ -469,6 +486,9 @@ class SACTrainer:
         self.state_preprocessor   = state_preprocessor   or (lambda x: x)
         self.action_preprocessor  = action_preprocessor  or (lambda x: x)
         self.action_postprocessor = action_postprocessor or (lambda x: x)
+        # When no postprocessor is supplied (e.g. the JAX adapter handles its own
+        # action decoding) skip the per-env Python loop in select_action_batch.
+        self._has_action_post     = action_postprocessor is not None
 
         # ── TensorBoard writer ────────────────────────────────────────────────
         if log_dir is not None and not _TB_AVAILABLE:
@@ -476,6 +496,9 @@ class SACTrainer:
                   "Run: pip install tensorboard")
         self.writer        = SummaryWriter(log_dir=log_dir) if (log_dir and _TB_AVAILABLE) else None
         self._update_count = 0
+        # Log gradient-update scalars (which each force a GPU sync) once every
+        # this many updates, keeping the hot path sync-free between logs.
+        self._tb_log_every = max(1, int(tb_log_every))
 
         # ── networks ──────────────────────────────────────────────────────────
         self.policy_net = policy_net.to(device)
@@ -582,6 +605,8 @@ class SACTrainer:
         with torch.no_grad(), self._autocast():
             actions, _ = self.policy_net.sample(states_t)
         actions_np = actions.float().cpu().numpy()
+        if not self._has_action_post:
+            return actions_np
         # apply postprocessor per-env (handles transformer padding etc.)
         return np.stack([self.action_postprocessor(a) for a in actions_np])
 
@@ -677,9 +702,14 @@ class SACTrainer:
             self.alpha = self.log_alpha.exp().item()
         t6 = _ck()
 
-        # ── TensorBoard ───────────────────────────────────────────────────────
-        if self.writer is not None:
-            s = self._update_count
+        # ── TensorBoard (throttled) ────────────────────────────────────────────
+        # Every logged scalar forces a CPU↔GPU sync (.item() / grad-norm), and the
+        # sigma read costs an extra policy forward.  On the JAX backend updates run
+        # ~once per vector step, so logging every update would stall the GPU on
+        # every step.  Throttle to once per `tb_log_every` updates: the curves are
+        # still smooth but the syncs are amortised out of the hot path.
+        s = self._update_count
+        if self.writer is not None and (s % self._tb_log_every == 0):
             with torch.no_grad():
                 _, sigma = self.policy_net.forward(states)
             self.writer.add_scalar("Loss/q1",              q1_loss.item(),     s)
@@ -696,21 +726,21 @@ class SACTrainer:
                 self.writer.add_scalar("Loss/alpha", alpha_loss.item(), s)
 
         self._update_count += 1
-        result = {
-            "q1_loss": q1_loss.item(),
-            "q2_loss": q2_loss.item(),
-            "pi_loss": policy_loss.item(),
-        }
+
+        # Only the profiler consumes the return value; building it unconditionally
+        # cost 3 × .item() (3 host syncs) on every update for nothing.
         if _profile:
-            result["_phases"] = {
-                "sample":   t1 - t0,
-                "q_target": t2 - t1,
-                "q1":       t3 - t2,
-                "q2":       t4 - t3,
-                "pi":       t5 - t4,
-                "tail":     t6 - t5,
+            return {
+                "_phases": {
+                    "sample":   t1 - t0,
+                    "q_target": t2 - t1,
+                    "q1":       t3 - t2,
+                    "q2":       t4 - t3,
+                    "pi":       t5 - t4,
+                    "tail":     t6 - t5,
+                },
             }
-        return result
+        return None
 
     # =========================================================================
     # Cache-based TD(λ)  (Daley & Amato, "Reconciling λ-Returns with
@@ -881,9 +911,9 @@ class SACTrainer:
             self.alpha_optimizer.step()
             self.alpha = self.log_alpha.exp().item()
 
-        # ── TensorBoard ───────────────────────────────────────────────────────
-        if self.writer is not None:
-            s = self._update_count
+        # ── TensorBoard (throttled — see update() for rationale) ───────────────
+        s = self._update_count
+        if self.writer is not None and (s % self._tb_log_every == 0):
             with torch.no_grad():
                 _, sigma = self.policy_net.forward(states)
             self.writer.add_scalar("Loss/q1",              q1_loss.item(),     s)
@@ -900,11 +930,7 @@ class SACTrainer:
                 self.writer.add_scalar("Loss/alpha", alpha_loss.item(), s)
 
         self._update_count += 1
-        return {
-            "q1_loss": q1_loss.item(),
-            "q2_loss": q2_loss.item(),
-            "pi_loss": policy_loss.item(),
-        }
+        return None
 
     # =========================================================================
     # Training loop dispatcher

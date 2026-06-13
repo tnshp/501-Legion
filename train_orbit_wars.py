@@ -50,6 +50,7 @@ import pickle
 import random
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 
@@ -573,7 +574,15 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     save_interval   = io_cfg.get("save_interval",   100)
     render_interval = io_cfg.get("render_interval", 0)   # 0 = disabled
     render_dir      = io_cfg.get("render_dir",      "replays")
+    # TensorBoard: the JAX loop logs per-step (reward/fleets/env) and per-episode
+    # (win-rate/length) scalars plus the trainer's gradient-update scalars. When
+    # io.log_dir is left null we default it to a timestamped runs/ directory so
+    # logging is on by default; gradient-update scalars (which each force a GPU
+    # sync) are throttled by tb_log_every to keep them out of the hot path.
     log_dir         = io_cfg.get("log_dir")
+    if log_dir is None:
+        log_dir = os.path.join("runs", f"jax_{time.strftime('%Y%m%d_%H%M%S')}")
+    tb_log_every    = io_cfg.get("tb_log_every", 25)
 
     # ── JAX env config ────────────────────────────────────────────────────────
     num_envs      = jax_cfg.get("num_envs",      256)
@@ -586,6 +595,12 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     tanh_scale    = env_cfg.get("tanh_scale",    0.2)
     min_fleet_ships = env_cfg.get("min_fleet_ships", 3)
     use_jax_buffer  = jax_cfg.get("jax_buffer",  False)
+    # Actor-learner threading: run env rollout and SAC updates on separate
+    # threads so the (CPU-heavy) JAX env step overlaps with the (GPU-heavy)
+    # gradient update instead of running serially.  See _run_actor_learner.
+    threaded        = jax_cfg.get("threaded", True)
+    actor_sync_every = jax_cfg.get("actor_sync_every", 2)   # updates between actor weight syncs
+    rollout_lead    = jax_cfg.get("rollout_lead", 8)        # max vsteps the env may lead the learner
 
     opponent = env_cfg.get("opponent", "random")
     ratio_4p = env_cfg.get("ratio_4p", 0.0)
@@ -623,6 +638,7 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     print(
         f"JAX backend: {tag} | opponent={opponent} | reward={_reward_names}"
     )
+    print(f"TensorBoard: logging to {log_dir} (run: tensorboard --logdir runs)")
 
     # ── Networks ──────────────────────────────────────────────────────────────
     d_model = model_cfg.get("d_model", 128)
@@ -676,6 +692,7 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         refresh_freq      = refresh_freq,
         log_dir           = log_dir,
         use_jax_buffer    = use_jax_buffer,
+        tb_log_every      = tb_log_every,
     )
 
     resume = exec_cfg.get("resume")
@@ -736,8 +753,250 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
 
     print(f"Running until {num_episodes} episodes complete...")
 
-    # ── Main loop — runs until num_episodes completed ─────────────────────────
-    while episodes_done < num_episodes:
+    # ═════════════════════════════════════════════════════════════════════════
+    # Actor-learner threaded loop
+    #
+    # Two threads share the trainer, replay buffer and (separate) actor network:
+    #   env thread     — selects actions from the ACTOR net, steps the JAX envs
+    #                    (CPU-heavy), writes transitions, owns episode bookkeeping.
+    #   learner thread — samples the buffer and runs SAC gradient updates
+    #                    (GPU-heavy), and every `actor_sync_every` updates copies
+    #                    the fresh policy weights into the actor under a lock.
+    #
+    # Because CUDA / numpy / JAX release the GIL during their heavy C work, the
+    # env thread's CPU rollout overlaps with the learner thread's GPU updates,
+    # closing the GPU-idle gap that the serial loop leaves between env.step and
+    # update.  Shutdown is via a stop Event + join(): the learner always finishes
+    # its in-flight update before we save, and a final actor sync leaves the actor
+    # matching the last trained weights.
+    # ═════════════════════════════════════════════════════════════════════════
+    if threaded:
+        print(f"Actor-learner threading ON (actor synced every "
+              f"{actor_sync_every} updates)")
+
+        # ── actor network: env thread reads it, learner syncs into it ──────────
+        actor_net = P_network(**net_kw).to(device)
+        actor_net.eval()
+        if device == "cuda" and hasattr(torch, "compile"):
+            actor_net = torch.compile(actor_net)
+
+        def _orig(m):
+            # The compiled module wraps the real one as ._orig_mod; copying weights
+            # orig→orig keeps the state_dict keys aligned (no _orig_mod. prefix).
+            return getattr(m, "_orig_mod", m)
+
+        actor_lock = threading.Lock()
+
+        def sync_actor():
+            # Runs only in the learner thread (the sole writer of policy_net), so
+            # reading policy_net here is race-free; the lock guards the actor net
+            # against the env thread's concurrent forward.
+            with actor_lock:
+                _orig(actor_net).load_state_dict(_orig(trainer.policy_net).state_dict())
+
+        sync_actor()  # seed the actor with the initial policy weights
+
+        def actor_select(states):
+            st = trainer._to(torch.FloatTensor(states))
+            st = trainer.state_preprocessor(st)
+            with actor_lock, torch.no_grad(), trainer._autocast():
+                a, _ = actor_net.sample(st)
+            return a.float().cpu().numpy()
+
+        # Self-play opponents read the (slightly stale) actor weights too.
+        if opponent == "self_play":
+            env_2p.set_policy(actor_select)
+            if env_4p is not None:
+                env_4p.set_policy(actor_select)
+
+        stop_evt  = threading.Event()
+        shared_ep = {"done": 0}
+        # Backpressure cap: how many transitions the rollout may get ahead of the
+        # learner's update budget.  Without this, a fast env thread (the update is
+        # the heavier side here) would exhaust the episode budget before the
+        # learner does its share of gradient steps, silently under-training.
+        lead_cap  = max(rollout_lead * num_envs, batch_size)
+
+        # ── learner thread ─────────────────────────────────────────────────────
+        def learner_worker():
+            upd = last_sync = last_ckpt = 0
+            while not stop_evt.is_set():
+                ts = trainer.train_step
+                if ts < warmup_steps or len(trainer.replay_buffer) < batch_size:
+                    time.sleep(0.001)
+                    continue
+                # Hold the serial update-to-transition ratio: one update per
+                # update_freq transitions (×gradient_steps).  When behind, run flat
+                # out; when caught up, sleep briefly instead of busy-spinning.
+                target = int((ts - warmup_steps) / update_freq * gradient_steps)
+                if upd >= target:
+                    time.sleep(0.0005)
+                    continue
+                trainer.update()
+                upd += 1
+                if upd - last_sync >= actor_sync_every:
+                    sync_actor()
+                    last_sync = upd
+                # Periodic checkpoint — done on the learner thread because it owns
+                # the networks (the env thread never touches them).
+                ed = shared_ep["done"]
+                if ed > 0 and ed % save_interval == 0 and ed != last_ckpt:
+                    last_ckpt = ed
+                    trainer.save_checkpoint(os.path.join(ckpt_dir, f"sac_ep{ed:05d}.pt"))
+                    trainer.save_replay_buffer(buffer_path)
+            sync_actor()   # final sync so the actor matches the last update
+
+        # ── env-rollout thread ─────────────────────────────────────────────────
+        def env_worker():
+            nonlocal obs_batch, max_fleets_seen
+            nonlocal _render_proc, _ep_states_0, _ep_states_0_complete, _ep_states_0_won
+            last_log = last_render = 0
+            while shared_ep["done"] < num_episodes and not stop_evt.is_set():
+                # ── backpressure: keep the rollout within lead_cap transitions of
+                #    the learner's update budget so the intended number of updates
+                #    actually runs (no effect during warmup) ──────────────────────
+                if trainer.train_step >= warmup_steps:
+                    expected = warmup_steps + int(
+                        trainer._update_count / gradient_steps * update_freq)
+                    while (trainer.train_step - expected > lead_cap
+                           and not stop_evt.is_set()):
+                        time.sleep(0.0005)
+                        expected = warmup_steps + int(
+                            trainer._update_count / gradient_steps * update_freq)
+
+                # ── action selection (actor net; random during warmup) ──────────
+                if trainer.train_step < warmup_steps:
+                    actions = np.stack([
+                        env_2p.action_space.sample() for _ in range(num_envs)
+                    ])
+                else:
+                    actions = actor_select(obs_batch)
+
+                if render_interval > 0:
+                    _ep_states_0.append(jax.tree_util.tree_map(
+                        lambda x: np.asarray(x[0]), env_2p._state
+                    ))
+
+                # ── env step(s) ─────────────────────────────────────────────────
+                if env_4p is not None:
+                    next_2p, rew_2p, done_2p, _, won_2p = env_2p.step(actions[:num_envs_2p])
+                    next_4p, rew_4p, done_4p, _, won_4p = env_4p.step(actions[num_envs_2p:])
+                    next_obs = np.concatenate([next_2p, next_4p], axis=0)
+                    rewards  = np.concatenate([rew_2p,  rew_4p])
+                    dones    = np.concatenate([done_2p, done_4p])
+                    wons     = np.concatenate([won_2p,  won_4p])
+                    fleets_sent = env_2p.last_fleets_sent + env_4p.last_fleets_sent
+                    n_fleets    = max(env_2p.last_n_fleets, env_4p.last_n_fleets)
+                else:
+                    next_obs, rewards, dones, _, wons = env_2p.step(actions)
+                    fleets_sent = env_2p.last_fleets_sent
+                    n_fleets    = env_2p.last_n_fleets
+
+                trainer.replay_buffer.add_batch(
+                    obs_batch, actions, rewards, next_obs, dones.astype(np.float32)
+                )
+                trainer.train_step += num_envs
+
+                # In-place slice ops (not `+=` on the bare name) so Python does
+                # not treat these enclosing arrays as env_worker locals.
+                ep_rewards[:] += rewards
+                ep_steps[:]   += 1
+
+                for r in rewards:
+                    reward_window.append(float(r))
+                fleets_window.append(fleets_sent)
+                max_fleets_seen = max(max_fleets_seen, n_fleets)
+
+                if trainer.writer:
+                    trainer.writer.add_scalar("Reward/step_ma100",
+                                              float(np.mean(reward_window)), trainer.train_step)
+                    trainer.writer.add_scalar("Policy/fleets_sent_ma50",
+                                              float(np.mean(fleets_window)), trainer.train_step)
+                    trainer.writer.add_scalar("Env/fleets_present",
+                                              n_fleets, trainer.train_step)
+                    trainer.writer.add_scalar("Env/fleets_present_max",
+                                              max_fleets_seen, trainer.train_step)
+
+                # ── track finished episodes ─────────────────────────────────────
+                for i in range(num_envs):
+                    if dones[i]:
+                        episode_wins.append(bool(wons[i]))
+                        episode_rewards.append(float(ep_rewards[i]))
+                        ep_idx = shared_ep["done"]
+                        if trainer.writer:
+                            trainer.writer.add_scalar("Misc/episode_length", int(ep_steps[i]), ep_idx)
+                            trainer.writer.add_scalar("Misc/buffer_fill", len(trainer.replay_buffer), ep_idx)
+                            trainer.writer.add_scalar("Misc/env_steps", trainer.train_step, ep_idx)
+                            trainer.writer.add_scalar("Reward/win", 1.0 if wons[i] else 0.0, ep_idx)
+                            trainer.writer.add_scalar("Reward/win_rate_10ep",
+                                                      float(np.mean(episode_wins[-10:])) * 100, ep_idx)
+                        shared_ep["done"] += 1
+                        ep_rewards[i] = 0.0
+                        ep_steps[i]   = 0
+                        if render_interval > 0 and i == 0:
+                            _ep_states_0_complete = _ep_states_0
+                            _ep_states_0_won      = bool(wons[0])
+                            _ep_states_0          = []
+
+                obs_batch = next_obs
+                ep_done = shared_ep["done"]
+
+                # ── console log ─────────────────────────────────────────────────
+                if (ep_done > 0 and ep_done % log_interval < 4 and ep_done != last_log):
+                    last_log = ep_done
+                    recent_r = episode_rewards[-log_interval:]
+                    recent_w = episode_wins[-log_interval:]
+                    avg_reward = float(np.mean(recent_r))
+                    win_rate   = float(np.mean(recent_w)) * 100 if recent_w else 0.0
+                    elapsed    = time.perf_counter() - t0
+                    print(
+                        f"Ep {ep_done:>5}/{num_episodes} | "
+                        f"Avg({log_interval}): {avg_reward:+8.3f} | "
+                        f"Win%: {win_rate:5.1f} | "
+                        f"Buffer: {len(trainer.replay_buffer):>7} | "
+                        f"Steps: {trainer.train_step:>9} | "
+                        f"Upd: {trainer._update_count:>7} | "
+                        f"{elapsed:.0f}s"
+                    )
+
+                # ── JAX render (background subprocess) ──────────────────────────
+                if (render_interval > 0 and ep_done > 0
+                        and ep_done % render_interval == 0
+                        and ep_done != last_render
+                        and _ep_states_0_complete is not None):
+                    last_render = ep_done
+                    if _render_proc is None or _render_proc.poll() is not None:
+                        result_tag = "WIN" if _ep_states_0_won else "LOSS"
+                        html_path  = os.path.join(
+                            render_dir, f"ep{ep_done:05d}_jax_{result_tag}.html")
+                        with open(_render_states_file, "wb") as _fh:
+                            pickle.dump(_ep_states_0_complete, _fh)
+                        _render_proc = subprocess.Popen(
+                            [sys.executable, _render_script,
+                             "--states-file", _render_states_file,
+                             "--final-won",   "true" if _ep_states_0_won else "false",
+                             "--output",      html_path],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
+
+        learner_t = threading.Thread(target=learner_worker, name="learner", daemon=True)
+        env_t     = threading.Thread(target=env_worker,     name="env-rollout", daemon=True)
+        learner_t.start()
+        env_t.start()
+        env_t.join()
+        # The rollout is done; let the learner drain its remaining update budget so
+        # the total gradient steps match the serial loop (which updates inline each
+        # vstep), then stop it.  join() guarantees the last update finished before
+        # we save.
+        final_target = int((trainer.train_step - warmup_steps) / update_freq * gradient_steps)
+        while trainer._update_count < final_target and learner_t.is_alive():
+            time.sleep(0.01)
+        stop_evt.set()
+        learner_t.join()
+        episodes_done = shared_ep["done"]
+
+    # ── Serial main loop (fallback; jax_env.threaded=false) ───────────────────
+    while (not threaded) and episodes_done < num_episodes:
         # ── action selection ─────────────────────────────────────────────────
         if trainer.train_step < warmup_steps:
             actions = np.stack([
@@ -1005,8 +1264,9 @@ if __name__ == "__main__":
     # ── Dispatch to correct backend ───────────────────────────────────────────
     backend = config.get("environment", {}).get("backend", "python")
     if backend == "jax":
-        print(f"Training with JAX parallel backend (reward schemes from config are "
-              f"not used in JAX mode; see jax_env.reward_type instead)")
+        print("Training with JAX parallel backend (config 'reward' schemes are "
+              "mirrored by the JAX adapter; jax_env.reward_type is the fallback "
+              "when no 'reward' list is given)")
         print()
         train_jax(config, MAX_PLANETS=40, MAX_FLEETS=200, reward_scheme=reward_scheme)
     else:

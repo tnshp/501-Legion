@@ -36,9 +36,10 @@ _NET_MF    = 100
 _STATE_DIM = 13
 _ACT_DIM   = 4
 
-_CENTER    = 50.0
-_ROT_LIMIT = 50.0
-_MAX_SPEED = 6.0
+_CENTER     = 50.0
+_ROT_LIMIT  = 50.0
+_MAX_SPEED  = 6.0
+_SUN_RADIUS = 10.0
 
 # Precomputed constants reused every step
 _PIDX, _QIDX = np.triu_indices(4, k=1)          # 6 upper-triangle pairs for d=4
@@ -47,7 +48,95 @@ _DIAG_MASK   = ~np.eye(_NET_MP, dtype=bool)      # [NMP, NMP] — exclude self-t
 
 def _fleet_speed_np(ships: np.ndarray) -> np.ndarray:
     s = np.maximum(1.0, ships)
-    return 1.0 + (_MAX_SPEED - 1.0) * (np.log(s) / np.log(1000.0)) ** 1.5
+    return np.minimum(
+        _MAX_SPEED,
+        1.0 + (_MAX_SPEED - 1.0) * (np.log(s) / np.log(1000.0)) ** 1.5,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reward-scheme support
+#
+# The Python backend composes a reward from a list of single-responsibility
+# components (env/orbit_wars.py).  The JAX adapter mirrors each one with a
+# vectorised numpy implementation that reads the pre-step (self._state) and
+# post-step (new_state) GameState arrays directly — no per-env Python loop.
+#
+# Legacy numbered schemes (RewardScheme1-4) are thin compositions; they are
+# expanded into their atomic components at construction time so the per-step
+# reward path only ever handles atomic components.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Atomic components handled directly by _compute_config_reward.
+_ATOMIC_SCHEMES = {
+    "RelativeShipAdvantage", "RelativeProductionAdvantage", "ShipGrowth",
+    "ProductionPlanetDelta", "ProximityCaptureBonus", "AbsoluteHoldings",
+    "FleetLaunchPenalty", "LaunchDistancePenalty", "StepPenalty",
+    "TerminalWinBonus", "TimeDecayWinBonus",
+}
+
+
+def _expand_scheme(name: str, params: dict) -> list:
+    """Expand a (possibly legacy/composite) scheme into a list of
+    (atomic_name, atomic_params) tuples, mirroring env/orbit_wars.py exactly."""
+    if name in _ATOMIC_SCHEMES:
+        return [(name, dict(params))]
+
+    ship   = params.get("ship_scale",   0.01)
+    planet = params.get("planet_scale", 1.0)
+    bonus  = params.get("win_bonus",    100.0)
+    if name == "RewardScheme1":
+        return [("RelativeShipAdvantage",       {"ship_scale": ship}),
+                ("RelativeProductionAdvantage", {"planet_scale": planet}),
+                ("TerminalWinBonus",            {"win_bonus": bonus})]
+    if name == "RewardScheme2":
+        return [("ShipGrowth",           {"ship_scale": ship}),
+                ("ProductionPlanetDelta", {"planet_scale": planet}),
+                ("TerminalWinBonus",      {"win_bonus": bonus})]
+    if name == "RewardScheme3":
+        return [("FleetLaunchPenalty", {"ship_scale": params.get("ship_scale", 0.5)})]
+    if name == "RewardScheme4":
+        return [("AbsoluteHoldings",  {"ship_scale": ship, "planet_scale": planet}),
+                ("TerminalWinBonus",  {"win_bonus": bonus})]
+    raise ValueError(
+        f"JAX adapter does not support reward scheme {name!r}. "
+        f"Supported: {sorted(_ATOMIC_SCHEMES | {'RewardScheme1', 'RewardScheme2', 'RewardScheme3', 'RewardScheme4'})}"
+    )
+
+
+def _swept_pair_hit_batch(fx0, fy0, fx1, fy1, px0, py0, px1, py1, r):
+    """Vectorised continuous swept-pair collision test (interpreter model).
+
+    True where a point moving (fx0,fy0)->(fx1,fy1) and a circle of radius r
+    moving (px0,py0)->(px1,py1) come within r for some t in [0, 1].
+    All inputs broadcast against each other; returns a bool array.
+    """
+    d0x = fx0 - px0
+    d0y = fy0 - py0
+    dvx = (fx1 - fx0) - (px1 - px0)
+    dvy = (fy1 - fy0) - (py1 - py0)
+    a = dvx * dvx + dvy * dvy
+    b = 2.0 * (d0x * dvx + d0y * dvy)
+    c = d0x * d0x + d0y * d0y - r * r
+    disc = b * b - 4.0 * a * c
+    sq = np.sqrt(np.maximum(disc, 0.0))
+    a_safe = np.where(a < 1e-12, 1.0, a)
+    t1 = (-b - sq) / (2.0 * a_safe)
+    t2 = (-b + sq) / (2.0 * a_safe)
+    moving_hit = (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0)
+    static_hit = c <= 0.0          # a≈0: relative motion negligible, test start
+    return np.where(a < 1e-12, static_hit, moving_hit)
+
+
+def _seg_dist_to_center(ax, ay, bx, by):
+    """Vectorised min distance from the board centre (50,50) to segment a→b."""
+    vx, vy = bx - ax, by - ay
+    l2 = vx * vx + vy * vy
+    l2_safe = np.where(l2 > 0.0, l2, 1.0)
+    t = np.clip(((_CENTER - ax) * vx + (_CENTER - ay) * vy) / l2_safe, 0.0, 1.0)
+    px = ax + t * vx
+    py = ay + t * vy
+    return np.sqrt((_CENTER - px) ** 2 + (_CENTER - py) ** 2)
 
 
 class JaxVecEnvAdapter:
@@ -104,21 +193,21 @@ class JaxVecEnvAdapter:
 
         # Parse config-based reward schemes.  When provided, these take precedence
         # over reward_type/reward_scale/win_bonus and mirror the Python-backend
-        # reward exactly for apples-to-apples comparisons.
-        _SUPPORTED = {"AbsoluteHoldings", "FleetLaunchPenalty", "TimeDecayWinBonus"}
-        self._reward_cfg: Optional[dict] = None
+        # reward exactly for apples-to-apples comparisons.  Legacy composite
+        # schemes are expanded into their atomic components here, so the per-step
+        # reward path only handles atomic components.  Stored as a list of
+        # (atomic_name, params) tuples (a scheme may appear more than once).
+        self._reward_cfg: Optional[list] = None
+        self._reward_names: set = set()
         if reward_cfg:
-            parsed: dict = {}
+            parsed: list = []
             for cfg in reward_cfg:
                 scheme = cfg.get("scheme", "")
-                if scheme not in _SUPPORTED:
-                    raise ValueError(
-                        f"JAX adapter does not yet support reward scheme {scheme!r}. "
-                        f"Supported: {sorted(_SUPPORTED)}"
-                    )
-                parsed[scheme] = {k: v for k, v in cfg.items() if k != "scheme"}
+                params = {k: v for k, v in cfg.items() if k != "scheme"}
+                parsed.extend(_expand_scheme(scheme, params))
             if parsed:
                 self._reward_cfg = parsed
+                self._reward_names = {n for n, _ in parsed}
 
         self._jax = VectorizedEnv(
             num_envs=num_envs,
@@ -216,19 +305,25 @@ class JaxVecEnvAdapter:
         player0_wons = (r_jax_np[:, 0] > 0) & dones_np
 
         # ── auto-reset done environments ───────────────────────────────────────
+        # Reset only the finished envs and scatter them back into the batched
+        # state with a single device-side `.at[idx].set()` per leaf.  The previous
+        # implementation split ALL num_envs states into Python pytrees and
+        # re-stacked every step any env finished — O(num_envs) host work and
+        # device→host slices that starved the GPU.  reset_single is still Python
+        # (rejection sampling can't be JIT-compiled), but now runs only for the
+        # done envs, and the merge is a vectorised scatter.
         done_idxs = np.where(dones_np)[0]
         if len(done_idxs) > 0:
-            fresh_seeds = np.arange(self._seed_counter,
-                                    self._seed_counter + len(done_idxs))
-            self._seed_counter += len(done_idxs)
-            states_list = [
-                jax.tree_util.tree_map(lambda x, i=i: x[i], new_state)
-                for i in range(self.num_envs)
-            ]
-            for idx, seed in zip(done_idxs, fresh_seeds):
-                states_list[idx] = self._jax.reset_single(int(seed))
+            n_done = len(done_idxs)
+            fresh_seeds = np.arange(self._seed_counter, self._seed_counter + n_done)
+            self._seed_counter += n_done
+            fresh_list = [self._jax.reset_single(int(s)) for s in fresh_seeds]
+            fresh_batch = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs), *fresh_list
+            )
+            idx_j = jnp.asarray(done_idxs)
             new_state = jax.tree_util.tree_map(
-                lambda *xs: jnp.stack(xs), *states_list
+                lambda full, fr: full.at[idx_j].set(fr), new_state, fresh_batch
             )
             if self.reward_type != "native" and self._reward_cfg is None:
                 self._prev_scores = self._compute_scores(new_state)
@@ -600,69 +695,256 @@ class JaxVecEnvAdapter:
     def _compute_config_reward(
         self,
         new_state,
-        r_jax_np: np.ndarray,   # [B, num_players]  native JAX rewards
+        r_jax_np: np.ndarray,   # [B, num_players]  native JAX rewards (unused now)
         dones_np:  np.ndarray,   # [B] bool
     ) -> np.ndarray:
-        """Compute per-env reward from config-based schemes.
+        """Compute per-env player-0 reward from config-based schemes.
 
-        Mirrors the Python backend exactly:
-          AbsoluteHoldings   — per step, uses new_state (post-step)
-          FleetLaunchPenalty — uses delta(p0 active fleets) across the step
-          TimeDecayWinBonus  — terminal only, linearly decays with episode length
+        Vectorised numpy mirror of the composable components in
+        env/orbit_wars.py.  Reads the pre-step (self._state) and post-step
+        (new_state) GameState arrays directly; no per-env Python loop.  Legacy
+        composite schemes were already expanded into atomic components in
+        __init__, so only atomic components are handled here.
         """
-        rewards = np.zeros(self.num_envs, dtype=np.float32)
-        cfg     = self._reward_cfg
+        B       = self.num_envs
+        NP      = self.num_players
+        names   = self._reward_names
+        rewards = np.zeros(B, dtype=np.float32)
 
-        # ── shared arrays ─────────────────────────────────────────────────────
-        p_owner_new = np.asarray(new_state.planets.owner,  dtype=np.int32)
-        p_act_new   = np.asarray(new_state.planets.active, dtype=bool)
+        old, new = self._state, new_state
 
-        # ── AbsoluteHoldings ──────────────────────────────────────────────────
-        if "AbsoluteHoldings" in cfg:
-            params       = cfg["AbsoluteHoldings"]
-            ship_scale   = params.get("ship_scale",   0.01)
-            planet_scale = params.get("planet_scale", 1.0)
+        # ── planet / fleet arrays (post-step) ─────────────────────────────────
+        p_owner_n = np.asarray(new.planets.owner,      dtype=np.int32)
+        p_ships_n = np.asarray(new.planets.ships,      dtype=np.float32)
+        p_prod_n  = np.asarray(new.planets.production,  dtype=np.float32)
+        p_act_n   = np.asarray(new.planets.active,     dtype=bool)
+        p_comet_n = np.asarray(new.planets.is_comet,   dtype=bool)
+        valid_n   = p_act_n & ~p_comet_n
 
-            p_ships = np.asarray(new_state.planets.ships,      dtype=np.float32)
-            p_prod  = np.asarray(new_state.planets.production, dtype=np.float32)
-            f_ships = np.asarray(new_state.fleets.ships,  dtype=np.float32)
-            f_owner = np.asarray(new_state.fleets.owner,  dtype=np.int32)
-            f_act   = np.asarray(new_state.fleets.active, dtype=bool)
+        f_owner_n = np.asarray(new.fleets.owner,  dtype=np.int32)
+        f_ships_n = np.asarray(new.fleets.ships,  dtype=np.float32)
+        f_act_n   = np.asarray(new.fleets.active, dtype=bool)
 
-            my_p      = (p_owner_new == 0) & p_act_new
-            my_f      = (f_owner == 0) & f_act
-            my_ships  = (p_ships * my_p).sum(axis=1) + (f_ships * my_f).sum(axis=1)
-            my_prod   = (p_prod  * my_p).sum(axis=1)
-            rewards  += (ship_scale * my_ships + planet_scale * my_prod).astype(np.float32)
+        pids = np.arange(NP)[None, None, :]
 
-        # ── FleetLaunchPenalty ────────────────────────────────────────────────
-        if "FleetLaunchPenalty" in cfg:
-            ship_scale = cfg["FleetLaunchPenalty"].get("ship_scale", 0.5)
+        def _holdings(p_owner, p_ships, p_prod, valid, f_owner, f_ships, f_act):
+            """Return (ships[B,NP], prod[B,NP]) — planet+fleet ships and planet
+            production per player, mirroring _owned_ships / _owned_production."""
+            pm    = (p_owner[:, :, None] == pids) & valid[:, :, None]
+            ships = (p_ships[:, :, None] * pm).sum(axis=1)
+            prod  = (p_prod[:, :, None]  * pm).sum(axis=1)
+            fm    = (f_owner[:, :, None] == pids) & f_act[:, :, None]
+            ships = ships + (f_ships[:, :, None] * fm).sum(axis=1)
+            return ships.astype(np.float32), prod.astype(np.float32)
 
-            # Fleet counts before this step (self._state, not yet overwritten)
-            pf_owner = np.asarray(self._state.fleets.owner,  dtype=np.int32)
-            pf_act   = np.asarray(self._state.fleets.active, dtype=bool)
-            prev_f0  = ((pf_owner == 0) & pf_act).sum(axis=1)   # [B]
+        ships_post, prod_post = _holdings(
+            p_owner_n, p_ships_n, p_prod_n, valid_n,
+            f_owner_n, f_ships_n, f_act_n,
+        )
 
-            # Fleet counts after this step (new_state, before auto-reset)
-            nf_owner = np.asarray(new_state.fleets.owner,  dtype=np.int32)
-            nf_act   = np.asarray(new_state.fleets.active, dtype=bool)
-            new_f0   = ((nf_owner == 0) & nf_act).sum(axis=1)   # [B]
+        # ── pre-step holdings (only for delta-based components) ────────────────
+        _delta = {"RelativeShipAdvantage", "RelativeProductionAdvantage", "ShipGrowth"}
+        if names & _delta:
+            p_owner_o = np.asarray(old.planets.owner,    dtype=np.int32)
+            p_ships_o = np.asarray(old.planets.ships,    dtype=np.float32)
+            p_prod_o  = np.asarray(old.planets.production, dtype=np.float32)
+            valid_o   = (np.asarray(old.planets.active, dtype=bool)
+                         & ~np.asarray(old.planets.is_comet, dtype=bool))
+            f_owner_o = np.asarray(old.fleets.owner,  dtype=np.int32)
+            f_ships_o = np.asarray(old.fleets.ships,  dtype=np.float32)
+            f_act_o   = np.asarray(old.fleets.active, dtype=bool)
+            ships_pre, prod_pre = _holdings(
+                p_owner_o, p_ships_o, p_prod_o, valid_o,
+                f_owner_o, f_ships_o, f_act_o,
+            )
 
-            launched  = np.maximum(0, new_f0 - prev_f0)
-            rewards  -= (ship_scale * launched).astype(np.float32)
+        # ── terminal win/loss result (ship-count based, +1/-1/0 like Python) ──
+        if names & {"TerminalWinBonus", "TimeDecayWinBonus"}:
+            my       = ships_post[:, 0]
+            best_opp = ships_post[:, 1:].max(axis=1) if NP > 1 else np.zeros(B, np.float32)
+            result   = np.sign(my - best_opp).astype(np.float32)   # +1 / -1 / 0
 
-        # ── TimeDecayWinBonus ─────────────────────────────────────────────────
-        if "TimeDecayWinBonus" in cfg:
-            win_bonus = cfg["TimeDecayWinBonus"].get("win_bonus", 100.0)
-            max_s     = float(self._episode_steps)
+        # ── owned-planet slot masks (capture/loss components) ─────────────────
+        if names & {"ProductionPlanetDelta", "ProximityCaptureBonus"}:
+            p_owner_o2 = np.asarray(old.planets.owner,   dtype=np.int32)
+            valid_o2   = (np.asarray(old.planets.active, dtype=bool)
+                          & ~np.asarray(old.planets.is_comet, dtype=bool))
+            owned_old = (p_owner_o2 == 0) & valid_o2     # [B, P]
+            owned_new = (p_owner_n == 0)  & valid_n      # [B, P]
+            captured  = owned_new & ~owned_old
+            lost      = owned_old & ~owned_new
 
-            step_arr  = np.asarray(new_state.step, dtype=np.float32)  # [B]
-            decay     = np.maximum(0.0, (max_s - step_arr) / max(1.0, max_s - 1.0))
+        # ── exact per-step launched-fleet mask (slot range in circular buffer) ─
+        if names & {"FleetLaunchPenalty", "LaunchDistancePenalty"}:
+            MF       = f_owner_n.shape[1]
+            pre_ptr  = np.asarray(old.next_fleet_slot, dtype=np.int64)   # [B]
+            post_ptr = np.asarray(new.next_fleet_slot, dtype=np.int64)   # [B]
+            n_total  = post_ptr - pre_ptr                                 # [B] launches (all players)
+            slot_idx = np.arange(MF)[None, :]
+            rel      = (slot_idx - pre_ptr[:, None]) % MF
+            in_range = rel < n_total[:, None]                             # [B, MF]
+            # A fleet counts as "launched" only if it survived the step (Python
+            # sees it in new_obs); one that hit/oob/sun immediately is dropped.
+            p0_launched = in_range & (f_owner_n == 0) & f_act_n           # [B, MF]
 
-            win_mask  = (r_jax_np[:, 0] > 0) & dones_np
-            loss_mask = (r_jax_np[:, 0] < 0) & dones_np
-            rewards  += (win_bonus * decay * win_mask).astype(np.float32)
-            rewards  -= (win_bonus * decay * loss_mask).astype(np.float32)
+        # ── per-scheme contributions ──────────────────────────────────────────
+        for name, params in self._reward_cfg:
+            if name == "RelativeShipAdvantage":
+                s     = params.get("ship_scale", 0.01)
+                my_d  = ships_post[:, 0] - ships_pre[:, 0]
+                opp_d = (ships_post[:, 1:].sum(1) - ships_pre[:, 1:].sum(1))
+                rewards += (s * (my_d - opp_d)).astype(np.float32)
 
+            elif name == "RelativeProductionAdvantage":
+                s     = params.get("planet_scale", 1.0)
+                my_d  = prod_post[:, 0] - prod_pre[:, 0]
+                opp_d = (prod_post[:, 1:].sum(1) - prod_pre[:, 1:].sum(1))
+                rewards += (s * (my_d - opp_d)).astype(np.float32)
+
+            elif name == "ShipGrowth":
+                s    = params.get("ship_scale", 0.01)
+                ls   = params.get("loss_scale", 1.0)
+                my_d = ships_post[:, 0] - ships_pre[:, 0]
+                scale = np.where(my_d < 0, s * ls, s)
+                rewards += (scale * my_d).astype(np.float32)
+
+            elif name == "ProductionPlanetDelta":
+                ps   = params.get("planet_scale", 1.0)
+                ls   = params.get("loss_scale", 1.0)
+                ss   = params.get("ship_scale", 0.0)
+                p_ships_o = np.asarray(old.planets.ships, dtype=np.float32)
+                p_prod_o  = np.asarray(old.planets.production, dtype=np.float32)
+                cap_prod  = (p_prod_n * captured).sum(axis=1)
+                lost_prod = (p_prod_o * lost).sum(axis=1)
+                ship_cost = (np.log1p(np.maximum(0.0, p_ships_o)) * captured).sum(axis=1)
+                rewards += (ps * (cap_prod - ls * lost_prod)
+                            - ss * ship_cost).astype(np.float32)
+
+            elif name == "ProximityCaptureBonus":
+                scale    = params.get("scale", 1.0)
+                ref_dist = max(1e-6, params.get("ref_dist", 25.0))
+                px_n = np.asarray(new.planets.x, dtype=np.float32)
+                py_n = np.asarray(new.planets.y, dtype=np.float32)
+                px_o = np.asarray(old.planets.x, dtype=np.float32)
+                py_o = np.asarray(old.planets.y, dtype=np.float32)
+                # closeness of each captured planet (post pos) to each
+                # already-owned planet (pre pos), summed — [B, P_cap, P_owned]
+                dx = px_n[:, :, None] - px_o[:, None, :]
+                dy = py_n[:, :, None] - py_o[:, None, :]
+                close = np.exp(-np.sqrt(dx * dx + dy * dy) / ref_dist)
+                mask  = captured[:, :, None] & owned_old[:, None, :]
+                rewards += (scale * (close * mask).sum(axis=(1, 2))).astype(np.float32)
+
+            elif name == "AbsoluteHoldings":
+                ss = params.get("ship_scale", 0.01)
+                ps = params.get("planet_scale", 1.0)
+                rewards += (ss * ships_post[:, 0] + ps * prod_post[:, 0]).astype(np.float32)
+
+            elif name == "FleetLaunchPenalty":
+                s = params.get("ship_scale", 0.5)
+                rewards -= (s * p0_launched.sum(axis=1)).astype(np.float32)
+
+            elif name == "LaunchDistancePenalty":
+                rewards += self._launch_distance_penalty(new, p0_launched, params)
+
+            elif name == "StepPenalty":
+                rewards -= np.float32(params.get("weight", 0.1))
+
+            elif name == "TerminalWinBonus":
+                wb = params.get("win_bonus", 100.0)
+                rewards += (wb * result * dones_np).astype(np.float32)
+
+            elif name == "TimeDecayWinBonus":
+                wb    = params.get("win_bonus", 100.0)
+                max_s = float(self._episode_steps)
+                step_arr = np.asarray(new.step, dtype=np.float32)         # [B]
+                decay = np.clip((max_s - step_arr) / max(1.0, max_s - 1.0), 0.0, 1.0)
+                rewards += (wb * decay * result * dones_np).astype(np.float32)
+
+        return rewards
+
+    # -------------------------------------------------------------------------
+    # LaunchDistancePenalty — vectorised flight-time forward simulation
+    # -------------------------------------------------------------------------
+
+    def _launch_distance_penalty(self, new_state, launched_mask, params) -> np.ndarray:
+        """Penalise each fleet launched this step by how long it must fly to
+        reach a planet (or the full horizon if it reaches none).
+
+        Mirrors env/orbit_wars.py LaunchDistancePenalty / _fleet_flight_ticks:
+        the straight-line flight is replayed against the engine's swept-collision
+        model (with per-tick planet orbital motion), the source planet excluded.
+        All launched fleets across all envs are simulated together; the per-tick
+        loop is the only Python loop and short-circuits once every fleet resolves.
+        """
+        B         = self.num_envs
+        scale     = params.get("scale", 1.0)
+        time_norm = max(1e-6, params.get("time_norm", 20.0))
+        max_ticks = int(params.get("max_ticks", 120))
+
+        b_idx, slot_idx = np.where(launched_mask)
+        rewards = np.zeros(B, dtype=np.float32)
+        if len(b_idx) == 0:
+            return rewards
+
+        # Launched-fleet kinematics (post-step positions = start of the replay).
+        fx     = np.asarray(new_state.fleets.x,     dtype=np.float32)[b_idx, slot_idx]
+        fy     = np.asarray(new_state.fleets.y,     dtype=np.float32)[b_idx, slot_idx]
+        fang   = np.asarray(new_state.fleets.angle, dtype=np.float32)[b_idx, slot_idx]
+        fships = np.asarray(new_state.fleets.ships, dtype=np.float32)[b_idx, slot_idx]
+        fsrc   = np.asarray(new_state.fleets.from_planet, dtype=np.int32)[b_idx, slot_idx]
+        speed  = _fleet_speed_np(fships)                           # [F]
+
+        # Per-fleet planet arrays (gathered from each fleet's env).
+        px0   = np.asarray(new_state.planets.x,      dtype=np.float32)[b_idx]   # [F, P]
+        py0   = np.asarray(new_state.planets.y,      dtype=np.float32)[b_idx]
+        pr    = np.asarray(new_state.planets.radius, dtype=np.float32)[b_idx]
+        pact  = np.asarray(new_state.planets.active, dtype=bool)[b_idx]
+        pcom  = np.asarray(new_state.planets.is_comet, dtype=bool)[b_idx]
+        omega = np.asarray(new_state.angular_velocity, dtype=np.float32)[b_idx]  # [F]
+
+        P       = px0.shape[1]
+        p_index = np.arange(P)[None, :]
+        # Testable planets: active, non-comet, not the source planet.
+        testable = pact & ~pcom & (p_index != fsrc[:, None])      # [F, P]
+
+        orb     = np.sqrt((px0 - _CENTER) ** 2 + (py0 - _CENTER) ** 2)
+        ang0    = np.arctan2(py0 - _CENTER, px0 - _CENTER)
+        moving  = (omega[:, None] != 0.0) & ((orb + pr) < _ROT_LIMIT) & testable
+
+        cos_a, sin_a = np.cos(fang), np.sin(fang)
+        hit_tick = np.full(len(b_idx), float(max_ticks), dtype=np.float32)
+        done     = np.zeros(len(b_idx), dtype=bool)
+        fxp, fyp = fx.copy(), fy.copy()
+        pcxp, pcyp = px0.copy(), py0.copy()
+
+        for k in range(1, max_ticks + 1):
+            fxc = fx + cos_a * speed * k
+            fyc = fy + sin_a * speed * k
+            ang = ang0 + omega[:, None] * k
+            pcxc = np.where(moving, _CENTER + orb * np.cos(ang), px0)
+            pcyc = np.where(moving, _CENTER + orb * np.sin(ang), py0)
+
+            hit = _swept_pair_hit_batch(
+                fxp[:, None], fyp[:, None], fxc[:, None], fyc[:, None],
+                pcxp, pcyp, pcxc, pcyc, pr,
+            ) & testable                                           # [F, P]
+            any_hit = hit.any(axis=1) & ~done
+            hit_tick = np.where(any_hit, float(k), hit_tick)
+            done = done | any_hit
+
+            # Planet hit takes priority; only otherwise can a fleet miss (off the
+            # board or into the sun → charged the full horizon, hit_tick=max).
+            oob = (fxc < 0.0) | (fxc > 100.0) | (fyc < 0.0) | (fyc > 100.0)
+            sun = _seg_dist_to_center(fxp, fyp, fxc, fyc) < _SUN_RADIUS
+            done = done | ((oob | sun) & ~done)
+
+            if done.all():
+                break
+            fxp, fyp = fxc, fyc
+            pcxp, pcyp = pcxc, pcyc
+
+        total = np.zeros(B, dtype=np.float64)
+        np.add.at(total, b_idx, hit_tick)
+        rewards -= (scale * total / time_norm).astype(np.float32)
         return rewards

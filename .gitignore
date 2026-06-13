@@ -6,3 +6,6 @@ settings.json
 *:Zone.Identifier
 *.pt
 *.npz
+
+# TensorBoard event files
+runs/
