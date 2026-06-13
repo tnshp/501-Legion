@@ -227,7 +227,7 @@ def _state_to_obs(
     comets = []
     comet_planet_ids = []
     for g in range(MAX_COMET_GROUPS):
-        if path_indices[g] < 0:
+        if path_indices[g] < 0 or path_indices[g] >= path_lengths[g]:
             continue
         path_len = int(path_lengths[g])
         pids = [int(planet_slots[g, k]) for k in range(4)]

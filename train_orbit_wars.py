@@ -54,6 +54,11 @@ import threading
 import time
 from collections import deque
 
+# Grow VRAM on demand instead of JAX's default 75 % grab, so that the learner
+# process (torch + JaxReplayBuffer) and the actor subprocess (its own JAX env,
+# under jax_env.actor="mp_env") can share one GPU.  Must precede `import jax`.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import numpy as np
 import torch
 import jax
@@ -70,7 +75,11 @@ from env.orbit_wars import (
     # legacy numbered schemes (backward compatibility)
     RewardScheme1, RewardScheme2, RewardScheme3, RewardScheme4,
 )
-from agents.agent1  import RuleBasedAgent
+# NB: RuleBasedAgent (and the kaggle_environments chain it pulls in) is imported
+# lazily at its two Python-backend use sites.  Importing it at module scope breaks
+# the multiprocessing-`spawn` child that the JAX `actor: "mp_env"` loop launches:
+# spawn re-imports this module to rebuild __main__, and kaggle_environments'
+# `from .test_agents...` relative import raises under that re-import.
 
 try:
     import kaggle_environments.envs.orbit_wars.orbit_wars as _ow
@@ -132,6 +141,7 @@ class MixedAgent:
         self.random_ratio = float(random_ratio)
         self.send_prob    = float(send_prob)
         self.fleet_thrsh =  fleet_thrsh
+        from agents.agent1 import RuleBasedAgent   # lazy: see module-top note
         self._base        = RuleBasedAgent()
 
     def reset(self):
@@ -185,6 +195,7 @@ def make_env(n_players: int, opponent: str, MAX_PLANETS: int = 40, MAX_FLEETS: i
                    curriculum scheduling. Empty for non-mixed opponents.
     """
     if opponent == "rule_based":
+        from agents.agent1 import RuleBasedAgent   # lazy: see module-top note
         opps = [RuleBasedAgent() for _ in range(n_players - 1)]
     elif opponent == "random":
         opps = ["random"] * (n_players - 1)
@@ -522,6 +533,68 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Multiprocess actor worker (env in its own process) — see train_jax(actor=mp_env)
+#
+# The threaded actor-learner overlaps nothing: the JAX env's host-side obs
+# extraction holds the GIL, so it serialises against the GPU update on the other
+# thread (measured ~5x SLOWER than serial).  A separate PROCESS has its own GIL,
+# so env.step genuinely runs concurrently with the learner's gradient update.
+# This worker owns the JAX env(s); the learner (main process) keeps ALL the
+# bookkeeping (episodes, logging, checkpoints, rendering, update scheduling).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mp_env_actor_worker(conn, env_kw, num_envs_2p, num_envs_4p, capture_render):
+    """Subprocess: own env_2p (+env_4p), serve step requests over `conn`.
+
+    Protocol: send the initial concatenated reset obs once, then loop
+    {recv actions  →  send (next_obs, rewards, dones, wons, fleets_sent,
+    n_fleets, state0)} until a None sentinel arrives.  `state0` is the env_2p[0]
+    pre-step GameState snapshot (for rendering) or None.
+    """
+    env_2p = JaxVecEnvAdapter(num_envs=num_envs_2p, num_players=2, **env_kw)
+    env_4p = (JaxVecEnvAdapter(num_envs=num_envs_4p, num_players=4, **env_kw)
+              if num_envs_4p > 0 else None)
+
+    obs_2p, _ = env_2p.reset()
+    if env_4p is not None:
+        obs_4p, _ = env_4p.reset()
+        obs = np.concatenate([obs_2p, obs_4p], axis=0)
+    else:
+        obs = obs_2p
+    conn.send(obs)
+
+    try:
+        while True:
+            actions = conn.recv()
+            if actions is None:
+                break
+            state0 = None
+            if capture_render:
+                state0 = jax.tree_util.tree_map(
+                    lambda x: np.asarray(x[0]), env_2p._state)
+            if env_4p is not None:
+                n2, r2, d2, _, w2 = env_2p.step(actions[:num_envs_2p])
+                n4, r4, d4, _, w4 = env_4p.step(actions[num_envs_2p:])
+                next_obs = np.concatenate([n2, n4], axis=0)
+                rewards  = np.concatenate([r2, r4])
+                dones    = np.concatenate([d2, d4])
+                wons     = np.concatenate([w2, w4])
+                fleets_sent = env_2p.last_fleets_sent + env_4p.last_fleets_sent
+                n_fleets    = max(env_2p.last_n_fleets, env_4p.last_n_fleets)
+            else:
+                next_obs, rewards, dones, _, wons = env_2p.step(actions)
+                fleets_sent = env_2p.last_fleets_sent
+                n_fleets    = env_2p.last_n_fleets
+            conn.send((next_obs, rewards, dones, wons,
+                       fleets_sent, n_fleets, state0))
+    finally:
+        env_2p.close()
+        if env_4p is not None:
+            env_4p.close()
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JAX vectorised training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -601,14 +674,28 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     tanh_scale    = env_cfg.get("tanh_scale",    0.2)
     min_fleet_ships = env_cfg.get("min_fleet_ships", 3)
     use_jax_buffer  = jax_cfg.get("jax_buffer",  False)
-    # Actor-learner threading: run env rollout and SAC updates on separate
-    # threads so the (CPU-heavy) JAX env step overlaps with the (GPU-heavy)
-    # gradient update instead of running serially.  See _run_actor_learner.
-    threaded        = jax_cfg.get("threaded", True)
+    # Rollout/learner overlap mode (jax_env.actor, default falls back to the
+    # legacy jax_env.threaded bool):
+    #   "mp_env"  — env in a SEPARATE PROCESS, learner in the main process; the
+    #               only mode that truly overlaps the CPU env.step with the GPU
+    #               update (~1.5x over serial).  Action selection stays on the
+    #               learner so the policy is always current.  Not for self_play
+    #               (opponent policy lives inside the env process).
+    #   "thread"  — legacy actor-learner threads (GIL-bound; ~5x SLOWER, kept for
+    #               reference / self_play).
+    #   "serial"  — single-threaded loop.
     actor_sync_every = jax_cfg.get("actor_sync_every", 2)   # gradient UPDATES between actor weight syncs
     rollout_lead    = jax_cfg.get("rollout_lead", 8)        # max vsteps the env may lead the learner
-
     opponent = env_cfg.get("opponent", "random")
+
+    _actor_default = "thread" if jax_cfg.get("threaded", True) else "serial"
+    actor_mode = jax_cfg.get("actor", _actor_default)
+    if actor_mode == "mp_env" and opponent == "self_play":
+        print("actor='mp_env' is unsupported with opponent='self_play' "
+              "(opponent policy lives in the env process) — falling back to 'thread'.")
+        actor_mode = "thread"
+    mp_env   = (actor_mode == "mp_env")
+    threaded = (actor_mode == "thread")
     ratio_4p = env_cfg.get("ratio_4p", 0.0)
 
     # ── Split envs between 2p and 4p ─────────────────────────────────────────
@@ -717,12 +804,18 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
             env_4p.set_policy(trainer.select_action_batch)
 
     # ── Reset envs ────────────────────────────────────────────────────────────
-    obs_2p, _ = env_2p.reset()
-    if env_4p is not None:
-        obs_4p, _ = env_4p.reset()
-        obs_batch = np.concatenate([obs_2p, obs_4p], axis=0)
+    # In mp_env mode the actor SUBPROCESS owns + resets the envs and sends the
+    # initial obs; resetting the main-process envs here would needlessly JIT and
+    # allocate a second env copy, so skip it (obs_batch comes from the worker).
+    if mp_env:
+        obs_batch = None
     else:
-        obs_batch = obs_2p
+        obs_2p, _ = env_2p.reset()
+        if env_4p is not None:
+            obs_4p, _ = env_4p.reset()
+            obs_batch = np.concatenate([obs_2p, obs_4p], axis=0)
+        else:
+            obs_batch = obs_2p
 
     # ── Training state ────────────────────────────────────────────────────────
     episode_wins:    list[bool]  = []
@@ -762,6 +855,156 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     t0 = time.perf_counter()
 
     print(f"Running until {num_episodes} episodes complete...")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Multiprocess-actor loop (jax_env.actor="mp_env")
+    #
+    # The env lives in a subprocess; this (learner) process keeps all bookkeeping.
+    # One-transition-lag pipeline: dispatch update() for the data already in the
+    # buffer WHILE the actor steps the env for the actions just sent, so the
+    # CPU env.step truly overlaps the GPU update (threads can't — shared GIL).
+    # Action selection stays here, so the rollout policy is always the latest.
+    # ═════════════════════════════════════════════════════════════════════════
+    if mp_env:
+        import multiprocessing as mp
+        print("Actor in SUBPROCESS (mp_env) — env.step overlaps the GPU update")
+
+        ctx = mp.get_context("spawn")        # fork is unsafe once CUDA is init'd
+        parent_conn, child_conn = ctx.Pipe()
+        actor_proc = ctx.Process(
+            target=_mp_env_actor_worker,
+            args=(child_conn, _env_kw, num_envs_2p, num_envs_4p,
+                  render_interval > 0),
+            daemon=True)
+        actor_proc.start()
+        child_conn.close()                    # parent keeps only its end
+
+        obs_batch = parent_conn.recv()        # initial reset obs from the actor
+
+        def _select(o):
+            if trainer.train_step < warmup_steps:
+                return np.stack([env_2p.action_space.sample()
+                                 for _ in range(num_envs)])
+            return trainer.select_action_batch(o)
+
+        # Prime: dispatch the first env step so the actor is busy during update #0.
+        prev_actions = _select(obs_batch)
+        prev_obs     = obs_batch
+        parent_conn.send(prev_actions)
+
+        while episodes_done < num_episodes:
+            # ── gradient updates — overlap the actor stepping prev_actions ────
+            if (trainer.train_step >= warmup_steps
+                    and len(trainer.replay_buffer) >= batch_size):
+                upd_debt += num_envs / update_freq
+                while upd_debt >= 1.0:
+                    for _ in range(gradient_steps):
+                        trainer.update()
+                    upd_debt -= 1.0
+
+            # ── env-step result for prev_actions ─────────────────────────────
+            (next_obs, rewards, dones, wons,
+             fleets_sent, n_fleets, state0) = parent_conn.recv()
+
+            if render_interval > 0 and state0 is not None:
+                _ep_states_0.append(state0)
+
+            trainer.replay_buffer.add_batch(
+                prev_obs, prev_actions, rewards, next_obs, dones.astype(np.float32))
+            trainer.train_step += num_envs
+
+            ep_rewards[:] += rewards
+            ep_steps[:]   += 1
+            for r in rewards:
+                reward_window.append(float(r))
+            fleets_window.append(fleets_sent)
+            max_fleets_seen = max(max_fleets_seen, n_fleets)
+
+            if trainer.writer:
+                trainer.writer.add_scalar("Reward/step_ma100",
+                                          float(np.mean(reward_window)), trainer.train_step)
+                trainer.writer.add_scalar("Policy/fleets_sent_ma50",
+                                          float(np.mean(fleets_window)), trainer.train_step)
+                trainer.writer.add_scalar("Env/fleets_present",
+                                          n_fleets, trainer.train_step)
+                trainer.writer.add_scalar("Env/fleets_present_max",
+                                          max_fleets_seen, trainer.train_step)
+
+            # ── finished episodes ────────────────────────────────────────────
+            for i in range(num_envs):
+                if dones[i]:
+                    episode_wins.append(bool(wons[i]))
+                    episode_rewards.append(float(ep_rewards[i]))
+                    ep_idx = episodes_done
+                    if trainer.writer:
+                        trainer.writer.add_scalar("Misc/episode_length", int(ep_steps[i]), ep_idx)
+                        trainer.writer.add_scalar("Misc/buffer_fill", len(trainer.replay_buffer), ep_idx)
+                        trainer.writer.add_scalar("Misc/env_steps", trainer.train_step, ep_idx)
+                        trainer.writer.add_scalar("Reward/win", 1.0 if wons[i] else 0.0, ep_idx)
+                        trainer.writer.add_scalar("Reward/win_rate_10ep",
+                                                  float(np.mean(episode_wins[-10:])) * 100, ep_idx)
+                    episodes_done += 1
+                    ep_rewards[i] = 0.0
+                    ep_steps[i]   = 0
+                    if render_interval > 0 and i == 0:
+                        _ep_states_0_complete = _ep_states_0
+                        _ep_states_0_won      = bool(wons[0])
+                        _ep_states_0          = []
+
+            # ── select next actions and dispatch NOW so the actor overlaps the
+            #    next iteration's update ────────────────────────────────────────
+            obs_batch = next_obs
+            if episodes_done < num_episodes:
+                prev_actions = _select(obs_batch)
+                prev_obs     = obs_batch
+                parent_conn.send(prev_actions)
+
+            # ── console log ──────────────────────────────────────────────────
+            if episodes_done // log_interval > last_log_ep:
+                last_log_ep = episodes_done // log_interval
+                recent_r   = episode_rewards[-log_interval:]
+                recent_w   = episode_wins[-log_interval:]
+                avg_reward = float(np.mean(recent_r))
+                win_rate   = float(np.mean(recent_w)) * 100 if recent_w else 0.0
+                elapsed    = time.perf_counter() - t0
+                print(
+                    f"Ep {episodes_done:>5}/{num_episodes} | "
+                    f"Avg({log_interval}): {avg_reward:+8.3f} | "
+                    f"Win%: {win_rate:5.1f} | "
+                    f"Buffer: {len(trainer.replay_buffer):>7} | "
+                    f"Steps: {trainer.train_step:>9} | "
+                    f"Upd: {trainer._update_count:>7} | "
+                    f"{elapsed:.0f}s"
+                )
+
+            # ── checkpoint ───────────────────────────────────────────────────
+            if episodes_done // save_interval > last_ckpt_ep:
+                last_ckpt_ep = episodes_done // save_interval
+                trainer.save_checkpoint(os.path.join(ckpt_dir, f"sac_ep{episodes_done:05d}.pt"))
+                trainer.save_replay_buffer(buffer_path)
+
+            # ── render (background subprocess) ───────────────────────────────
+            if (render_interval > 0
+                    and episodes_done // render_interval > last_render_ep
+                    and _ep_states_0_complete is not None):
+                last_render_ep = episodes_done // render_interval
+                if _render_proc is None or _render_proc.poll() is not None:
+                    result_tag = "WIN" if _ep_states_0_won else "LOSS"
+                    html_path  = os.path.join(
+                        render_dir, f"ep{episodes_done:05d}_jax_{result_tag}.html")
+                    with open(_render_states_file, "wb") as _fh:
+                        pickle.dump(_ep_states_0_complete, _fh)
+                    _render_proc = subprocess.Popen(
+                        [sys.executable, _render_script,
+                         "--states-file", _render_states_file,
+                         "--final-won",   "true" if _ep_states_0_won else "false",
+                         "--output",      html_path],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        parent_conn.send(None)                # stop the actor
+        actor_proc.join(timeout=10)
+        if actor_proc.is_alive():
+            actor_proc.terminate()
 
     # ═════════════════════════════════════════════════════════════════════════
     # Actor-learner threaded loop
@@ -1010,8 +1253,8 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         learner_t.join()
         episodes_done = shared_ep["done"]
 
-    # ── Serial main loop (fallback; jax_env.threaded=false) ───────────────────
-    while (not threaded) and episodes_done < num_episodes:
+    # ── Serial main loop (fallback; jax_env.actor="serial") ───────────────────
+    while (not threaded) and (not mp_env) and episodes_done < num_episodes:
         # ── action selection ─────────────────────────────────────────────────
         if trainer.train_step < warmup_steps:
             actions = np.stack([

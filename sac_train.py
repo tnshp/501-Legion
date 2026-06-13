@@ -426,6 +426,13 @@ class SACTrainer:
     ):
         self.env           = env
         self._compile_mode = (compile_mode or "default")
+        # "cudagraph": capture the WHOLE update() (fwd+bwd+optim+polyak for all
+        # three nets) into one replayable CUDA graph — see _build_cudagraph.  This
+        # is the cure for the launch-bound update (low GPU util, small model) that
+        # torch.compile's auto-cudagraphs (reduce-overhead) can't deliver here
+        # because SAC's combined policy backward aliases their shared memory pool.
+        self._use_cudagraph = (self._compile_mode == "cudagraph")
+        self._cudagraph     = None     # lazily captured on the first update()
         self.device        = device
         # Enable TF32 matmul/conv on Ampere+ GPUs: the transformer is matmul-bound
         # and TF32 runs those ~1.5-2x faster with precision loss that is immaterial
@@ -531,7 +538,15 @@ class SACTrainer:
         #   "max-autotune"    — autotune GEMMs (long compile; best steady-state)
         if (self._compile_mode != "none" and self._dev_type == "cuda"
                 and hasattr(torch, "compile")):
-            _ckw = {} if self._compile_mode == "default" else {"mode": self._compile_mode}
+            # cudagraph mode still compiles with DEFAULT (inductor fusion → fewer,
+            # bigger kernels); the manual CUDA-graph capture then eliminates the
+            # per-kernel launch overhead on top.  Fusion alone (default) leaves the
+            # launches; capture of unfused eager kernels is slower than fused — we
+            # need both.
+            if self._compile_mode in ("default", "cudagraph"):
+                _ckw = {}
+            else:
+                _ckw = {"mode": self._compile_mode}
             self.policy_net = torch.compile(self.policy_net, **_ckw)
             self.q1_net     = torch.compile(self.q1_net,     **_ckw)
             self.q2_net     = torch.compile(self.q2_net,     **_ckw)
@@ -548,6 +563,10 @@ class SACTrainer:
         adam_kw = {}
         if torch.device(self.device).type == "cuda":
             adam_kw["fused"] = True
+            # capturable=True keeps Adam's step counter on the GPU (no host sync),
+            # which is mandatory for the optimiser step to run inside a CUDA graph.
+            if self._use_cudagraph:
+                adam_kw["capturable"] = True
         self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate, **adam_kw)
         self.q1_optimizer     = optim.Adam(self.q1_net.parameters(),     lr=learning_rate, **adam_kw)
         self.q2_optimizer     = optim.Adam(self.q2_net.parameters(),     lr=learning_rate, **adam_kw)
@@ -577,8 +596,15 @@ class SACTrainer:
         target.load_state_dict(source.state_dict())
 
     def _soft_update(self, target: nn.Module, source: nn.Module):
-        for tp, sp in zip(target.parameters(), source.parameters()):
-            tp.data.copy_(self.tau * sp.data + (1.0 - self.tau) * tp.data)
+        # Polyak: tp ← (1-τ)·tp + τ·sp.  lerp_(b, w): a ← a + w·(b−a), which is
+        # exactly this.  Done as ONE fused _foreach_ kernel instead of ~4 kernel
+        # launches per parameter (×~65 params ×2 target nets, every update) — pure
+        # launch overhead that dominates when the model is small and the loop is
+        # launch-bound rather than compute-bound.
+        with torch.no_grad():
+            torch._foreach_lerp_(
+                list(target.parameters()), list(source.parameters()), self.tau
+            )
 
     @staticmethod
     def _grad_norm(net: nn.Module) -> float:
@@ -651,6 +677,128 @@ class SACTrainer:
     # Gradient update — SAC v2
     # =========================================================================
 
+    # ── CUDA-graph update (compile_mode="cudagraph") ─────────────────────────
+
+    def _clip_grads_(self, params) -> None:
+        """In-place global grad-norm clip with NO host sync (capturable).
+
+        nn.utils.clip_grad_norm_ reads the total norm to the host to decide
+        whether to scale, which breaks CUDA-graph capture.  This computes the
+        scale entirely on-device: coef = clamp(max_norm / ‖g‖, ≤1), g *= coef.
+        """
+        if self.max_grad_norm is None:
+            return
+        grads = [p.grad for p in params if p.grad is not None]
+        if not grads:
+            return
+        total = torch.norm(torch.stack(torch._foreach_norm(grads)))
+        coef  = torch.clamp(self.max_grad_norm / (total + 1e-6), max=1.0)
+        torch._foreach_mul_(grads, coef)
+
+    def _graph_update_body(self) -> None:
+        """The full SAC update on the STATIC graph buffers (self._g_*).
+
+        Identical math to the eager update() below; written against fixed-address
+        tensors so it can be captured once and replayed.  Grad clipping uses the
+        sync-free _clip_grads_; zero_grad(set_to_none=False) keeps grad addresses
+        stable across replays.  alpha/gamma/tau are baked as constants (cudagraph
+        requires auto_alpha=False).
+        """
+        s, a, r        = self._g_states, self._g_actions, self._g_rewards
+        ns, d          = self._g_next_states, self._g_dones
+        with self._autocast():
+            with torch.no_grad():
+                a_next, lp_next = self._sample(self.policy_net, ns)
+                q1_next = self.q1_target(ns, a_next).unsqueeze(-1)
+                q2_next = self.q2_target(ns, a_next).unsqueeze(-1)
+                q_target = (r + (1.0 - d) * self.gamma * (
+                    torch.min(q1_next, q2_next) - self.alpha * lp_next)).float()
+                q_target = torch.nan_to_num(q_target, nan=0.0, posinf=0.0, neginf=0.0)
+            q1_pred = self.q1_net(s, a).unsqueeze(-1)
+            q1_loss = nn.functional.mse_loss(q1_pred, q_target)
+        self.q1_optimizer.zero_grad(set_to_none=False)
+        q1_loss.backward()
+        self._clip_grads_(self.q1_net.parameters())
+        self.q1_optimizer.step()
+
+        with self._autocast():
+            q2_pred = self.q2_net(s, a).unsqueeze(-1)
+            q2_loss = nn.functional.mse_loss(q2_pred, q_target)
+        self.q2_optimizer.zero_grad(set_to_none=False)
+        q2_loss.backward()
+        self._clip_grads_(self.q2_net.parameters())
+        self.q2_optimizer.step()
+
+        with self._autocast():
+            a_tilde, lp = self._sample(self.policy_net, s)
+            q1_pi = self.q1_net(s, a_tilde).unsqueeze(-1)
+            q2_pi = self.q2_net(s, a_tilde).unsqueeze(-1)
+            policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
+        self.policy_optimizer.zero_grad(set_to_none=False)
+        policy_loss.backward()
+        self._clip_grads_(self.policy_net.parameters())
+        self.policy_optimizer.step()
+
+        self._soft_update(self.q1_target, self.q1_net)
+        self._soft_update(self.q2_target, self.q2_net)
+
+        # Stash losses in static buffers so logging can read them after replay.
+        self._g_q1_loss.copy_(q1_loss.detach())
+        self._g_q2_loss.copy_(q2_loss.detach())
+        self._g_policy_loss.copy_(policy_loss.detach())
+
+    def _build_cudagraph(self, states, actions, rewards, next_states, dones) -> None:
+        """Allocate static buffers, warm up, and capture the update graph."""
+        self._g_states      = states.clone()
+        self._g_actions     = actions.clone()
+        self._g_rewards     = rewards.clone()
+        self._g_next_states = next_states.clone()
+        self._g_dones       = dones.clone()
+        self._g_q1_loss     = torch.zeros((), device=self.device)
+        self._g_q2_loss     = torch.zeros((), device=self.device)
+        self._g_policy_loss = torch.zeros((), device=self.device)
+
+        # Warm up on a side stream so optimiser state + autograd grad tensors are
+        # allocated and cuBLAS/cuDNN pick algorithms BEFORE capture (required).
+        warm = torch.cuda.Stream()
+        warm.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warm):
+            for _ in range(3):
+                self._graph_update_body()
+        torch.cuda.current_stream().wait_stream(warm)
+
+        self._cudagraph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._cudagraph):
+            self._graph_update_body()
+
+    def _update_cudagraph(self) -> None:
+        """Sample → copy into static buffers → replay the captured update."""
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(
+            self.batch_size)
+        states      = self.state_preprocessor (self._to(states))
+        actions     = self.action_preprocessor(self._to(actions))
+        rewards     = self._to(rewards)
+        next_states = self.state_preprocessor (self._to(next_states))
+        dones       = self._to(dones)
+
+        if self._cudagraph is None:
+            self._build_cudagraph(states, actions, rewards, next_states, dones)
+        else:
+            self._g_states.copy_(states)
+            self._g_actions.copy_(actions)
+            self._g_rewards.copy_(rewards)
+            self._g_next_states.copy_(next_states)
+            self._g_dones.copy_(dones)
+            self._cudagraph.replay()
+
+        self._update_count += 1
+        if self.writer is not None and self._update_count % self._tb_log_every == 0:
+            s = self._update_count
+            self.writer.add_scalar("Loss/q1",     self._g_q1_loss.item(),     s)
+            self.writer.add_scalar("Loss/q2",     self._g_q2_loss.item(),     s)
+            self.writer.add_scalar("Loss/policy", self._g_policy_loss.item(), s)
+        return None
+
     def update(self, _profile: bool = False) -> Optional[Dict[str, float]]:
         """
         One SAC v2 gradient step.  train_step is NOT incremented here —
@@ -661,6 +809,9 @@ class SACTrainer:
 
         if self.use_lambda_returns:
             return self._lambda_update()
+
+        if self._use_cudagraph and not self.auto_alpha:
+            return self._update_cudagraph()
 
         def _ck() -> float:
             if _profile and self._dev_type == "cuda":
@@ -682,8 +833,12 @@ class SACTrainer:
         # ── Q-targets ─────────────────────────────────────────────────────────
         with torch.no_grad(), self._autocast():
             a_next, lp_next = self._sample(self.policy_net, next_states)
-            q1_next = self.q1_target(next_states, a_next).unsqueeze(-1)
-            q2_next = self.q2_target(next_states, a_next).unsqueeze(-1)
+            # clone(): under compile_mode="reduce-overhead" each compiled forward
+            # returns a view into a shared CUDA-graph static buffer that the NEXT
+            # compiled call overwrites.  q1_next must survive the q2_target call
+            # below (both feed torch.min), so copy it out of the graph pool.
+            q1_next = self.q1_target(next_states, a_next).unsqueeze(-1).clone()
+            q2_next = self.q2_target(next_states, a_next).unsqueeze(-1).clone()
             q_target = (rewards + (1.0 - dones) * self.gamma * (
                 torch.min(q1_next, q2_next) - self.alpha * lp_next
             )).float()
@@ -716,8 +871,10 @@ class SACTrainer:
         # ── Policy update ──────────────────────────────────────────────────────
         with self._autocast():
             a_tilde, lp = self._sample(self.policy_net, states)
-            q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
-            q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
+            # clone(): q1_pi must survive the q2_net call before torch.min — see
+            # the q1_next clone() note above (CUDA-graph buffer reuse).
+            q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1).clone()
+            q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1).clone()
             policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
@@ -814,7 +971,9 @@ class SACTrainer:
                 ns = torch.from_numpy(next_states_np[i:i + chunk])
                 ns = self.state_preprocessor(self._to(ns))
                 a, lp = self._sample(self.policy_net, ns)          # a:[c,...], lp:[c,1]
-                q1 = self.q1_net(ns, a).unsqueeze(-1)              # [c,1]
+                # clone() q1 so the q2_net call can't overwrite it in the shared
+                # CUDA-graph buffer before torch.min (reduce-overhead mode).
+                q1 = self.q1_net(ns, a).unsqueeze(-1).clone()      # [c,1]
                 q2 = self.q2_net(ns, a).unsqueeze(-1)              # [c,1]
                 v  = torch.min(q1, q2) - self.alpha * lp           # [c,1]
                 out.append(v.squeeze(-1).float().cpu().numpy())
@@ -929,8 +1088,10 @@ class SACTrainer:
         # ── Policy update — identical SAC actor objective ─────────────────────
         with self._autocast():
             a_tilde, lp = self._sample(self.policy_net, states)
-            q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1)
-            q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1)
+            # clone(): q1_pi must survive the q2_net call before torch.min, since
+            # reduce-overhead returns views into a reused CUDA-graph buffer.
+            q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1).clone()
+            q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1).clone()
             policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
