@@ -24,7 +24,7 @@
     "max_steps": 500
   },
   "td_lambda": {
-    "enabled": false,
+    "enabled": true,
     "lambda": 0.9,
     "cache_size": 8000,
     "block_size": 50,
