@@ -66,11 +66,26 @@ import jax
 from model.SAC      import P_network, Q_network
 from model          import action_decoder as _action_decoder
 from sac_train      import SACTrainer
-# This branch trains exclusively on the JAX parallel environment (jax_env/).  The
-# Python/kaggle environment (env/orbit_wars.py) is kept only for evaluation and
-# submission and is intentionally NOT imported here — that also keeps the
-# multiprocessing-`spawn` child the mp_env loop launches free of kaggle_environments
-# (whose `from .test_agents...` relative import breaks under spawn's re-import).
+from env.orbit_wars import (
+    OrbitWarsEnv,
+    # composable reward components
+    RelativeShipAdvantage, RelativeProductionAdvantage,
+    ShipGrowth, ProductionPlanetDelta, ProximityCaptureBonus,
+    AbsoluteHoldings, FleetLaunchPenalty, LaunchDistancePenalty, StepPenalty,
+    TerminalWinBonus, TimeDecayWinBonus,
+    # legacy numbered schemes (backward compatibility)
+    RewardScheme1, RewardScheme2, RewardScheme3, RewardScheme4,
+)
+# NB: RuleBasedAgent (and the kaggle_environments chain it pulls in) is imported
+# lazily at its two Python-backend use sites.  Importing it at module scope breaks
+# the multiprocessing-`spawn` child that the JAX `actor: "mp_env"` loop launches:
+# spawn re-imports this module to rebuild __main__, and kaggle_environments'
+# `from .test_agents...` relative import raises under that re-import.
+
+try:
+    import kaggle_environments.envs.orbit_wars.orbit_wars as _ow
+except ImportError:
+    _ow = None
 
 try:
     from jax_env import JaxVecEnvAdapter
@@ -102,6 +117,420 @@ def _make_schedule(schedule_type: str):
     if schedule_type == "linear":
         return _linear_schedule
     raise ValueError(f"Unknown schedule type: {schedule_type!r}. Use 'linear' or 'exponential'.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mixed opponent (per-step blend of random and rule-based)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MixedAgent:
+    """
+    Per-step blend of random and rule-based actions.
+
+    At every call, independently samples whether to act randomly or rely on the
+    wrapped RuleBasedAgent.
+
+        random_ratio = 1.0  → every step is random
+        random_ratio = 0.0  → every step is rule-based
+        random_ratio = 0.5  → ~50/50 mix
+
+    Random actions: for each owned planet, with probability `send_prob`, launch
+    a fleet at a random angle with a random ship count (1..ships).
+    """
+
+    def __init__(self, random_ratio: float = 0.5, send_prob: float = 0.3, fleet_thrsh: int = 20):
+        self.random_ratio = float(random_ratio)
+        self.send_prob    = float(send_prob)
+        self.fleet_thrsh =  fleet_thrsh
+        from agents.agent1 import RuleBasedAgent   # lazy: see module-top note
+        self._base        = RuleBasedAgent()
+
+    def reset(self):
+        if hasattr(self._base, "reset"):
+            self._base.reset()
+
+    def __call__(self, obs, config=None):
+        if random.random() < self.random_ratio:
+            return self._random_action(obs)
+        return self._base(obs, config)
+
+    def _random_action(self, obs):
+        if _ow is None:
+            return []
+        player = obs.get("player", -2)
+        planets = [_ow.Planet(*p) for p in obs.get("planets", [])]
+        moves = []
+        for p in planets:
+            if p.owner != player or p.ships < 1:
+                continue
+            if random.random() >= self.send_prob:
+                continue
+            if p.ships < self.fleet_thrsh:
+                continue
+            ships = random.randint(self.fleet_thrsh, int(p.ships))
+            angle = random.uniform(0.0, 2.0 * math.pi)
+            moves.append([p.id, angle, ships])
+        return moves
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment factory
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_env(n_players: int, opponent: str, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100,
+             reward_scheme=None, mixed_random_ratio: float = 0.5,
+             mixed_send_prob: float = 0.3,
+             tanh_scale: float = 0.2, min_fleet_ships: int = 3):
+    """
+    Build an OrbitWarsEnv.  Opponent choices: rule_based | random | mixed.
+
+    "mixed" uses MixedAgent: each step independently chooses between random
+    and rule-based actions based on `mixed_random_ratio` (1.0 → fully random,
+    0.0 → fully rule-based).
+
+    Returns
+    -------
+    env          : OrbitWarsEnv
+    mixed_agents : list[MixedAgent]  — MixedAgent instances whose .random_ratio
+                   can be updated each episode by the training loop to implement
+                   curriculum scheduling. Empty for non-mixed opponents.
+    """
+    if opponent == "rule_based":
+        from agents.agent1 import RuleBasedAgent   # lazy: see module-top note
+        opps = [RuleBasedAgent() for _ in range(n_players - 1)]
+    elif opponent == "random":
+        opps = ["random"] * (n_players - 1)
+    elif opponent == "mixed":
+        opps = [
+            MixedAgent(random_ratio=mixed_random_ratio, send_prob=mixed_send_prob)
+            for _ in range(n_players - 1)
+        ]
+    else:
+        raise ValueError(f"Unknown opponent: {opponent!r}")
+
+    mixed_agents = [a for a in opps if isinstance(a, MixedAgent)]
+
+    env = OrbitWarsEnv(opponent=opps, player_id=0, n_players=n_players,
+                       reward_scheme=reward_scheme,
+                       tanh_scale=tanh_scale, min_fleet_ships=min_fleet_ships)
+    env.MAX_FLEETS  = MAX_FLEETS
+    env.MAX_PLANETS = MAX_PLANETS
+    return env, mixed_agents
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> list[float]:
+    """Train SAC agent using configuration from JSON.
+
+    Parameters
+    ----------
+    config : dict
+        Training configuration loaded from JSON file
+    reward_scheme : list[RewardScheme]
+        List of reward scheme instances (initialized separately)
+    MAX_PLANETS, MAX_FLEETS : int
+        Environment constants
+    """
+    # Extract config sections
+    train_cfg = config.get("training", {})
+    env_cfg = config.get("environment", {})
+    curr_cfg = config.get("curriculum", {})
+    io_cfg = config.get("io", {})
+    exec_cfg = config.get("execution", {})
+    model_cfg = config.get("model", {})
+    if reward_scheme is None:
+        reward_scheme = [RewardScheme1()]
+
+    cpu_force = exec_cfg.get("cpu_force", False)
+    device = "cuda" if torch.cuda.is_available() and not cpu_force else "cpu"
+    print(f"Device: {device}")
+
+    ckpt_dir = io_cfg.get("ckpt_dir", "checkpoints")
+    render_dir = io_cfg.get("render_dir", "replays")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(render_dir, exist_ok=True)
+    # Replay buffer is persisted alongside checkpoints so a resumed run does not
+    # have to rebuild it from scratch.
+    buffer_path = os.path.join(ckpt_dir, "replay_buffer.npz")
+
+    num_episodes = train_cfg.get("num_episodes", 250)
+
+    opponent        = env_cfg.get("opponent",        "rule_based")
+    ratio_4p        = env_cfg.get("ratio_4p",        0.3)
+    mixed_send_prob = env_cfg.get("mixed_send_prob", 0.3)
+    tanh_scale      = env_cfg.get("tanh_scale",      0.2)
+    min_fleet_ships = env_cfg.get("min_fleet_ships",  3)
+
+    # ── mixed_random_ratio scheduler (curriculum) ────────────────────────────
+    ratio_start     = curr_cfg.get("mixed_random_ratio_start",    1.0)
+    ratio_end       = curr_cfg.get("mixed_random_ratio_end",       0.0)
+    ratio_decay     = curr_cfg.get("mixed_random_ratio_decay")
+    ratio_schedule  = curr_cfg.get("mixed_random_ratio_schedule", "linear")
+    ratio_decay_eps = ratio_decay if ratio_decay is not None else num_episodes
+    schedule_fn     = _make_schedule(ratio_schedule)
+
+    if opponent == "mixed":
+        print(f"Mixed opponent: random_ratio {ratio_start:.2f} → {ratio_end:.2f} "
+              f"over {ratio_decay_eps} episodes ({ratio_schedule}), "
+              f"send_prob={mixed_send_prob:.2f}")
+
+    # ── envs ──────────────────────────────────────────────────────────────────
+    env_2p, mixed_2p = make_env(
+        n_players=2, opponent=opponent,
+        MAX_PLANETS=MAX_PLANETS, MAX_FLEETS=MAX_FLEETS, reward_scheme=reward_scheme,
+        mixed_random_ratio=ratio_start, mixed_send_prob=mixed_send_prob,
+        tanh_scale=tanh_scale, min_fleet_ships=min_fleet_ships,
+    )
+    if ratio_4p > 0.0:
+        env_4p, mixed_4p = make_env(
+            n_players=4, opponent=opponent,
+            MAX_PLANETS=MAX_PLANETS, MAX_FLEETS=MAX_FLEETS, reward_scheme=reward_scheme,
+            mixed_random_ratio=ratio_start, mixed_send_prob=mixed_send_prob,
+            tanh_scale=tanh_scale, min_fleet_ships=min_fleet_ships,
+        )
+    else:
+        env_4p, mixed_4p = None, []
+
+    all_mixed_agents = mixed_2p + mixed_4p
+
+    # ── networks — action_dim=4 to match OrbitWarsEnv.ACTION_DIM ─────────────
+    d_model = model_cfg.get("d_model", 128)
+    net_kw = dict(
+        state_dim       = OrbitWarsEnv.STATE_DIM,    # 14
+        action_dim      = OrbitWarsEnv.ACTION_DIM,   # 4
+        max_planets     = OrbitWarsEnv.MAX_PLANETS,  # 40
+        max_fleets      = OrbitWarsEnv.MAX_FLEETS,   # 100
+        d_model         = d_model,
+        dim_feedforward = model_cfg.get("ff_dim", 512),
+        # Wire transformer depth/width from config — these were previously dropped,
+        # so the nets silently used the class default of num_layers=3 (config says 2),
+        # i.e. ~50% more transformer compute than intended.
+        num_layers      = model_cfg.get("num_layers", 2),
+        nhead           = model_cfg.get("num_heads", 4),
+    )
+    policy_net = P_network(**net_kw)
+    q1_net     = Q_network(**net_kw)
+    q2_net     = Q_network(**net_kw)
+
+    # ── SACTrainer — env_2p provides obs/act shapes for the replay buffer ─────
+    lr = train_cfg.get("lr", 3e-4)
+    gamma = train_cfg.get("gamma", 0.99)
+    tau = train_cfg.get("tau", 5e-3)
+    alpha = train_cfg.get("alpha", 0.2)
+    auto_alpha = train_cfg.get("auto_alpha", False)
+    target_entropy = train_cfg.get("target_entropy")
+    buffer_size = train_cfg.get("buffer_size", 100_000)
+    batch_size = train_cfg.get("batch_size", 64)
+    max_grad_norm = train_cfg.get("grad_clip", 1.0)
+    log_dir = io_cfg.get("log_dir")
+
+    # ── cache-based TD(λ) (optional; replaces target net with a λ-return cache)
+    tdl_cfg            = config.get("td_lambda", {})
+    use_lambda_returns = tdl_cfg.get("enabled", False)
+    lambda_return      = tdl_cfg.get("lambda", 0.9)
+    cache_size         = tdl_cfg.get("cache_size", 8000)
+    block_size         = tdl_cfg.get("block_size", 50)
+    refresh_freq       = tdl_cfg.get("refresh_freq", 1000)
+    if use_lambda_returns:
+        print(f"TD(λ) cache: λ={lambda_return}, S={cache_size}, B={block_size}, "
+              f"refresh every {refresh_freq} steps (target network disabled)")
+
+    trainer = SACTrainer(
+        env               = env_2p,
+        policy_net        = policy_net,
+        q1_net            = q1_net,
+        q2_net            = q2_net,
+        device            = device,
+        learning_rate     = lr,
+        gamma             = gamma,
+        tau               = tau,
+        alpha             = alpha,
+        auto_alpha        = auto_alpha,
+        target_entropy    = target_entropy,
+        replay_buffer_size= buffer_size,
+        batch_size        = batch_size,
+        max_grad_norm     = max_grad_norm,
+        use_lambda_returns= use_lambda_returns,
+        lambda_return     = lambda_return,
+        cache_size        = cache_size,
+        block_size        = block_size,
+        refresh_freq      = refresh_freq,
+        log_dir           = log_dir,
+        compile_mode      = model_cfg.get("compile_mode", "default"),
+    )
+
+    resume = exec_cfg.get("resume")
+    if resume:
+        trainer.load_checkpoint(resume)
+        trainer.load_replay_buffer(buffer_path)
+
+    episode_rewards: list[float] = []
+    episode_wins: list[bool] = []
+    # Rolling window of fleets-sent-per-step. Tracked across episodes (not reset
+    # per episode) so the metric is independent of variable episode length.
+    fleets_window: deque[int] = deque(maxlen=50)
+    # Rolling window of per-step reward for a smoothed step-wise reward curve.
+    # Tracked across episodes (not reset per episode) so it spans episode seams.
+    reward_window: deque[float] = deque(maxlen=100)
+    # All-time peak of total fleets in play — for sizing MAX_FLEETS.
+    max_fleets_seen = 0
+    t0 = time.perf_counter()
+
+    max_steps = train_cfg.get("max_steps", 500)
+    warmup_steps = train_cfg.get("warmup_steps", 500)
+    update_freq = train_cfg.get("update_freq", 4)
+    gradient_steps = train_cfg.get("gradient_steps", 1)
+    log_interval = io_cfg.get("log_interval", 1)
+    render_interval = io_cfg.get("render_interval", 10)
+    save_interval = io_cfg.get("save_interval", 100)
+
+    for episode in range(num_episodes):
+        # ── curriculum: anneal mixed_random_ratio ─────────────────────────────
+        current_ratio = schedule_fn(
+            episode, ratio_start, ratio_end, ratio_decay_eps
+        )
+        for a in all_mixed_agents:
+            a.random_ratio = current_ratio
+
+        # ── pick 2p or 4p env ─────────────────────────────────────────────────
+        use_4p  = env_4p is not None and random.random() < ratio_4p
+        env     = env_4p if use_4p else env_2p
+        tag     = "4p" if use_4p else "2p"
+
+        state, _ = env.reset()
+        ep_reward = 0.0
+        ep_length = 0
+
+        # ── episode rollout ───────────────────────────────────────────────────
+        for _ in range(max_steps):
+            if trainer.train_step < warmup_steps:
+                action = env.action_space.sample()
+            else:
+                action = trainer.select_action(state)
+
+            next_state, reward, terminated, truncated, won = env.step(action)
+            done = terminated or truncated
+
+            trainer.replay_buffer.add(
+                state, action, reward, next_state, float(done)
+            )
+            trainer.train_step += 1
+            ep_reward += reward
+            ep_length += 1
+            state = next_state
+
+            # ── per-step reward: current value + 100-step moving average ───────
+            reward_window.append(float(reward))
+            # ── per-step fleets-sent moving average (window = 50 steps) ────────
+            fleets_window.append(env.last_fleets_sent)
+            # ── total fleets in play (all players) — for sizing MAX_FLEETS ─────
+            max_fleets_seen = max(max_fleets_seen, env.last_n_fleets)
+            if trainer.writer:
+                trainer.writer.add_scalar(
+                    "Reward/step", float(reward), trainer.train_step,
+                )
+                trainer.writer.add_scalar(
+                    "Reward/step_ma100",
+                    float(np.mean(reward_window)),
+                    trainer.train_step,
+                )
+                trainer.writer.add_scalar(
+                    "Policy/fleets_sent_ma50",
+                    float(np.mean(fleets_window)),
+                    trainer.train_step,
+                )
+                # Instantaneous count carries the distribution + peaks (read the
+                # series max for the worst case); the running max plateaus at the
+                # all-time peak so the number to compare against MAX_FLEETS is
+                # unambiguous.
+                trainer.writer.add_scalar(
+                    "Env/fleets_present", env.last_n_fleets, trainer.train_step,
+                )
+                trainer.writer.add_scalar(
+                    "Env/fleets_present_max", max_fleets_seen, trainer.train_step,
+                )
+
+            if (
+                trainer.train_step >= warmup_steps
+                and trainer.train_step % update_freq == 0
+                and len(trainer.replay_buffer) >= batch_size
+            ):
+                for _ in range(gradient_steps):
+                    trainer.update()
+
+            if done:
+                break
+
+        # Determine if player 0 won: has planets and all opponents have none.
+        episode_wins.append(won)
+
+        episode_rewards.append(ep_reward)
+        # Reward is now logged step-wise (Reward/step + Reward/step_ma100 in the
+        # rollout above), so the per-episode reward scalar is dropped here. Keep
+        # the non-reward per-episode diagnostics that _log_episode used to emit.
+        if trainer.writer:
+            trainer.writer.add_scalar("Misc/episode_length", ep_length, episode)
+            trainer.writer.add_scalar("Misc/buffer_fill", len(trainer.replay_buffer), episode)
+            trainer.writer.add_scalar("Misc/env_steps", trainer.train_step, episode)
+
+        # ── per-episode tensorboard scalars ───────────────────────────────────
+        win_float    = 1.0 if won else 0.0
+        win_rate_10  = float(np.mean(episode_wins[-10:])) * 100
+        if trainer.writer:
+            trainer.writer.add_scalar("Misc/n_players",            4 if use_4p else 2, episode)
+            trainer.writer.add_scalar("Misc/mixed_random_ratio",   current_ratio,      episode)
+            trainer.writer.add_scalar("Reward/win",                win_float,          episode)
+            trainer.writer.add_scalar("Reward/win_rate_10ep",      win_rate_10,        episode)
+
+        # ── console log ───────────────────────────────────────────────────────
+        if (episode + 1) % log_interval == 0:
+            recent_rewards = episode_rewards[-log_interval:]
+            recent_wins    = episode_wins[-log_interval:]
+            avg_reward     = float(np.mean(recent_rewards))
+            win_rate       = float(np.mean(recent_wins)) * 100 if recent_wins else 0.0
+            elapsed        = time.perf_counter() - t0
+            ratio_tag      = (f" | MixR: {current_ratio:.2f}"
+                              if opponent == "mixed" else "")
+            print(
+                f"Ep {episode + 1:>5}/{num_episodes} [{tag}] | "
+                f"Avg({log_interval}): {avg_reward:+8.3f} | "
+                f"Last: {ep_reward:+8.3f} | "
+                f"Win%: {win_rate:5.1f} | "
+                f"Buffer: {len(trainer.replay_buffer):>7} | "
+                f"Steps: {trainer.train_step:>7}{ratio_tag} | "
+                f"{elapsed:.0f}s"
+            )
+
+        # ── HTML replay ───────────────────────────────────────────────────────
+        if (episode + 1) % render_interval == 0:
+            result_tag = "WIN" if won else "LOSS"
+            html_path = os.path.join(
+                render_dir,
+                f"ep{episode + 1:05d}_{tag}_{result_tag}.html",
+            )
+            env.render(html_path=html_path)
+
+        # ── checkpoint ────────────────────────────────────────────────────────
+        if (episode + 1) % save_interval == 0:
+            ckpt_path = os.path.join(
+                ckpt_dir, f"sac_ep{episode + 1:05d}.pt"
+            )
+            trainer.save_checkpoint(ckpt_path)
+            trainer.save_replay_buffer(buffer_path)
+
+    # ── final save ────────────────────────────────────────────────────────────
+    trainer.save_checkpoint(os.path.join(ckpt_dir, "sac_final.pt"))
+    trainer.save_replay_buffer(buffer_path)
+    trainer.close()
+    env_2p.close()
+    if env_4p:
+        env_4p.close()
+
+    print(f"\nDone. {trainer.train_step} total env steps.")
+    return episode_rewards
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,7 +641,7 @@ def _log_vstep(vstep, num_episodes, episodes_done, episode_rewards,
     )
 
 
-def train_jax(config: dict, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> list[float]:
+def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> list[float]:
     """Train SAC using the parallel JAX environment backend.
 
     Runs until ``num_episodes`` episodes have completed across all envs.
@@ -232,6 +661,7 @@ def train_jax(config: dict, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> lis
     Parameters
     ----------
     config       : full JSON config dict
+    reward_scheme: unused (JAX backend uses its own reward; kept for API parity)
     MAX_PLANETS, MAX_FLEETS : network shape constants
     """
     if not _JAX_AVAILABLE:
@@ -294,6 +724,7 @@ def train_jax(config: dict, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> lis
     win_bonus     = jax_cfg.get("win_bonus",     100.0)
     tanh_scale    = env_cfg.get("tanh_scale",    0.2)
     min_fleet_ships = env_cfg.get("min_fleet_ships", 3)
+    use_jax_buffer  = jax_cfg.get("jax_buffer",  False)
     # Rollout/learner overlap mode (jax_env.actor, default falls back to the
     # legacy jax_env.threaded bool):
     #   "mp_env"  — env in a SEPARATE PROCESS, learner in the main process; the
@@ -407,8 +838,8 @@ def train_jax(config: dict, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> lis
     # ── Networks ──────────────────────────────────────────────────────────────
     d_model = model_cfg.get("d_model", 128)
     net_kw  = dict(
-        state_dim       = JaxVecEnvAdapter.STATE_DIM,
-        action_dim      = JaxVecEnvAdapter.ACTION_DIM,
+        state_dim       = OrbitWarsEnv.STATE_DIM,
+        action_dim      = OrbitWarsEnv.ACTION_DIM,
         max_planets     = MAX_PLANETS,
         max_fleets      = MAX_FLEETS,
         d_model         = d_model,
@@ -462,6 +893,7 @@ def train_jax(config: dict, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> lis
         # promote per-env (not cross-env) blocks into its λ-return cache.
         env_stride        = num_envs,
         log_dir           = log_dir,
+        use_jax_buffer    = use_jax_buffer,
         tb_log_every      = tb_log_every,
         compile_mode      = model_cfg.get("compile_mode", "default"),
     )
@@ -1136,8 +1568,65 @@ if __name__ == "__main__":
         torch.manual_seed(seed)
         print(f"Random seed set to: {seed}")
 
-    # JAX-only training branch.  The reward components named in config["reward"]
-    # are parsed and applied by the JAX adapter itself (see JaxVecEnvAdapter /
-    # jax_env reward handling); there is no Python-env training path here.
-    print("Training with the JAX parallel environment.\n")
-    train_jax(config, MAX_PLANETS=40, MAX_FLEETS=200)
+    # Load and instantiate reward schemes.
+    #
+    # Each entry in the "reward" list is summed every step. The "scheme" key
+    # selects the class; every *other* key is passed straight to its constructor,
+    # so a config only specifies the params that scheme actually declares
+    # (e.g. ship_scale, planet_scale, win_bonus). Compose a full reward by listing
+    # several components — e.g. RelativeShipAdvantage + RelativeProductionAdvantage +
+    # TimeDecayWinBonus reproduces (and improves on) the old RewardScheme1.
+    reward_cfg_list = config.get("reward", [])
+    reward_scheme_map = {
+        # composable single-responsibility components
+        "RelativeShipAdvantage":     RelativeShipAdvantage,
+        "RelativeProductionAdvantage": RelativeProductionAdvantage,
+        "ShipGrowth":              ShipGrowth,
+        "ProductionPlanetDelta":   ProductionPlanetDelta,
+        "ProximityCaptureBonus":   ProximityCaptureBonus,
+        "AbsoluteHoldings":        AbsoluteHoldings,
+        "FleetLaunchPenalty":      FleetLaunchPenalty,
+        "LaunchDistancePenalty":   LaunchDistancePenalty,
+        "StepPenalty":             StepPenalty,
+        "TerminalWinBonus":        TerminalWinBonus,
+        "TimeDecayWinBonus":       TimeDecayWinBonus,
+        # legacy numbered schemes (composites; kept for backward compatibility)
+        "RewardScheme1": RewardScheme1,
+        "RewardScheme2": RewardScheme2,
+        "RewardScheme3": RewardScheme3,
+        "RewardScheme4": RewardScheme4,
+    }
+
+    reward_scheme = []
+    if reward_cfg_list:
+        for reward_cfg in reward_cfg_list:
+            scheme_name = reward_cfg.get("scheme", "RewardScheme1")
+            if scheme_name not in reward_scheme_map:
+                raise ValueError(
+                    f"Unknown reward scheme {scheme_name!r}. "
+                    f"Available: {sorted(reward_scheme_map)}"
+                )
+            RewardSchemeClass = reward_scheme_map[scheme_name]
+            # Pass every key except "scheme" straight to the constructor.
+            params = {k: v for k, v in reward_cfg.items() if k != "scheme"}
+            reward_scheme.append(RewardSchemeClass(**params))
+            print(f"Loaded {scheme_name} with params: {params}")
+    else:
+        # Fallback to RewardScheme1 if no reward config
+        reward_scheme = [RewardScheme1()]
+        print("No reward schemes in config, using default RewardScheme1")
+
+    # ── Dispatch to correct backend ───────────────────────────────────────────
+    backend = config.get("environment", {}).get("backend", "python")
+    if backend == "jax":
+        print("Training with JAX parallel backend (config 'reward' schemes are "
+              "mirrored by the JAX adapter; jax_env.reward_type is the fallback "
+              "when no 'reward' list is given)")
+        print()
+        train_jax(config, MAX_PLANETS=40, MAX_FLEETS=200, reward_scheme=reward_scheme)
+    else:
+        if backend != "python":
+            print(f"Warning: unknown backend {backend!r}, falling back to 'python'")
+        print(f"Training with {len(reward_scheme)} reward scheme(s)")
+        print()
+        train(config, MAX_PLANETS=40, MAX_FLEETS=200, reward_scheme=reward_scheme)
