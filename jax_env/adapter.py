@@ -33,6 +33,24 @@ except ImportError:
 from .vec_env import VectorizedEnv
 from .constants import MAX_PLANETS as _JAX_MP, MAX_FLEETS as _JAX_MF
 
+# The vectorised heuristic opponents live in agents/vec_opponents.py so the
+# strategy logic is easy to find and edit.  Load them by explicit FILE PATH, not
+# `import agents.vec_opponents`: kaggle_environments puts a different top-level
+# `agents` module on sys.path (envs/lux_ai_s3/agents.py) that would shadow the
+# project package and crash on its own relative import (see the note in
+# train_orbit_wars.py).  Path loading sidesteps the name collision and works in
+# the mp_env spawn worker too (numpy-only — no torch/jax/kaggle pulled in).
+import importlib.util as _ilu
+import os as _os
+_vo_path = _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+    "agents", "vec_opponents.py")
+_vo_spec = _ilu.spec_from_file_location("orbit_vec_opponents", _vo_path)
+_vec_opponents = _ilu.module_from_spec(_vo_spec)
+_vo_spec.loader.exec_module(_vec_opponents)
+greedy_opponent = _vec_opponents.greedy_opponent
+random_opponent = _vec_opponents.random_opponent
+
 # Network / observation shape constants (must match OrbitWarsEnv)
 _NET_MP    = 40
 _NET_MF    = 100
@@ -288,21 +306,54 @@ class JaxVecEnvAdapter:
     # Step
     # -------------------------------------------------------------------------
 
-    def step(self, actions_np: np.ndarray):
-        """
-        Parameters
-        ----------
-        actions_np : float32[num_envs, NET_MP, ACTION_DIM]  — player-0 policy output
+    def decode_state(self):
+        """Planet arrays (player-0 perspective) + omega the torch decoder needs.
 
-        Returns
-        -------
-        obs_next   : float32[num_envs, seq_len, STATE_DIM]
-        rewards    : float32[num_envs]
-        dones      : bool[num_envs]
-        truncateds : bool[num_envs]  (always False; JAX env handles truncation internally)
-        wons       : bool[num_envs]
+        Returned for the CURRENT state (the one the last-returned obs describes),
+        so the learner can decode player-0's engine action before the next step.
+        All arrays are numpy [num_envs, NET_MP]; omega is [num_envs].  Used by the
+        env-light training path (decode in the learner) and mirrors exactly the
+        comet-free, first-NET_MP-planets view env/orbit_wars.py decodes from.
+        """
+        s = self._state
+        P = _NET_MP
+        active = (np.asarray(s.planets.active, dtype=bool)[:, :P]
+                  & ~np.asarray(s.planets.is_comet, dtype=bool)[:, :P])
+        return {
+            "owner":  np.asarray(s.planets.owner,  dtype=np.int32)[:, :P],
+            "x":      np.asarray(s.planets.x,       dtype=np.float32)[:, :P],
+            "y":      np.asarray(s.planets.y,       dtype=np.float32)[:, :P],
+            "r":      np.asarray(s.planets.radius,  dtype=np.float32)[:, :P],
+            "ships":  np.asarray(s.planets.ships,   dtype=np.float32)[:, :P],
+            "active": active,
+            "omega":  np.asarray(s.angular_velocity, dtype=np.float32).reshape(-1),
+        }
+
+    def step(self, actions_np: np.ndarray):
+        """Decode raw player-0 policy output internally, then step.
+
+        Convenience path (benchmarks, tests, single-process use). The env-light
+        training loops instead decode player-0 in the learner and call
+        ``step_engine``; this keeps a self-contained entry point.
+
+        actions_np : float32[num_envs, NET_MP, ACTION_DIM] — player-0 policy output.
+        Returns (obs_next, rewards, dones, truncateds, wons).
         """
         jax_acts = self._decode_actions_batch(actions_np)
+        return self._post_step(jax_acts)
+
+    def step_engine(self, p0_engine: np.ndarray):
+        """Step with a pre-decoded player-0 ENGINE action (env-light path).
+
+        p0_engine : float32[num_envs, NET_MP, 2] = (angle, absolute ship count),
+        as produced by model.action_decoder.decode in the learner. Opponents are
+        still generated here (they are env-side heuristics that need live state).
+        Returns (obs_next, rewards, dones, truncateds, wons).
+        """
+        jax_acts = self._build_engine_actions(p0_engine)
+        return self._post_step(jax_acts)
+
+    def _post_step(self, jax_acts):
         new_state, rewards_jax, dones_jax = self._jax.step(self._state, jax_acts)
 
         dones_np = np.array(dones_jax, dtype=bool)
@@ -539,7 +590,8 @@ class JaxVecEnvAdapter:
 
         b_idx, slot_idx = np.where(launch)
         jax_acts[b_idx, pid, slot_idx, 0] = angles[b_idx, slot_idx]
-        jax_acts[b_idx, pid, slot_idx, 1] = frac[b_idx, slot_idx]
+        # Engine now consumes ABSOLUTE ship counts (see step._launch_fleets).
+        jax_acts[b_idx, pid, slot_idx, 1] = num_ships[b_idx, slot_idx]
         return int(len(b_idx))
 
     # -------------------------------------------------------------------------
@@ -548,7 +600,7 @@ class JaxVecEnvAdapter:
 
     def _decode_actions_batch(self, actions_np: np.ndarray) -> jnp.ndarray:
         """
-        Decode player-0 network output + generate opponent actions.
+        Decode raw player-0 network output + generate opponent actions.
 
         actions_np : float32[B, NMP, 4]
         returns    : jnp.float32[B, num_players, JAMP, 2]
@@ -558,179 +610,84 @@ class JaxVecEnvAdapter:
         JAMP = _JAX_MP
 
         state   = self._state
-        p_owner = np.asarray(state.planets.owner,      dtype=np.int32)
-        p_x     = np.asarray(state.planets.x,          dtype=np.float32)
-        p_y     = np.asarray(state.planets.y,          dtype=np.float32)
-        p_ships = np.asarray(state.planets.ships,      dtype=np.float32)
-        p_prod  = np.asarray(state.planets.production, dtype=np.float32)
-        p_act   = np.asarray(state.planets.active,     dtype=bool)
-        p_comet = np.asarray(state.planets.is_comet,   dtype=bool)
+        p_owner = np.asarray(state.planets.owner,  dtype=np.int32)
+        p_x     = np.asarray(state.planets.x,      dtype=np.float32)
+        p_y     = np.asarray(state.planets.y,      dtype=np.float32)
+        p_ships = np.asarray(state.planets.ships,  dtype=np.float32)
+        p_act   = np.asarray(state.planets.active, dtype=bool)
+        p_comet = np.asarray(state.planets.is_comet, dtype=bool)
 
         jax_acts = np.zeros((B, NP, JAMP, 2), dtype=np.float32)
         valid    = p_act[:, :_NET_MP] & ~p_comet[:, :_NET_MP]   # [B, NMP]
 
-        # ── Player 0 ───────────────────────────────────────────────────────────
         owned_p0 = (p_owner[:, :_NET_MP] == 0) & valid
-        n_launched = self._decode_for_player(
+        self.last_fleets_sent = self._decode_for_player(
             actions_np, jax_acts, 0, owned_p0, valid, p_x, p_y, p_ships
         )
-        self.last_fleets_sent = n_launched
-
-        # ── Opponents ─────────────────────────────────────────────────────────
-        if NP > 1:
-            if self.opponent == "self_play" and self._policy_fn is not None:
-                for pid in range(1, NP):
-                    opp_obs  = self._extract_obs(state, pid=pid)   # [B, seq, 13]
-                    opp_acts = self._policy_fn(opp_obs)            # [B, NMP, 4]
-                    owned_opp = (p_owner[:, :_NET_MP] == pid) & valid
-                    self._decode_for_player(
-                        opp_acts, jax_acts, pid, owned_opp, valid, p_x, p_y, p_ships
-                    )
-            elif self.opponent in ("greedy", "rule_based"):  # rule_based: alias
-                self._decode_opponent_greedy(
-                    jax_acts, valid, p_owner, p_x, p_y, p_ships, p_prod
-                )
-            elif self.opponent == "mixed":
-                # Per (env, opponent-player) coin flip: with prob mixed_random_ratio
-                # that slot acts randomly this step, else greedy — the vectorised
-                # analogue of the Python MixedAgent's per-call random/rule choice.
-                # The two decoders are gated by complementary masks so each
-                # (env, player) is filled by exactly one strategy (no overwrite).
-                use_random = (np.random.random((B, NP)) < self.mixed_random_ratio)
-                self._decode_opponent_greedy(
-                    jax_acts, valid, p_owner, p_x, p_y, p_ships, p_prod,
-                    env_gate=~use_random,
-                )
-                self._decode_opponent_random_vec(
-                    jax_acts, valid, p_owner, p_ships,
-                    send_prob=self.mixed_send_prob, env_gate=use_random,
-                )
-            else:
-                self._decode_opponent_random_vec(
-                    jax_acts, valid, p_owner, p_ships
-                )
-
+        self._add_opponent_actions(jax_acts)
         return jnp.array(jax_acts, dtype=jnp.float32)
 
-    # -------------------------------------------------------------------------
-    # Opponent strategy implementations
-    # -------------------------------------------------------------------------
+    def _build_engine_actions(self, p0_engine: np.ndarray) -> jnp.ndarray:
+        """Assemble the full engine action from a pre-decoded player-0 action.
 
-    def _decode_opponent_greedy(
-        self,
-        jax_acts: np.ndarray,
-        valid:    np.ndarray,   # [B, NMP] active non-comet
-        p_owner:  np.ndarray,   # [B, JAMP]
-        p_x:      np.ndarray,
-        p_y:      np.ndarray,
-        p_ships:  np.ndarray,
-        p_prod:   np.ndarray,
-        env_gate: np.ndarray = None,   # [B, NP] bool — if given, only these (env,player) may launch
-    ):
-        """Vectorised greedy opponent — mirrors agent1.get_custom_score heuristic.
-
-        For each owned planet with enough ships, aims directly at the target
-        that maximises (100 - dist) + 15×production + 10×production×is_enemy,
-        subject to the capture-feasibility mask (ships_sent > target_ships).
-        Fully vectorised over all B envs with no Python loop.
-
-        env_gate
-            Optional [B, num_players] bool mask. When provided (opponent="mixed"),
-            player ``pid`` only launches from env ``b`` if env_gate[b, pid] — used
-            to restrict the greedy half to the greedy-chosen (env, player) slots.
+        p0_engine : float32[B, NMP, 2] = (angle, absolute ships). Player-0 slots
+        are copied verbatim; opponents are generated from live state. Returns the
+        batched engine action jnp.float32[B, num_players, JAMP, 2].
         """
-        B   = self.num_envs
-        NMP = _NET_MP
-        bi  = np.arange(B)[:, np.newaxis]
-        si  = np.arange(NMP)[np.newaxis, :]
+        B, NP, JAMP = self.num_envs, self.num_players, _JAX_MP
+        jax_acts = np.zeros((B, NP, JAMP, 2), dtype=np.float32)
+        jax_acts[:, 0, :_NET_MP, :] = p0_engine
+        self.last_fleets_sent = int((p0_engine[:, :, 1] > 0).sum(axis=1).mean())
+        self._add_opponent_actions(jax_acts)
+        return jnp.array(jax_acts, dtype=jnp.float32)
 
-        px = p_x[:, :NMP]       # [B, NMP]
-        py = p_y[:, :NMP]
-        ps = p_ships[:, :NMP]
-        pp = p_prod[:, :NMP]
-        po = p_owner[:, :NMP]
+    def _add_opponent_actions(self, jax_acts: np.ndarray):
+        """Fill jax_acts[:, 1:, ...] with the chosen opponent strategy in place.
 
-        # Pairwise distances [B, src, tgt]
-        # dx[b, s, t] = px[b, t] - px[b, s]  (tgt minus src)
-        dx   = px[:, np.newaxis, :] - px[:, :, np.newaxis]   # [B, NMP, NMP]
-        dy   = py[:, np.newaxis, :] - py[:, :, np.newaxis]
-        dist = np.sqrt(dx**2 + dy**2)   # [B, NMP, NMP]
-
-        # Target heuristic value (same formula across all pids)
-        is_owned = (po != -1)   # [B, NMP]  — not neutral
-        score_tgt = (100.0 - dist
-                     + 15.0 * pp[:, np.newaxis, :]
-                     + 10.0 * pp[:, np.newaxis, :] * is_owned[:, np.newaxis, :])
-
-        frac_val = 0.7
-
-        for pid in range(1, self.num_players):
-            owned_pid  = (po == pid) & valid   # [B, NMP]
-            not_owned  = (po != pid) & valid   # [B, NMP]  — enemy or neutral
-
-            n_ships    = frac_val * ps         # [B, NMP]  ships to send
-
-            src_ok  = (owned_pid & (ps > 10.0))[:, :, np.newaxis]  # [B, NMP, 1]
-            tgt_ok  = not_owned[:, np.newaxis, :]                   # [B, 1, NMP]
-            cap_ok  = n_ships[:, :, np.newaxis] > ps[:, np.newaxis, :]  # [B, NMP, NMP]
-
-            final = np.where(
-                src_ok & tgt_ok & cap_ok & _DIAG_MASK[np.newaxis],
-                score_tgt, -np.inf
-            )   # [B, NMP, NMP]
-
-            best_tgt = np.argmax(final, axis=2)         # [B, NMP]
-            best_val = final[bi, si, best_tgt]           # [B, NMP]
-
-            launch = owned_pid & (ps > 10.0) & (best_val > -np.inf)
-            if env_gate is not None:
-                launch = launch & env_gate[:, pid][:, np.newaxis]
-            b_idx, slot_idx = np.where(launch)
-            if len(b_idx) == 0:
-                continue
-
-            tgt_idx = best_tgt[b_idx, slot_idx]
-            angles  = np.arctan2(
-                py[b_idx, tgt_idx] - py[b_idx, slot_idx],
-                px[b_idx, tgt_idx] - px[b_idx, slot_idx],
-            )
-            jax_acts[b_idx, pid, slot_idx, 0] = angles
-            jax_acts[b_idx, pid, slot_idx, 1] = frac_val
-
-    def _decode_opponent_random_vec(
-        self,
-        jax_acts: np.ndarray,
-        valid:    np.ndarray,   # [B, NMP]
-        p_owner:  np.ndarray,   # [B, JAMP]
-        p_ships:  np.ndarray,
-        send_prob: float = 0.3,
-        env_gate:  np.ndarray = None,   # [B, NP] bool — if given, only these (env,player) may launch
-    ):
-        """Vectorised random opponent — each owned planet launches a random fleet
-        with probability ``send_prob``.
-
-        env_gate
-            Optional [B, num_players] bool mask. When provided (opponent="mixed"),
-            player ``pid`` only launches from env ``b`` if env_gate[b, pid] — used
-            to restrict the random half to the random-chosen (env, player) slots.
+        Opponents are env-side heuristics (greedy / random / mixed / self_play)
+        that read the live planet state, so they stay in the env rather than the
+        learner.  No-op for single-player games.
         """
-        B   = self.num_envs
-        NMP = _NET_MP
+        NP = self.num_players
+        if NP <= 1:
+            return
+        B = self.num_envs
+        state   = self._state
+        p_owner = np.asarray(state.planets.owner,      dtype=np.int32)
+        p_x     = np.asarray(state.planets.x,          dtype=np.float32)
+        p_y     = np.asarray(state.planets.y,          dtype=np.float32)
+        p_r     = np.asarray(state.planets.radius,     dtype=np.float32)
+        p_ships = np.asarray(state.planets.ships,      dtype=np.float32)
+        p_prod  = np.asarray(state.planets.production, dtype=np.float32)
+        p_act   = np.asarray(state.planets.active,     dtype=bool)
+        p_comet = np.asarray(state.planets.is_comet,   dtype=bool)
+        omega   = np.asarray(state.angular_velocity,   dtype=np.float32).reshape(-1)
+        valid   = p_act[:, :_NET_MP] & ~p_comet[:, :_NET_MP]
 
-        for pid in range(1, self.num_players):
-            owned = ((p_owner[:, :NMP] == pid)
-                     & valid
-                     & (p_ships[:, :NMP] > 5.0))   # [B, NMP]
-            launch = owned & (np.random.random((B, NMP)) < send_prob)
-            if env_gate is not None:
-                launch = launch & env_gate[:, pid][:, np.newaxis]
-
-            b_idx, slot_idx = np.where(launch)
-            if len(b_idx) == 0:
-                continue
-            n = len(b_idx)
-            jax_acts[b_idx, pid, slot_idx, 0] = np.random.uniform(0.0, 2 * np.pi, n)
-            jax_acts[b_idx, pid, slot_idx, 1] = np.random.uniform(0.3, 0.7, n)
+        if self.opponent == "self_play" and self._policy_fn is not None:
+            for pid in range(1, NP):
+                opp_obs  = self._extract_obs(state, pid=pid)   # [B, seq, 13]
+                opp_acts = self._policy_fn(opp_obs)            # [B, NMP, 4]
+                owned_opp = (p_owner[:, :_NET_MP] == pid) & valid
+                self._decode_for_player(
+                    opp_acts, jax_acts, pid, owned_opp, valid, p_x, p_y, p_ships
+                )
+        elif self.opponent in ("greedy", "rule_based"):  # rule_based: alias
+            greedy_opponent(jax_acts, valid, p_owner, p_x, p_y, p_r,
+                            p_ships, p_prod, omega, NP)
+        elif self.opponent == "mixed":
+            # Per (env, opponent-player) coin flip: with prob mixed_random_ratio
+            # that slot acts randomly this step, else greedy — the vectorised
+            # analogue of the Python MixedAgent's per-call random/rule choice. The
+            # two strategies are gated by complementary masks so each (env, player)
+            # is filled by exactly one strategy (no overwrite).
+            use_random = (np.random.random((B, NP)) < self.mixed_random_ratio)
+            greedy_opponent(jax_acts, valid, p_owner, p_x, p_y, p_r,
+                            p_ships, p_prod, omega, NP, env_gate=~use_random)
+            random_opponent(jax_acts, valid, p_owner, p_ships, NP,
+                            send_prob=self.mixed_send_prob, env_gate=use_random)
+        else:
+            random_opponent(jax_acts, valid, p_owner, p_ships, NP)
 
     # -------------------------------------------------------------------------
     # Ship-score helper (shaped rewards)

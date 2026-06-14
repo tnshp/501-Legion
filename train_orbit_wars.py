@@ -64,6 +64,7 @@ import torch
 import jax
 
 from model.SAC      import P_network, Q_network
+from model          import action_decoder as _action_decoder
 from sac_train      import SACTrainer
 from env.orbit_wars import (
     OrbitWarsEnv,
@@ -546,15 +547,26 @@ def train(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEETS: i
 def _mp_env_actor_worker(conn, env_kw, num_envs_2p, num_envs_4p, capture_render):
     """Subprocess: own env_2p (+env_4p), serve step requests over `conn`.
 
-    Protocol: send the initial concatenated reset obs once, then loop
-    {recv (actions, mix_ratio)  →  send (next_obs, rewards, dones, wons,
-    fleets_sent, n_fleets, state0)} until a None sentinel arrives.  `mix_ratio`
-    is the current opponent="mixed" random ratio (or None to leave it unchanged);
-    `state0` is the env_2p[0] pre-step GameState snapshot (for rendering) or None.
+    Protocol (env-light): send the initial ``(obs, decode_state)`` once, then loop
+    {recv (p0_engine, mix_ratio)  →  step_engine  →  send (next_obs, rewards,
+    dones, wons, fleets_sent, n_fleets, state0, decode_state)} until a None
+    sentinel arrives.  ``p0_engine`` is the learner-decoded player-0 engine action
+    [B, NET_MP, 2]=(angle, ship-count); ``decode_state`` is the post-step planet
+    state the learner needs to decode the NEXT action; ``mix_ratio`` is the current
+    opponent="mixed" random ratio (or None); ``state0`` is the env_2p[0] pre-step
+    GameState snapshot (for rendering) or None.
     """
     env_2p = JaxVecEnvAdapter(num_envs=num_envs_2p, num_players=2, **env_kw)
     env_4p = (JaxVecEnvAdapter(num_envs=num_envs_4p, num_players=4, **env_kw)
               if num_envs_4p > 0 else None)
+
+    def _combined_dstate():
+        """Concatenated planet decode-state across the 2p (+4p) envs."""
+        d2 = env_2p.decode_state()
+        if env_4p is None:
+            return d2
+        d4 = env_4p.decode_state()
+        return {k: np.concatenate([d2[k], d4[k]], axis=0) for k in d2}
 
     obs_2p, _ = env_2p.reset()
     if env_4p is not None:
@@ -562,14 +574,15 @@ def _mp_env_actor_worker(conn, env_kw, num_envs_2p, num_envs_4p, capture_render)
         obs = np.concatenate([obs_2p, obs_4p], axis=0)
     else:
         obs = obs_2p
-    conn.send(obs)
+    # Initial obs + decode-state so the learner can decode the first action.
+    conn.send((obs, _combined_dstate()))
 
     try:
         while True:
             msg = conn.recv()
             if msg is None:
                 break
-            actions, mix_ratio = msg
+            p0_engine, mix_ratio = msg              # player-0 ENGINE action
             if mix_ratio is not None:
                 env_2p.set_mixed_random_ratio(mix_ratio)
                 if env_4p is not None:
@@ -579,8 +592,8 @@ def _mp_env_actor_worker(conn, env_kw, num_envs_2p, num_envs_4p, capture_render)
                 state0 = jax.tree_util.tree_map(
                     lambda x: np.asarray(x[0]), env_2p._state)
             if env_4p is not None:
-                n2, r2, d2, _, w2 = env_2p.step(actions[:num_envs_2p])
-                n4, r4, d4, _, w4 = env_4p.step(actions[num_envs_2p:])
+                n2, r2, d2, _, w2 = env_2p.step_engine(p0_engine[:num_envs_2p])
+                n4, r4, d4, _, w4 = env_4p.step_engine(p0_engine[num_envs_2p:])
                 next_obs = np.concatenate([n2, n4], axis=0)
                 rewards  = np.concatenate([r2, r4])
                 dones    = np.concatenate([d2, d4])
@@ -588,11 +601,11 @@ def _mp_env_actor_worker(conn, env_kw, num_envs_2p, num_envs_4p, capture_render)
                 fleets_sent = env_2p.last_fleets_sent + env_4p.last_fleets_sent
                 n_fleets    = max(env_2p.last_n_fleets, env_4p.last_n_fleets)
             else:
-                next_obs, rewards, dones, _, wons = env_2p.step(actions)
+                next_obs, rewards, dones, _, wons = env_2p.step_engine(p0_engine)
                 fleets_sent = env_2p.last_fleets_sent
                 n_fleets    = env_2p.last_n_fleets
             conn.send((next_obs, rewards, dones, wons,
-                       fleets_sent, n_fleets, state0))
+                       fleets_sent, n_fleets, state0, _combined_dstate()))
     finally:
         env_2p.close()
         if env_4p is not None:
@@ -797,6 +810,31 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         """Scheduled opponent random-ratio at the given completed-episode count."""
         return mix_ratio_sched(eps_done, mix_ratio_start, mix_ratio_end, mix_decay_eps)
 
+    # ── env-light decode: turn raw player-0 policy output into engine actions ──
+    # The wedge + lead-intercept decode runs HERE in the learner (torch, on the
+    # training device) rather than inside the env, so the env consumes engine-ready
+    # (angle, ship-count) actions and the same module backs the standalone agent.
+    def _p0_from_dstate(raw, dstate):
+        """raw [n, NET_MP, 4] (numpy) + planet dstate → engine [n, NET_MP, 2] (numpy)."""
+        a = torch.as_tensor(np.asarray(raw), dtype=torch.float32, device=device)
+        out = _action_decoder.decode(
+            a,
+            torch.as_tensor(dstate["owner"],  device=device),
+            torch.as_tensor(dstate["x"],      dtype=torch.float32, device=device),
+            torch.as_tensor(dstate["y"],      dtype=torch.float32, device=device),
+            torch.as_tensor(dstate["r"],      dtype=torch.float32, device=device),
+            torch.as_tensor(dstate["ships"],  dtype=torch.float32, device=device),
+            torch.as_tensor(dstate["active"], device=device),
+            torch.as_tensor(dstate["omega"],  dtype=torch.float32, device=device),
+            player=0, tanh_scale=tanh_scale,
+        )
+        p0 = torch.stack([out["angle"], out["num_ships"].float()], dim=-1)
+        return p0.detach().cpu().numpy().astype(np.float32)
+
+    def _p0_from_env(env, raw):
+        """Decode player-0 engine action using `env`'s current planet state."""
+        return _p0_from_dstate(raw, env.decode_state())
+
     # ── Networks ──────────────────────────────────────────────────────────────
     d_model = model_cfg.get("d_model", 128)
     net_kw  = dict(
@@ -945,7 +983,9 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         actor_proc.start()
         child_conn.close()                    # parent keeps only its end
 
-        obs_batch = parent_conn.recv()        # initial reset obs from the actor
+        # Initial obs + planet decode-state from the actor (the learner owns no
+        # live env state in mp_env, so the worker ships the state needed to decode).
+        obs_batch, dstate = parent_conn.recv()
 
         def _select(o):
             if trainer.train_step < warmup_steps:
@@ -954,11 +994,12 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
             return trainer.select_action_batch(o)
 
         # Prime: dispatch the first env step so the actor is busy during update #0.
-        # The mixed ratio (or None) rides alongside the actions so the worker's
-        # env can anneal its opponent in lock-step with the learner's episode count.
+        # Player-0 is decoded HERE (torch, on the training device) from the raw
+        # policy output; the mixed ratio rides alongside so the worker's opponent
+        # anneals in lock-step. The replay buffer still stores the RAW action.
         prev_actions = _select(obs_batch)
         prev_obs     = obs_batch
-        parent_conn.send((prev_actions,
+        parent_conn.send((_p0_from_dstate(prev_actions, dstate),
                           _current_mix_ratio(0) if is_mixed else None))
 
         while episodes_done < num_episodes:
@@ -973,8 +1014,9 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                     upd_debt -= 1.0
 
             # ── env-step result for prev_actions ─────────────────────────────
+            # `dstate` is the post-step planet state, used to decode the next action.
             (next_obs, rewards, dones, wons,
-             fleets_sent, n_fleets, state0) = parent_conn.recv()
+             fleets_sent, n_fleets, state0, dstate) = parent_conn.recv()
 
             if render_interval > 0 and state0 is not None:
                 _ep_states_0.append(state0)
@@ -1031,7 +1073,8 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                 if mr is not None and trainer.writer:
                     trainer.writer.add_scalar("Misc/mixed_random_ratio",
                                               mr, trainer.train_step)
-                parent_conn.send((prev_actions, mr))
+                # decode player-0 with the post-step planet state from the worker
+                parent_conn.send((_p0_from_dstate(prev_actions, dstate), mr))
 
             # ── console log (every log_interval vector-steps) ────────────────
             if vstep % log_interval == 0:
@@ -1208,10 +1251,12 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                         lambda x: np.asarray(x[0]), env_2p._state
                     ))
 
-                # ── env step(s) ─────────────────────────────────────────────────
+                # ── env step(s): decode player-0 in-thread, env takes engine acts
                 if env_4p is not None:
-                    next_2p, rew_2p, done_2p, _, won_2p = env_2p.step(actions[:num_envs_2p])
-                    next_4p, rew_4p, done_4p, _, won_4p = env_4p.step(actions[num_envs_2p:])
+                    p0_2p = _p0_from_env(env_2p, actions[:num_envs_2p])
+                    p0_4p = _p0_from_env(env_4p, actions[num_envs_2p:])
+                    next_2p, rew_2p, done_2p, _, won_2p = env_2p.step_engine(p0_2p)
+                    next_4p, rew_4p, done_4p, _, won_4p = env_4p.step_engine(p0_4p)
                     next_obs = np.concatenate([next_2p, next_4p], axis=0)
                     rewards  = np.concatenate([rew_2p,  rew_4p])
                     dones    = np.concatenate([done_2p, done_4p])
@@ -1219,7 +1264,8 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                     fleets_sent = env_2p.last_fleets_sent + env_4p.last_fleets_sent
                     n_fleets    = max(env_2p.last_n_fleets, env_4p.last_n_fleets)
                 else:
-                    next_obs, rewards, dones, _, wons = env_2p.step(actions)
+                    next_obs, rewards, dones, _, wons = env_2p.step_engine(
+                        _p0_from_env(env_2p, actions))
                     fleets_sent = env_2p.last_fleets_sent
                     n_fleets    = env_2p.last_n_fleets
 
@@ -1336,12 +1382,12 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                 lambda x: np.asarray(x[0]), env_2p._state
             ))
 
-        # ── env step(s) ───────────────────────────────────────────────────────
+        # ── env step(s): decode player-0 in the learner, env takes engine actions
         if env_4p is not None:
-            acts_2p = actions[:num_envs_2p]
-            acts_4p = actions[num_envs_2p:]
-            next_2p, rew_2p, done_2p, _, won_2p = env_2p.step(acts_2p)
-            next_4p, rew_4p, done_4p, _, won_4p = env_4p.step(acts_4p)
+            p0_2p = _p0_from_env(env_2p, actions[:num_envs_2p])
+            p0_4p = _p0_from_env(env_4p, actions[num_envs_2p:])
+            next_2p, rew_2p, done_2p, _, won_2p = env_2p.step_engine(p0_2p)
+            next_4p, rew_4p, done_4p, _, won_4p = env_4p.step_engine(p0_4p)
             next_obs = np.concatenate([next_2p, next_4p], axis=0)
             rewards  = np.concatenate([rew_2p,  rew_4p])
             dones    = np.concatenate([done_2p, done_4p])
@@ -1349,7 +1395,8 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
             fleets_sent = env_2p.last_fleets_sent + env_4p.last_fleets_sent
             n_fleets    = max(env_2p.last_n_fleets,  env_4p.last_n_fleets)
         else:
-            next_obs, rewards, dones, _, wons = env_2p.step(actions)
+            next_obs, rewards, dones, _, wons = env_2p.step_engine(
+                _p0_from_env(env_2p, actions))
             fleets_sent = env_2p.last_fleets_sent
             n_fleets    = env_2p.last_n_fleets
 

@@ -40,7 +40,7 @@
     "min_fleet_ships": 3
   },
   "jax_env": {
-    "num_envs":     512,
+    "num_envs":     64,
     "jax_buffer": true,
     "actor": "mp_env",
     "threaded": true,

@@ -151,18 +151,21 @@ def _launch_fleets(
 
     actions: float32[num_players, MAX_PLANETS, 2]
       [:, :, 0] = angle (radians)
-      [:, :, 1] = ship fraction; ≤0 = no launch
+      [:, :, 1] = ABSOLUTE ship count to send; ≤0 = no launch
 
-    Ships are deducted from the planet immediately.  Multiple actions for the
-    same planet are processed left-to-right (first player first, then by slot).
+    The decoder (model/action_decoder.py) and the opponent generators now emit an
+    exact ship count, so the engine sends that count directly (floored, clamped to
+    the garrison) rather than re-deriving it from a fraction.  Ships are deducted
+    from the planet immediately.  Multiple actions for the same planet are
+    processed left-to-right (first player first, then by slot).
     """
     angles  = actions[:, :, 0]           # [num_players, MAX_PLANETS]
-    fracs   = actions[:, :, 1]           # [num_players, MAX_PLANETS]
+    reqs    = actions[:, :, 1]           # [num_players, MAX_PLANETS] absolute ships
 
     # Flatten to [num_players * MAX_PLANETS] to scan over
     n_actions = num_players * MAX_PLANETS
     flat_angles = angles.reshape(n_actions)
-    flat_fracs  = fracs.reshape(n_actions)
+    flat_reqs   = reqs.reshape(n_actions)
     flat_players = jnp.repeat(jnp.arange(num_players, dtype=jnp.int32), MAX_PLANETS)
     flat_pslots  = jnp.tile(jnp.arange(MAX_PLANETS, dtype=jnp.int32), num_players)
 
@@ -172,11 +175,10 @@ def _launch_fleets(
         player    = flat_players[i]
         p_slot    = flat_pslots[i]
         angle     = flat_angles[i]
-        frac      = flat_fracs[i]
+        req       = flat_reqs[i]
 
         avail_ships = planets_.ships[p_slot]
-        raw_ships   = frac * avail_ships
-        ships_i     = jnp.floor(jnp.maximum(raw_ships, 0.0)).astype(jnp.int32)
+        ships_i     = jnp.floor(jnp.maximum(req, 0.0)).astype(jnp.int32)
 
         is_valid = (
             (planets_.owner[p_slot] == player)
