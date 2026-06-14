@@ -156,8 +156,15 @@ class JaxVecEnvAdapter:
     reward_type     : "ship_advantage" (shaped) | "native" (terminal ±1 only)
     reward_scale    : per-step ship-advantage multiplier
     win_bonus       : terminal win/loss bonus magnitude
-    opponent        : "random" | "rule_based" | "self_play"
+    opponent        : "random" | "rule_based" | "mixed" | "self_play"
                       For "self_play", call set_policy() after trainer creation.
+                      For "mixed", each opponent independently acts randomly with
+                      probability ``mixed_random_ratio`` (else rule-based) on every
+                      step; anneal the ratio over training with
+                      set_mixed_random_ratio() to mirror the Python MixedAgent
+                      curriculum (1.0 → fully random, 0.0 → fully rule-based).
+    mixed_random_ratio : initial random-vs-rulebased blend for opponent="mixed".
+    mixed_send_prob    : per-owned-planet launch probability for the random half.
     """
 
     MAX_PLANETS = _NET_MP
@@ -179,6 +186,8 @@ class JaxVecEnvAdapter:
         win_bonus:       float = 100.0,
         opponent:        str   = "random",
         reward_cfg:      Optional[list] = None,
+        mixed_random_ratio: float = 0.5,
+        mixed_send_prob:    float = 0.3,
     ):
         self.num_envs        = num_envs
         self.num_players     = num_players
@@ -188,6 +197,11 @@ class JaxVecEnvAdapter:
         self.reward_scale    = reward_scale
         self.win_bonus       = win_bonus
         self.opponent        = opponent
+        # opponent="mixed": per-step blend of random and rule-based actions. The
+        # ratio is mutable so the training curriculum can anneal it (see
+        # set_mixed_random_ratio); send_prob is the random half's launch chance.
+        self.mixed_random_ratio = float(mixed_random_ratio)
+        self.mixed_send_prob    = float(mixed_send_prob)
         self._policy_fn: Optional[Callable] = None
         self._episode_steps  = episode_steps
 
@@ -246,6 +260,15 @@ class JaxVecEnvAdapter:
         Called once per opponent player per vector-step.
         """
         self._policy_fn = policy_fn
+
+    def set_mixed_random_ratio(self, ratio: float):
+        """Update the random-vs-rule-based blend for opponent="mixed".
+
+        Mirrors annealing MixedAgent.random_ratio in the Python backend: pass a
+        value in [0, 1] (1.0 → fully random, 0.0 → fully rule-based). No-op for
+        other opponent modes.
+        """
+        self.mixed_random_ratio = float(np.clip(ratio, 0.0, 1.0))
 
     def reset(self, seed=None, options=None):
         seeds = np.arange(self._seed_counter, self._seed_counter + self.num_envs)
@@ -563,6 +586,21 @@ class JaxVecEnvAdapter:
                 self._decode_opponent_greedy(
                     jax_acts, valid, p_owner, p_x, p_y, p_ships, p_prod
                 )
+            elif self.opponent == "mixed":
+                # Per (env, opponent-player) coin flip: with prob mixed_random_ratio
+                # that slot acts randomly this step, else rule-based — the vectorised
+                # analogue of the Python MixedAgent's per-call random/rule choice.
+                # The two decoders are gated by complementary masks so each
+                # (env, player) is filled by exactly one strategy (no overwrite).
+                use_random = (np.random.random((B, NP)) < self.mixed_random_ratio)
+                self._decode_opponent_greedy(
+                    jax_acts, valid, p_owner, p_x, p_y, p_ships, p_prod,
+                    env_gate=~use_random,
+                )
+                self._decode_opponent_random_vec(
+                    jax_acts, valid, p_owner, p_ships,
+                    send_prob=self.mixed_send_prob, env_gate=use_random,
+                )
             else:
                 self._decode_opponent_random_vec(
                     jax_acts, valid, p_owner, p_ships
@@ -583,6 +621,7 @@ class JaxVecEnvAdapter:
         p_y:      np.ndarray,
         p_ships:  np.ndarray,
         p_prod:   np.ndarray,
+        env_gate: np.ndarray = None,   # [B, NP] bool — if given, only these (env,player) may launch
     ):
         """Vectorised greedy opponent — mirrors agent1.get_custom_score heuristic.
 
@@ -590,6 +629,11 @@ class JaxVecEnvAdapter:
         that maximises (100 - dist) + 15×production + 10×production×is_enemy,
         subject to the capture-feasibility mask (ships_sent > target_ships).
         Fully vectorised over all B envs with no Python loop.
+
+        env_gate
+            Optional [B, num_players] bool mask. When provided (opponent="mixed"),
+            player ``pid`` only launches from env ``b`` if env_gate[b, pid] — used
+            to restrict the greedy half to the rule-based-chosen (env, player) slots.
         """
         B   = self.num_envs
         NMP = _NET_MP
@@ -635,6 +679,8 @@ class JaxVecEnvAdapter:
             best_val = final[bi, si, best_tgt]           # [B, NMP]
 
             launch = owned_pid & (ps > 10.0) & (best_val > -np.inf)
+            if env_gate is not None:
+                launch = launch & env_gate[:, pid][:, np.newaxis]
             b_idx, slot_idx = np.where(launch)
             if len(b_idx) == 0:
                 continue
@@ -653,8 +699,17 @@ class JaxVecEnvAdapter:
         valid:    np.ndarray,   # [B, NMP]
         p_owner:  np.ndarray,   # [B, JAMP]
         p_ships:  np.ndarray,
+        send_prob: float = 0.3,
+        env_gate:  np.ndarray = None,   # [B, NP] bool — if given, only these (env,player) may launch
     ):
-        """Vectorised random opponent — ~30% of owned planets launch a random fleet."""
+        """Vectorised random opponent — each owned planet launches a random fleet
+        with probability ``send_prob``.
+
+        env_gate
+            Optional [B, num_players] bool mask. When provided (opponent="mixed"),
+            player ``pid`` only launches from env ``b`` if env_gate[b, pid] — used
+            to restrict the random half to the random-chosen (env, player) slots.
+        """
         B   = self.num_envs
         NMP = _NET_MP
 
@@ -662,7 +717,9 @@ class JaxVecEnvAdapter:
             owned = ((p_owner[:, :NMP] == pid)
                      & valid
                      & (p_ships[:, :NMP] > 5.0))   # [B, NMP]
-            launch = owned & (np.random.random((B, NMP)) < 0.3)
+            launch = owned & (np.random.random((B, NMP)) < send_prob)
+            if env_gate is not None:
+                launch = launch & env_gate[:, pid][:, np.newaxis]
 
             b_idx, slot_idx = np.where(launch)
             if len(b_idx) == 0:

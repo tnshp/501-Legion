@@ -547,9 +547,10 @@ def _mp_env_actor_worker(conn, env_kw, num_envs_2p, num_envs_4p, capture_render)
     """Subprocess: own env_2p (+env_4p), serve step requests over `conn`.
 
     Protocol: send the initial concatenated reset obs once, then loop
-    {recv actions  →  send (next_obs, rewards, dones, wons, fleets_sent,
-    n_fleets, state0)} until a None sentinel arrives.  `state0` is the env_2p[0]
-    pre-step GameState snapshot (for rendering) or None.
+    {recv (actions, mix_ratio)  →  send (next_obs, rewards, dones, wons,
+    fleets_sent, n_fleets, state0)} until a None sentinel arrives.  `mix_ratio`
+    is the current opponent="mixed" random ratio (or None to leave it unchanged);
+    `state0` is the env_2p[0] pre-step GameState snapshot (for rendering) or None.
     """
     env_2p = JaxVecEnvAdapter(num_envs=num_envs_2p, num_players=2, **env_kw)
     env_4p = (JaxVecEnvAdapter(num_envs=num_envs_4p, num_players=4, **env_kw)
@@ -565,9 +566,14 @@ def _mp_env_actor_worker(conn, env_kw, num_envs_2p, num_envs_4p, capture_render)
 
     try:
         while True:
-            actions = conn.recv()
-            if actions is None:
+            msg = conn.recv()
+            if msg is None:
                 break
+            actions, mix_ratio = msg
+            if mix_ratio is not None:
+                env_2p.set_mixed_random_ratio(mix_ratio)
+                if env_4p is not None:
+                    env_4p.set_mixed_random_ratio(mix_ratio)
             state0 = None
             if capture_render:
                 state0 = jax.tree_util.tree_map(
@@ -728,6 +734,21 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     threaded = (actor_mode == "thread")
     ratio_4p = env_cfg.get("ratio_4p", 0.0)
 
+    # ── Mixed-opponent curriculum (opponent="mixed") ──────────────────────────
+    # Each opponent independently acts randomly with probability mixed_random_ratio
+    # (else rule-based) per step. The ratio is annealed start→end over
+    # mixed_random_ratio_decay EPISODES (default: num_episodes), mirroring the
+    # Python backend's MixedAgent curriculum.
+    mixed_send_prob = env_cfg.get("mixed_send_prob", 0.3)
+    curr_cfg        = config.get("curriculum", {})
+    mix_ratio_start = curr_cfg.get("mixed_random_ratio_start", 1.0)
+    mix_ratio_end   = curr_cfg.get("mixed_random_ratio_end",   0.0)
+    mix_ratio_decay = curr_cfg.get("mixed_random_ratio_decay")
+    mix_ratio_sched = _make_schedule(
+        curr_cfg.get("mixed_random_ratio_schedule", "linear"))
+    mix_decay_eps   = mix_ratio_decay if mix_ratio_decay is not None else num_episodes
+    is_mixed        = (opponent == "mixed")
+
     # ── Split envs between 2p and 4p ─────────────────────────────────────────
     num_envs_4p = int(num_envs * ratio_4p) if ratio_4p > 0 else 0
     num_envs_2p = num_envs - num_envs_4p
@@ -750,6 +771,8 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
         win_bonus=win_bonus,
         reward_cfg=_reward_cfg,
         opponent=opponent,
+        mixed_random_ratio=mix_ratio_start,
+        mixed_send_prob=mixed_send_prob,
     )
     env_2p = JaxVecEnvAdapter(num_envs=num_envs_2p, num_players=2, **_env_kw)
     env_4p = (JaxVecEnvAdapter(num_envs=num_envs_4p, num_players=4, **_env_kw)
@@ -761,7 +784,16 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     print(
         f"JAX backend: {tag} | opponent={opponent} | reward={_reward_names}"
     )
+    if is_mixed:
+        print(f"Mixed opponent: random_ratio {mix_ratio_start:.2f} → "
+              f"{mix_ratio_end:.2f} over {mix_decay_eps} episodes "
+              f"({curr_cfg.get('mixed_random_ratio_schedule', 'linear')}), "
+              f"send_prob={mixed_send_prob:.2f}")
     print(f"TensorBoard: logging to {log_dir} (run: tensorboard --logdir runs)")
+
+    def _current_mix_ratio(eps_done: int) -> float:
+        """Scheduled opponent random-ratio at the given completed-episode count."""
+        return mix_ratio_sched(eps_done, mix_ratio_start, mix_ratio_end, mix_decay_eps)
 
     # ── Networks ──────────────────────────────────────────────────────────────
     d_model = model_cfg.get("d_model", 128)
@@ -920,9 +952,12 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
             return trainer.select_action_batch(o)
 
         # Prime: dispatch the first env step so the actor is busy during update #0.
+        # The mixed ratio (or None) rides alongside the actions so the worker's
+        # env can anneal its opponent in lock-step with the learner's episode count.
         prev_actions = _select(obs_batch)
         prev_obs     = obs_batch
-        parent_conn.send(prev_actions)
+        parent_conn.send((prev_actions,
+                          _current_mix_ratio(0) if is_mixed else None))
 
         while episodes_done < num_episodes:
             vstep += 1
@@ -990,7 +1025,11 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
             if episodes_done < num_episodes:
                 prev_actions = _select(obs_batch)
                 prev_obs     = obs_batch
-                parent_conn.send(prev_actions)
+                mr = _current_mix_ratio(episodes_done) if is_mixed else None
+                if mr is not None and trainer.writer:
+                    trainer.writer.add_scalar("Misc/mixed_random_ratio",
+                                              mr, trainer.train_step)
+                parent_conn.send((prev_actions, mr))
 
             # ── console log (every log_interval vector-steps) ────────────────
             if vstep % log_interval == 0:
@@ -1144,6 +1183,16 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
                         expected = warmup_steps + int(
                             trainer._update_count / gradient_steps * update_freq)
 
+                # ── anneal the mixed opponent (in-process envs) ─────────────────
+                if is_mixed:
+                    mr = _current_mix_ratio(shared_ep["done"])
+                    env_2p.set_mixed_random_ratio(mr)
+                    if env_4p is not None:
+                        env_4p.set_mixed_random_ratio(mr)
+                    if trainer.writer:
+                        trainer.writer.add_scalar("Misc/mixed_random_ratio",
+                                                  mr, trainer.train_step)
+
                 # ── action selection (actor net; random during warmup) ──────────
                 if trainer.train_step < warmup_steps:
                     actions = np.stack([
@@ -1262,6 +1311,15 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
     # ── Serial main loop (fallback; jax_env.actor="serial") ───────────────────
     while (not threaded) and (not mp_env) and episodes_done < num_episodes:
         vstep += 1
+        # ── anneal the mixed opponent ─────────────────────────────────────────
+        if is_mixed:
+            mr = _current_mix_ratio(episodes_done)
+            env_2p.set_mixed_random_ratio(mr)
+            if env_4p is not None:
+                env_4p.set_mixed_random_ratio(mr)
+            if trainer.writer:
+                trainer.writer.add_scalar("Misc/mixed_random_ratio",
+                                          mr, trainer.train_step)
         # ── action selection ─────────────────────────────────────────────────
         if trainer.train_step < warmup_steps:
             actions = np.stack([
