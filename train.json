@@ -32,7 +32,7 @@
   },
   "environment": {
     "backend": "jax",
-    "opponent": "rule_based",
+    "opponent": "greedy",
     "n_players_default": 2,
     "ratio_4p": 0.3,
     "mixed_send_prob": 0.3,

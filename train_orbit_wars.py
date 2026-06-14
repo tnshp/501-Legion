@@ -640,7 +640,9 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
 
     Opponent modes (``environment.opponent`` in config):
       "random"     — uniform random actions for all opponent slots
-      "rule_based" — vectorised greedy (score-based target + direct aim)
+      "greedy"     — vectorised greedy (score-based target + direct aim);
+                     "rule_based" is accepted as a deprecated alias
+      "mixed"      — per-step blend of "random" and "greedy" (curriculum-annealed)
       "self_play"  — same policy network for all players
 
     Parameters
@@ -736,7 +738,7 @@ def train_jax(config: dict, reward_scheme=None, MAX_PLANETS: int = 40, MAX_FLEET
 
     # ── Mixed-opponent curriculum (opponent="mixed") ──────────────────────────
     # Each opponent independently acts randomly with probability mixed_random_ratio
-    # (else rule-based) per step. The ratio is annealed start→end over
+    # (else greedy) per step. The ratio is annealed start→end over
     # mixed_random_ratio_decay EPISODES (default: num_episodes), mirroring the
     # Python backend's MixedAgent curriculum.
     mixed_send_prob = env_cfg.get("mixed_send_prob", 0.3)

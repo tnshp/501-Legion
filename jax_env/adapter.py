@@ -9,8 +9,11 @@ pairwise wedge + direct atan2 aim (no per-tick lead simulation).
 
 Opponent modes (set via ``opponent`` constructor arg):
   "random"     — random angle / random fraction for all owned planets
-  "rule_based" — vectorised greedy: score-based target selection + direct aim
-                 (mirrors agent1.get_custom_score heuristic without state)
+  "greedy"     — vectorised greedy: score-based target selection + direct aim
+                 (mirrors agent1.get_custom_score heuristic without state).
+                 NOT the genuine RuleBasedAgent — that lives in the Python
+                 backend; "rule_based" is accepted here as a deprecated alias.
+  "mixed"      — per-step blend of "random" and "greedy" (see mixed_random_ratio)
   "self_play"  — same policy network for all players; call set_policy() after
                  the trainer is created
 """
@@ -156,14 +159,15 @@ class JaxVecEnvAdapter:
     reward_type     : "ship_advantage" (shaped) | "native" (terminal ±1 only)
     reward_scale    : per-step ship-advantage multiplier
     win_bonus       : terminal win/loss bonus magnitude
-    opponent        : "random" | "rule_based" | "mixed" | "self_play"
+    opponent        : "random" | "greedy" | "mixed" | "self_play"
+                      ("rule_based" is a deprecated alias for "greedy".)
                       For "self_play", call set_policy() after trainer creation.
                       For "mixed", each opponent independently acts randomly with
-                      probability ``mixed_random_ratio`` (else rule-based) on every
+                      probability ``mixed_random_ratio`` (else greedy) on every
                       step; anneal the ratio over training with
                       set_mixed_random_ratio() to mirror the Python MixedAgent
-                      curriculum (1.0 → fully random, 0.0 → fully rule-based).
-    mixed_random_ratio : initial random-vs-rulebased blend for opponent="mixed".
+                      curriculum (1.0 → fully random, 0.0 → fully greedy).
+    mixed_random_ratio : initial random-vs-greedy blend for opponent="mixed".
     mixed_send_prob    : per-owned-planet launch probability for the random half.
     """
 
@@ -197,7 +201,7 @@ class JaxVecEnvAdapter:
         self.reward_scale    = reward_scale
         self.win_bonus       = win_bonus
         self.opponent        = opponent
-        # opponent="mixed": per-step blend of random and rule-based actions. The
+        # opponent="mixed": per-step blend of random and greedy actions. The
         # ratio is mutable so the training curriculum can anneal it (see
         # set_mixed_random_ratio); send_prob is the random half's launch chance.
         self.mixed_random_ratio = float(mixed_random_ratio)
@@ -262,10 +266,10 @@ class JaxVecEnvAdapter:
         self._policy_fn = policy_fn
 
     def set_mixed_random_ratio(self, ratio: float):
-        """Update the random-vs-rule-based blend for opponent="mixed".
+        """Update the random-vs-greedy blend for opponent="mixed".
 
         Mirrors annealing MixedAgent.random_ratio in the Python backend: pass a
-        value in [0, 1] (1.0 → fully random, 0.0 → fully rule-based). No-op for
+        value in [0, 1] (1.0 → fully random, 0.0 → fully greedy). No-op for
         other opponent modes.
         """
         self.mixed_random_ratio = float(np.clip(ratio, 0.0, 1.0))
@@ -582,13 +586,13 @@ class JaxVecEnvAdapter:
                     self._decode_for_player(
                         opp_acts, jax_acts, pid, owned_opp, valid, p_x, p_y, p_ships
                     )
-            elif self.opponent == "rule_based":
+            elif self.opponent in ("greedy", "rule_based"):  # rule_based: alias
                 self._decode_opponent_greedy(
                     jax_acts, valid, p_owner, p_x, p_y, p_ships, p_prod
                 )
             elif self.opponent == "mixed":
                 # Per (env, opponent-player) coin flip: with prob mixed_random_ratio
-                # that slot acts randomly this step, else rule-based — the vectorised
+                # that slot acts randomly this step, else greedy — the vectorised
                 # analogue of the Python MixedAgent's per-call random/rule choice.
                 # The two decoders are gated by complementary masks so each
                 # (env, player) is filled by exactly one strategy (no overwrite).
@@ -633,7 +637,7 @@ class JaxVecEnvAdapter:
         env_gate
             Optional [B, num_players] bool mask. When provided (opponent="mixed"),
             player ``pid`` only launches from env ``b`` if env_gate[b, pid] — used
-            to restrict the greedy half to the rule-based-chosen (env, player) slots.
+            to restrict the greedy half to the greedy-chosen (env, player) slots.
         """
         B   = self.num_envs
         NMP = _NET_MP
