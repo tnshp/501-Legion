@@ -47,10 +47,7 @@
     "actor_sync_every": 2,
     "rollout_lead": 8,
     "num_players":  2,
-    "episode_steps": 500,
-    "reward_type":  "ship_advantage",
-    "reward_scale": 0.01,
-    "win_bonus":    100.0
+    "episode_steps": 500
   },
   "curriculum": {
     "mixed_random_ratio_start": 1.0,

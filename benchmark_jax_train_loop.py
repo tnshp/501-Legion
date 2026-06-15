@@ -5,7 +5,7 @@ Measures per-phase timing for the train_jax() hot path:
 
   select   — select_action_batch: network inference on (B, seq, 13)
   envstep  — JaxVecEnvAdapter.step: JAX game step + obs extraction + reward
-  add      — replay_buffer.add_batch  [CPU with ReplayBuffer, GPU with JaxReplayBuffer]
+  add      — replay_buffer.add_batch  (CPU numpy ReplayBuffer)
   update   — SAC gradient updates (debt-scaled at num_envs/update_freq per vstep)
 
 Optionally sweeps over multiple num_envs values to plot scaling behaviour.
@@ -15,8 +15,8 @@ Usage
     python benchmark_jax_train_loop.py                              # default config
     python benchmark_jax_train_loop.py --config train.json --num-envs 128
     python benchmark_jax_train_loop.py --sweep 64,128,256,512      # scaling sweep
-    python benchmark_jax_train_loop.py --jax-buffer                # GPU-resident buffer
-    python benchmark_jax_train_loop.py --jax-buffer --sweep 256,512,1024  # both
+    python benchmark_jax_train_loop.py --threaded                  # + actor-learner pass
+    python benchmark_jax_train_loop.py --mp-env                    # + subprocess-actor pass
 """
 from __future__ import annotations
 
@@ -29,9 +29,9 @@ import time
 from collections import deque
 
 # Grow VRAM on demand instead of JAX's default 75 % grab, so the main process
-# (torch + JaxReplayBuffer) and the --mp-env actor subprocess (its own JAX env)
-# can coexist on one GPU.  Must be set BEFORE `import jax`.  Honoured if already
-# set in the environment.
+# (torch) and the --mp-env actor subprocess (its own JAX env) can coexist on one
+# GPU.  Must be set BEFORE `import jax`.  Honoured if already set in the
+# environment.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
@@ -40,7 +40,6 @@ import torch
 
 from model.SAC import P_network, Q_network
 from sac_train import SACTrainer
-from env.orbit_wars import OrbitWarsEnv
 from jax_env import JaxVecEnvAdapter
 # NB: load_config is imported lazily inside main() — importing train_orbit_wars
 # at module scope pulls in agents.agent1, whose relative import breaks when the
@@ -113,14 +112,13 @@ class GPUSampler(threading.Thread):
         return float(gu.mean())
 
 
-def verdict(gpu_util_mean: float | None, cpu_ms: float, gpu_ms: float,
-            jax_buffer: bool = False):
+def verdict(gpu_util_mean: float | None, cpu_ms: float, gpu_ms: float):
     print("\n=== BOTTLENECK VERDICT ===")
     total = cpu_ms + gpu_ms
     if total <= 0:
         return
-    cpu_label = "env rollout" if jax_buffer else "env rollout + buffer"
-    gpu_label = "inference + buffer scatter + SAC updates" if jax_buffer else "network inference + SAC updates"
+    cpu_label = "env rollout + buffer"
+    gpu_label = "network inference + SAC updates"
     if cpu_ms > gpu_ms:
         print(f"  CPU-bound: {cpu_label} = {cpu_ms:.3f} ms/vstep "
               f"({cpu_ms/total*100:.0f}%) vs GPU {gpu_ms:.3f} ms/vstep.")
@@ -165,20 +163,20 @@ def _build_env(config: dict, num_envs: int, num_players: int = 2) -> JaxVecEnvAd
     )
 
 
-def _build_trainer(config: dict, env: JaxVecEnvAdapter, device: str,
-                   use_jax_buffer: bool = False) -> SACTrainer:
+def _build_trainer(config: dict, env: JaxVecEnvAdapter, device: str) -> SACTrainer:
     t   = config.get("training",  {})
     m   = config.get("model",     {})
     tdl = config.get("td_lambda", {})
     net_kw = dict(
-        state_dim       = OrbitWarsEnv.STATE_DIM,
-        action_dim      = OrbitWarsEnv.ACTION_DIM,
+        state_dim       = JaxVecEnvAdapter.STATE_DIM,
+        action_dim      = JaxVecEnvAdapter.ACTION_DIM,
         max_planets     = 40,
         max_fleets      = 200,
         d_model         = m.get("d_model", 128),
         dim_feedforward = m.get("ff_dim", 512),
         num_layers      = m.get("num_layers", 2),
         nhead           = m.get("num_heads", 4),
+        attn_impl       = m.get("attn_impl", "torch"),
     )
     return SACTrainer(
         env                = env,
@@ -201,7 +199,7 @@ def _build_trainer(config: dict, env: JaxVecEnvAdapter, device: str,
         block_size         = tdl.get("block_size",   50),
         refresh_freq       = tdl.get("refresh_freq", 1000),
         log_dir            = None,
-        use_jax_buffer     = use_jax_buffer,
+        env_stride         = env.num_envs if tdl.get("enabled", False) else 1,
         tb_log_every       = config.get("io", {}).get("tb_log_every", 25),
         compile_mode       = m.get("compile_mode", "default"),
     )
@@ -222,18 +220,12 @@ def _run(
     device:        str,
     n_vsteps:      int,
     label:         str,
-    jax_buffer:    bool = False,
     profile_update: bool = False,
 ) -> dict:
     """Run one benchmark pass and return timing statistics.
 
     warmup_steps=0 means gradient updates start from the first vector step
     (use this for the measured pass when the buffer is already pre-filled).
-
-    When jax_buffer=True, a JAX sync is inserted after add_batch so that the
-    async GPU scatter completes before the timer for the 'add' phase stops.
-    Without it the scatter would bleed into the 'update' phase wall time,
-    making 'add' look free and 'update' look artificially slow.
     """
     is_cuda     = (device == "cuda")
     phases      = {k: 0.0 for k in ("select", "envstep", "add", "update")}
@@ -266,11 +258,6 @@ def _run(
         trainer.replay_buffer.add_batch(
             obs, actions, rewards, next_obs, dones.astype(np.float32)
         )
-        # With JaxReplayBuffer the scatter is dispatched asynchronously to the
-        # GPU.  Block here so the 'add' timer captures the true scatter cost
-        # rather than letting it bleed into the 'update' phase.
-        if jax_buffer:
-            trainer.replay_buffer.block_until_ready()
         trainer.train_step += num_envs
         obs = next_obs
         t3 = time.perf_counter()
@@ -306,18 +293,12 @@ def _run(
     n_tr   = n_vsteps * num_envs
 
     if label:
-        _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device, jax_buffer,
+        _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device,
                       upd_phases=_upd_phases if is_cuda and _n_upd_calls > 0 else None,
                       n_upd_calls=_n_upd_calls)
 
-    # With JaxReplayBuffer, 'add' is GPU work (JAX scatter); attribute it to
-    # the GPU side so the bottleneck verdict is accurate.
-    if jax_buffer:
-        cpu_ms = phases["envstep"] / n_vsteps * 1000
-        gpu_ms = (phases["select"] + phases["add"] + phases["update"]) / n_vsteps * 1000
-    else:
-        cpu_ms = (phases["envstep"] + phases["add"]) / n_vsteps * 1000
-        gpu_ms = (phases["select"]  + phases["update"]) / n_vsteps * 1000
+    cpu_ms = (phases["envstep"] + phases["add"]) / n_vsteps * 1000
+    gpu_ms = (phases["select"]  + phases["update"]) / n_vsteps * 1000
 
     return {"tps": n_tr / wall, "cpu_ms": cpu_ms, "gpu_ms": gpu_ms,
             "wall": wall, "n_updates": n_upds, "upd_phases": _upd_phases,
@@ -540,20 +521,17 @@ def _run_mp_env(trainer, config, num_envs, num_players, update_freq, grad_steps,
 
 
 def _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device,
-                  jax_buffer: bool = False,
                   upd_phases: dict | None = None, n_upd_calls: int = 0):
     tps = n_tr / wall
     print(f"\n=== {label} ===")
     print(f"  {n_vsteps} vsteps × {n_tr//n_vsteps} envs = {n_tr} transitions"
-          f" | {n_upds} gradient updates | device={device}"
-          + ("  [JaxReplayBuffer]" if jax_buffer else ""))
+          f" | {n_upds} gradient updates | device={device}")
     print(f"  {'TOTAL wall':20s}: {wall*1000:9.1f} ms  "
           f"({wall/n_tr*1000:.4f} ms/transition)  {tps:9.1f} trans/s")
-    # 'add' moves from CPU to GPU when using JaxReplayBuffer.
     phase_device = {
         "select":  "GPU",
         "envstep": "CPU",
-        "add":     "GPU*" if jax_buffer else "CPU",
+        "add":     "CPU",
         "update":  "GPU",
     }
     for k in ("select", "envstep", "add", "update"):
@@ -561,17 +539,10 @@ def _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device,
         print(f"  {k:20s}: {phases[k]*1000:9.1f} ms  "
               f"({phases[k]/n_vsteps*1000:7.3f} ms/vstep)  "
               f"{share:5.1f}%  [{phase_device[k]}]")
-    if jax_buffer:
-        cpu_ms = phases["envstep"] / n_vsteps * 1000
-        gpu_ms = (phases["select"] + phases["add"] + phases["update"]) / n_vsteps * 1000
-        print(f"\n  CPU (envstep)           : {cpu_ms:.3f} ms/vstep")
-        print(f"  GPU (select+add*+update): {gpu_ms:.3f} ms/vstep")
-        print(f"  * add = JAX GPU scatter (async H2D + in-place scatter)")
-    else:
-        cpu_ms = (phases["envstep"] + phases["add"]) / n_vsteps * 1000
-        gpu_ms = (phases["select"]  + phases["update"]) / n_vsteps * 1000
-        print(f"\n  CPU (envstep + add): {cpu_ms:.3f} ms/vstep")
-        print(f"  GPU (select + upd) : {gpu_ms:.3f} ms/vstep")
+    cpu_ms = (phases["envstep"] + phases["add"]) / n_vsteps * 1000
+    gpu_ms = (phases["select"]  + phases["update"]) / n_vsteps * 1000
+    print(f"\n  CPU (envstep + add): {cpu_ms:.3f} ms/vstep")
+    print(f"  GPU (select + upd) : {gpu_ms:.3f} ms/vstep")
     bot = "CPU-bound" if cpu_ms > gpu_ms else "GPU-bound"
     print(f"  BOTTLENECK         : {bot}")
     if cpu_ms > gpu_ms:
@@ -619,9 +590,6 @@ def main():
                     help="measured vector steps (default: 300)")
     ap.add_argument("--sweep",        type=str, default=None,
                     help="comma-separated num_envs values to sweep, e.g. 64,128,256,512")
-    ap.add_argument("--jax-buffer",   action="store_true", default=None,
-                    help="use GPU-resident JaxReplayBuffer (overrides jax_env.jax_buffer "
-                         "in config; requires JAX CUDA + enough VRAM)")
     ap.add_argument("--threaded",     action="store_true",
                     help="also run an actor-learner THREADED pass and report its "
                          "end-to-end trans/s next to the serial number (the serial "
@@ -643,9 +611,6 @@ def main():
     t_cfg   = config.get("training", {})
     jax_cfg = config.get("jax_env",  {})
 
-    # --jax-buffer flag takes precedence; fall back to config value.
-    jax_buffer = args.jax_buffer if args.jax_buffer is not None else jax_cfg.get("jax_buffer", False)
-
     default_num_envs = args.num_envs or jax_cfg.get("num_envs", 256)
     update_freq_cfg  = t_cfg.get("update_freq", None)
     grad_steps       = t_cfg.get("gradient_steps", 1)
@@ -662,11 +627,7 @@ def main():
         print(f"GPU    : {torch.cuda.get_device_name(0)}")
     reward_names = [c.get("scheme") for c in config.get("reward", [])]
     print(f"Reward : {reward_names}")
-    if jax_buffer:
-        print("Buffer : JaxReplayBuffer (GPU-resident JAX scatter/gather + DLPack)")
-        print("         Set XLA_PYTHON_CLIENT_PREALLOCATE=false to share VRAM with PyTorch")
-    else:
-        print("Buffer : ReplayBuffer (CPU numpy)")
+    print("Buffer : ReplayBuffer (CPU numpy)")
     print(f"grad_steps={grad_steps}  warmup_steps={warmup_steps}  batch_size={batch_size}")
 
     results = []
@@ -678,18 +639,16 @@ def main():
         print(f"{'='*70}")
 
         env     = _build_env(config, num_envs, args.num_players)
-        trainer = _build_trainer(config, env, device, use_jax_buffer=jax_buffer)
+        trainer = _build_trainer(config, env, device)
 
         # ── Warmup: JIT compilation + fill buffer ─────────────────────────────
         # JAX traces and compiles step() on the first call. We run enough vsteps
         # to cross warmup_steps (so gradient updates also get compiled) plus a
-        # small margin.  With JaxReplayBuffer the write and sample kernels are
-        # also JIT-compiled on the first add_batch / sample call.
+        # small margin.
         warmup_vsteps = warmup_steps // num_envs + 2
         print(f"Warming up ({warmup_vsteps} vsteps) — JIT compile + buffer fill...")
         _run(trainer, env, num_envs, warmup_steps, update_freq, grad_steps,
-             batch_size, device, n_vsteps=warmup_vsteps, label="",
-             jax_buffer=jax_buffer)
+             batch_size, device, n_vsteps=warmup_vsteps, label="")
 
         # ── Measured pass ─────────────────────────────────────────────────────
         # warmup_steps=0 so updates start immediately (buffer already filled).
@@ -699,14 +658,14 @@ def main():
                    batch_size=batch_size, device=device,
                    n_vsteps=args.steps,
                    label=f"JAX  num_envs={num_envs}  {args.num_players}p",
-                   jax_buffer=jax_buffer, profile_update=args.profile_update)
+                   profile_update=args.profile_update)
         sampler.stop()
 
         print("\n=== GPU UTILIZATION (serial) ===")
         gpu_util = sampler.report()
         if device == "cuda":
             print(f"  torch peak allocated: {torch.cuda.max_memory_allocated()/1024**2:6.0f} MiB")
-        verdict(gpu_util, res["cpu_ms"], res["gpu_ms"], jax_buffer=jax_buffer)
+        verdict(gpu_util, res["cpu_ms"], res["gpu_ms"])
 
         # ── Threaded (actor-learner) pass ─────────────────────────────────────
         if args.threaded:
