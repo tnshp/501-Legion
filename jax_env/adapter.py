@@ -49,6 +49,7 @@ _vo_spec = _ilu.spec_from_file_location("orbit_vec_opponents", _vo_path)
 _vec_opponents = _ilu.module_from_spec(_vo_spec)
 _vo_spec.loader.exec_module(_vec_opponents)
 greedy_opponent = _vec_opponents.greedy_opponent
+agent1_opponent = _vec_opponents.agent1_opponent
 random_opponent = _vec_opponents.random_opponent
 
 # Network / observation shape constants (must match OrbitWarsEnv)
@@ -177,8 +178,10 @@ class JaxVecEnvAdapter:
     reward_type     : "ship_advantage" (shaped) | "native" (terminal ±1 only)
     reward_scale    : per-step ship-advantage multiplier
     win_bonus       : terminal win/loss bonus magnitude
-    opponent        : "random" | "greedy" | "mixed" | "self_play"
+    opponent        : "random" | "greedy" | "agent1" | "mixed" | "self_play"
                       ("rule_based" is a deprecated alias for "greedy".)
+                      "agent1" is a fuller vectorised port of the agents/agent1.py
+                      rule-based bot (defence + accurate-ship-count attack).
                       For "self_play", call set_policy() after trainer creation.
                       For "mixed", each opponent independently acts randomly with
                       probability ``mixed_random_ratio`` (else greedy) on every
@@ -675,6 +678,18 @@ class JaxVecEnvAdapter:
         elif self.opponent in ("greedy", "rule_based"):  # rule_based: alias
             greedy_opponent(jax_acts, valid, p_owner, p_x, p_y, p_r,
                             p_ships, p_prod, omega, NP)
+        elif self.opponent == "agent1":
+            # Fuller rule-based port: needs the live fleet arrays for its defence
+            # (incoming enemy fleets) and en-route accounting.
+            f_owner  = np.asarray(state.fleets.owner,  dtype=np.int32)
+            f_x      = np.asarray(state.fleets.x,      dtype=np.float32)
+            f_y      = np.asarray(state.fleets.y,      dtype=np.float32)
+            f_angle  = np.asarray(state.fleets.angle,  dtype=np.float32)
+            f_ships  = np.asarray(state.fleets.ships,  dtype=np.float32)
+            f_active = np.asarray(state.fleets.active, dtype=bool)
+            agent1_opponent(jax_acts, valid, p_owner, p_x, p_y, p_r,
+                            p_ships, p_prod, omega, NP,
+                            f_owner, f_x, f_y, f_angle, f_ships, f_active)
         elif self.opponent == "mixed":
             # Per (env, opponent-player) coin flip: with prob mixed_random_ratio
             # that slot acts randomly this step, else greedy — the vectorised

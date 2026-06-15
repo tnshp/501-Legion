@@ -15,7 +15,7 @@ Arguments
 ---------
     --checkpoint    Path to a .pt checkpoint produced by train_orbit_wars.py
     --output        Output HTML path (default: jax_replay.html)
-    --opponent      "random" | "greedy" (default: greedy)
+    --opponent      "random" | "greedy" | "agent1" (default: greedy)
     --seed          Integer seed for planet generation (default: 42)
     --episode-steps Max ticks to record (default: 500)
     --ship-speed    Physics constant (default: 6.0)
@@ -404,7 +404,7 @@ def main():
     # ── Standalone / checkpoint mode ──────────────────────────────────────────
     parser.add_argument("--checkpoint",    default=None,             help="Path to .pt checkpoint")
     parser.add_argument("--output",        default="jax_replay.html",help="Output HTML path")
-    parser.add_argument("--opponent",      default="greedy",         choices=["random", "greedy", "rule_based"])
+    parser.add_argument("--opponent",      default="greedy",         choices=["random", "greedy", "agent1", "rule_based"])
     parser.add_argument("--seed",          type=int, default=42,     help="Episode seed")
     parser.add_argument("--episode-steps", type=int, default=500)
     parser.add_argument("--ship-speed",    type=float, default=6.0)

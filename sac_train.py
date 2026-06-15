@@ -11,14 +11,6 @@ from typing import Callable, Dict, Optional
 import gymnasium as gym
 
 try:
-    import jax
-    import jax.numpy as jnp
-    import jax.random as jr
-    _JAX_BUFFER_AVAILABLE = True
-except ImportError:
-    _JAX_BUFFER_AVAILABLE = False
-
-try:
     from torch.utils.tensorboard import SummaryWriter
     _TB_AVAILABLE = True
 except ImportError:
@@ -171,197 +163,6 @@ class ReplayBuffer:
 
 
 # =============================================================================
-# GPU-resident Replay Buffer (JAX backend)
-# =============================================================================
-
-class JaxReplayBuffer:
-    """Replay buffer backed by JAX arrays living on the GPU.
-
-    Designed for the JAX parallel environment backend, where the CPU numpy
-    random-scatter bottleneck in ReplayBuffer.sample() becomes the dominant
-    cost (85 %+ of wall time at high num_envs).
-
-    Write path  (add_batch): numpy → JAX GPU arrays via a JIT-compiled scatter
-      with buffer donation so XLA can update in-place without copying the full
-      buffer.  The H2D transfer happens once per vector step for num_envs
-      sequential rows — cache-friendly and unavoidable.
-
-    Read path   (sample): JIT-compiled GPU gather + JAX PRNG → DLPack →
-      PyTorch CUDA tensor.  No CPU round-trip; no PCIe on the critical path.
-      The A100's ~2 TB/s HBM bandwidth makes this ~100× faster than numpy
-      random fancy-indexing on CPU.
-
-    SACTrainer.update() works unchanged: _to() is a no-op for already-CUDA
-    tensors, and the preprocessors operate on CUDA tensors via torch.cat etc.
-
-    Requirements: JAX with CUDA backend; enough VRAM for the buffer
-      (≈ capacity × 2 × obs_bytes + action/reward bytes).  On an A100 40 GB
-      a 100 k buffer of shape (140, 13) costs ≈ 1.4 GB.
-
-    Set XLA_PYTHON_CLIENT_PREALLOCATE=false before importing JAX so it does
-    not claim all VRAM at startup, leaving headroom for PyTorch.
-    """
-
-    def __init__(self, capacity: int, obs_shape: tuple, action_shape: tuple):
-        if not _JAX_BUFFER_AVAILABLE:
-            raise RuntimeError(
-                "JaxReplayBuffer requires JAX with CUDA support. "
-                "Install with: pip install 'jax[cuda12]'"
-            )
-        self._cap  = int(capacity)
-        self._ptr  = 0
-        self._size = 0
-        # Serialises add_batch (donates/reassigns the buffer arrays) against
-        # sample (reads them) so the threaded loop's env and learner threads
-        # can't race on the donated GPU arrays.
-        self._lock = threading.Lock()
-
-        # Pre-allocate all arrays on the JAX default device (GPU).
-        self._obs  = jnp.zeros((self._cap, *obs_shape),    dtype=jnp.float32)
-        self._acts = jnp.zeros((self._cap, *action_shape), dtype=jnp.float32)
-        self._rews = jnp.zeros((self._cap, 1),             dtype=jnp.float32)
-        self._nxts = jnp.zeros((self._cap, *obs_shape),    dtype=jnp.float32)
-        self._dons = jnp.zeros((self._cap, 1),             dtype=jnp.float32)
-
-        self._rng = jr.PRNGKey(0)
-
-        # donate_argnums=(0..4): XLA may reuse the buffer arrays in-place for
-        # the scatter output, avoiding a full-buffer copy on every write step.
-        # After the call the original references are invalid; we always
-        # reassign self._obs etc. from the returned tuple.
-        self._jit_write = jax.jit(
-            JaxReplayBuffer._write_fn, donate_argnums=(0, 1, 2, 3, 4)
-        )
-        # static_argnums=(7,): batch_size is always the same value, so JAX
-        # compiles once and treats it as a compile-time shape constant, which
-        # lets (n,) in jr.randint be a static shape rather than a traced value.
-        self._jit_sample = jax.jit(
-            JaxReplayBuffer._sample_fn, static_argnums=(7,)
-        )
-
-    # ── JIT-compiled kernels (static methods so jax.jit can trace them) ──────
-
-    @staticmethod
-    def _write_fn(obs, acts, rews, nxts, dons,
-                  new_obs, new_acts, new_rews, new_nxts, new_dons, idxs):
-        return (
-            obs .at[idxs].set(new_obs),
-            acts.at[idxs].set(new_acts),
-            rews.at[idxs].set(new_rews),
-            nxts.at[idxs].set(new_nxts),
-            dons.at[idxs].set(new_dons),
-        )
-
-    @staticmethod
-    def _sample_fn(key, obs, acts, rews, nxts, dons, size, n):
-        # size is dynamic (grows during warmup); n is static (always batch_size).
-        idxs = jr.randint(key, (n,), minval=0, maxval=size)
-        return obs[idxs], acts[idxs], rews[idxs], nxts[idxs], dons[idxs]
-
-    # ── Public interface (matches ReplayBuffer) ───────────────────────────────
-
-    def add_batch(self, obs, acts, rews, nxts, dons):
-        n    = len(obs)
-        with self._lock:
-            idxs = (jnp.arange(n, dtype=jnp.int32) + self._ptr) % self._cap
-            (self._obs, self._acts, self._rews, self._nxts, self._dons) = (
-                self._jit_write(
-                    self._obs, self._acts, self._rews, self._nxts, self._dons,
-                    jnp.asarray(obs,  dtype=jnp.float32),
-                    jnp.asarray(acts, dtype=jnp.float32),
-                    jnp.asarray(rews, dtype=jnp.float32).reshape(-1, 1),
-                    jnp.asarray(nxts, dtype=jnp.float32),
-                    jnp.asarray(dons, dtype=jnp.float32).reshape(-1, 1),
-                    idxs,
-                )
-            )
-            self._ptr  = int((self._ptr + n) % self._cap)
-            self._size = min(self._size + n, self._cap)
-
-    def add(self, obs, act, rew, nxt, don):
-        """Single-transition add (delegates to add_batch for a batch of 1)."""
-        self.add_batch(
-            obs[np.newaxis], act[np.newaxis],
-            np.array([rew],        dtype=np.float32),
-            nxt[np.newaxis],
-            np.array([float(don)], dtype=np.float32),
-        )
-
-    def sample(self, batch_size: int):
-        """GPU gather → DLPack → PyTorch CUDA tensors (zero PCIe transfer)."""
-        with self._lock:
-            self._rng, subkey = jr.split(self._rng)
-            arrays = self._jit_sample(
-                subkey,
-                self._obs, self._acts, self._rews, self._nxts, self._dons,
-                jnp.int32(self._size),  # dynamic: changes as buffer fills
-                batch_size,             # static: compile-time shape constant
-            )
-        # DLPack: zero-copy JAX GPU array → PyTorch CUDA tensor.
-        # JAX handles stream synchronisation inside to_dlpack so the gather
-        # is guaranteed complete before PyTorch reads the tensor.
-        return tuple(torch.from_dlpack(a) for a in arrays)
-
-    def __len__(self) -> int:
-        return self._size
-
-    # ── Persistence (GPU → numpy for I/O, only at checkpoint time) ───────────
-
-    def save(self, path: str):
-        n   = self._size
-        tmp = f"{path}.tmp"
-        with open(tmp, "wb") as f:
-            np.savez(
-                f,
-                states      = np.asarray(self._obs [:n]),
-                actions     = np.asarray(self._acts[:n]),
-                rewards     = np.asarray(self._rews[:n]),
-                next_states = np.asarray(self._nxts[:n]),
-                dones       = np.asarray(self._dons[:n]),
-                ptr  = np.int64(self._ptr),
-                size = np.int64(self._size),
-                max  = np.int64(self._cap),
-            )
-        os.replace(tmp, path)
-
-    def load(self, path: str) -> bool:
-        if not os.path.exists(path):
-            return False
-        data       = np.load(path)
-        saved_max  = int(data["max"])
-        saved_size = int(data["size"])
-        saved_ptr  = int(data["ptr"])
-        n = min(saved_size, self._cap)
-        idxs = jnp.arange(n, dtype=jnp.int32)
-        (self._obs, self._acts, self._rews, self._nxts, self._dons) = (
-            self._jit_write(
-                self._obs, self._acts, self._rews, self._nxts, self._dons,
-                jnp.array(data["states"]     [:n], dtype=jnp.float32),
-                jnp.array(data["actions"]    [:n], dtype=jnp.float32),
-                jnp.array(data["rewards"]    [:n], dtype=jnp.float32),
-                jnp.array(data["next_states"][:n], dtype=jnp.float32),
-                jnp.array(data["dones"]      [:n], dtype=jnp.float32),
-                idxs,
-            )
-        )
-        if saved_max == self._cap:
-            self._size = saved_size
-            self._ptr  = saved_ptr
-        else:
-            self._size = n
-            self._ptr  = n % self._cap
-        return True
-
-    def block_until_ready(self):
-        """Block until all pending JAX GPU operations (scatter/gather) complete.
-
-        Used by the benchmark to get accurate per-phase wall-clock timings.
-        Not needed in normal training — JAX dispatches are async by design.
-        """
-        jax.block_until_ready(self._obs)
-
-
-# =============================================================================
 # SAC Trainer
 # =============================================================================
 
@@ -421,7 +222,6 @@ class SACTrainer:
         action_preprocessor: Optional[Callable] = None,
         action_postprocessor: Optional[Callable] = None,
         log_dir: Optional[str] = None,
-        use_jax_buffer: bool = False,
         tb_log_every: int = 1,
         compile_mode: str = "default",
     ):
@@ -579,37 +379,15 @@ class SACTrainer:
         self.q2_optimizer     = optim.Adam(self.q2_net.parameters(),     lr=learning_rate, **adam_kw)
 
         # ── replay buffer ─────────────────────────────────────────────────────
-        # JaxReplayBuffer keeps all data on the GPU and samples via a JIT-compiled
-        # gather + DLPack, eliminating the CPU random-indexing bottleneck.
-        # Only use with the JAX parallel backend on a GPU with sufficient VRAM.
-        # TD(λ) samples its gradient minibatches from the numpy λ-return CACHE,
-        # not from the replay buffer (the buffer is only read during the periodic
-        # cache refresh).  So the GPU-resident JaxReplayBuffer brings no speed-up
-        # here and its arrays live on-device where the numpy cache build can't read
-        # them — fall back to the CPU ReplayBuffer.  Also round capacity down to a
-        # whole number of env-interleaved rows so the per-env stride stays aligned
-        # across the circular wrap.
+        # Round capacity down to a whole number of env-interleaved rows so the
+        # per-env stride stays aligned across the circular wrap (TD(λ) path).
+        if use_lambda_returns and self._lambda_env_stride > 1:
+            replay_buffer_size = ((replay_buffer_size // self._lambda_env_stride)
+                                  * self._lambda_env_stride)
+        self.replay_buffer = ReplayBuffer(replay_buffer_size, obs_shape, act_shape)
         if use_lambda_returns:
-            if self._lambda_env_stride > 1:
-                replay_buffer_size = ((replay_buffer_size // self._lambda_env_stride)
-                                      * self._lambda_env_stride)
-            if use_jax_buffer:
-                print("TD(λ) enabled → using CPU ReplayBuffer (the λ-return cache, "
-                      "not buffer.sample(), is the hot path; JaxReplayBuffer gives "
-                      "no benefit and can't be read by the numpy cache build).")
-            self.replay_buffer = ReplayBuffer(replay_buffer_size, obs_shape, act_shape)
-            print(f"Using CPU ReplayBuffer ({replay_buffer_size} capacity, "
+            print(f"Using ReplayBuffer ({replay_buffer_size} capacity, "
                   f"env_stride={self._lambda_env_stride})")
-        elif use_jax_buffer:
-            if not _JAX_BUFFER_AVAILABLE:
-                raise RuntimeError(
-                    "use_jax_buffer=True requires JAX with CUDA. "
-                    "Install: pip install 'jax[cuda12]'"
-                )
-            self.replay_buffer = JaxReplayBuffer(replay_buffer_size, obs_shape, act_shape)
-            print(f"Using JaxReplayBuffer (GPU-resident, {replay_buffer_size} capacity)")
-        else:
-            self.replay_buffer = ReplayBuffer(replay_buffer_size, obs_shape, act_shape)
 
         self.train_step = 0   # counts env interactions only (not gradient steps)
 

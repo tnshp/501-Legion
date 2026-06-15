@@ -5,7 +5,8 @@
     "num_heads": 4,
     "ff_dim": 768,
     "dropout": 0.15,
-    "compile_mode": "default"
+    "compile_mode": "default",
+    "attn_impl": "flash"
   },
   "training": {
     "num_episodes": 1000,
@@ -32,7 +33,7 @@
   },
   "environment": {
     "backend": "jax",
-    "opponent": "greedy",
+    "opponent": "agent1",
     "n_players_default": 2,
     "ratio_4p": 0.3,
     "mixed_send_prob": 0.3,
@@ -41,7 +42,6 @@
   },
   "jax_env": {
     "num_envs":     64,
-    "jax_buffer": true,
     "actor": "mp_env",
     "threaded": true,
     "actor_sync_every": 2,

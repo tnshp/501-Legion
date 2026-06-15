@@ -224,18 +224,143 @@ def _aggregate_meta_features(state):
     return torch.cat([planet_cnt, prod_tot, ships_tot], dim=-1)  # [B, 12]
 
 
+# ============================================================
+# Flash-Attention encoder (SDPA)
+# ============================================================
+#
+# The stock nn.TransformerEncoderLayer only reaches a fused/flash attention
+# kernel on its inference "fast path"; in training (and under torch.compile) it
+# graph-breaks and runs the slow math path.  These modules route attention
+# through F.scaled_dot_product_attention, which dispatches to the
+# FlashAttention-2 kernel on Ampere+ GPUs (A30, RTX 30xx) under fp16/bf16
+# autocast and falls back to the memory-efficient / math kernel everywhere else
+# (older GPUs, CPU, fp32).
+#
+# The parameter layout is deliberately IDENTICAL to nn.TransformerEncoderLayer
+# (self_attn.in_proj_weight/in_proj_bias/out_proj, linear1, linear2, norm1,
+# norm2, stacked under an .layers ModuleList), so a checkpoint trained with one
+# implementation loads unchanged into the other — switch `attn_impl` freely
+# without retraining.
+
+class _SDPASelfAttention(nn.Module):
+    """Multi-head self-attention via F.scaled_dot_product_attention.
+
+    Parameters mirror nn.MultiheadAttention exactly (combined QKV projection in
+    `in_proj_weight`/`in_proj_bias`, output projection in `out_proj`), so the
+    state_dict keys match the stock encoder's `self_attn.*`.
+    """
+
+    def __init__(self, d_model, nhead, dropout=0.0):
+        super().__init__()
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        self.nhead    = nhead
+        self.head_dim = d_model // nhead
+        self.dropout  = dropout
+        self.in_proj_weight = nn.Parameter(torch.empty(3 * d_model, d_model))
+        self.in_proj_bias   = nn.Parameter(torch.empty(3 * d_model))
+        self.out_proj       = nn.Linear(d_model, d_model)
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        # Match nn.MultiheadAttention's init (xavier on the fused QKV, zero biases;
+        # out_proj.weight keeps the nn.Linear default).
+        nn.init.xavier_uniform_(self.in_proj_weight)
+        nn.init.constant_(self.in_proj_bias, 0.0)
+        nn.init.constant_(self.out_proj.bias, 0.0)
+
+    def forward(self, x):                         # x: [B, L, D]
+        B, L, _ = x.shape
+        qkv = F.linear(x, self.in_proj_weight, self.in_proj_bias)   # [B, L, 3D]
+        q, k, v = qkv.chunk(3, dim=-1)
+        # [B, L, D] → [B, nhead, L, head_dim]
+        q = q.view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+        k = k.view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+        v = v.view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+        # No attention mask (all tokens attend to all — padding is zeroed
+        # upstream), which keeps this on the flash-eligible path.
+        attn = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.dropout if self.training else 0.0)
+        attn = attn.transpose(1, 2).reshape(B, L, self.nhead * self.head_dim)
+        return self.out_proj(attn)
+
+
+class _SDPAEncoderLayer(nn.Module):
+    """Post-norm transformer encoder layer (matches nn.TransformerEncoderLayer
+    defaults: norm_first=False, ReLU FFN) but with SDPA self-attention."""
+
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, activation="relu"):
+        super().__init__()
+        self.self_attn = _SDPASelfAttention(d_model, nhead, dropout=dropout)
+        self.linear1   = nn.Linear(d_model, dim_feedforward)
+        self.dropout   = nn.Dropout(dropout)
+        self.linear2   = nn.Linear(dim_feedforward, d_model)
+        self.norm1     = nn.LayerNorm(d_model)
+        self.norm2     = nn.LayerNorm(d_model)
+        self.dropout1  = nn.Dropout(dropout)
+        self.dropout2  = nn.Dropout(dropout)
+        self.activation = F.gelu if activation == "gelu" else F.relu
+
+    def _sa_block(self, x):
+        return self.dropout1(self.self_attn(x))
+
+    def _ff_block(self, x):
+        return self.dropout2(self.linear2(self.dropout(self.activation(self.linear1(x)))))
+
+    def forward(self, src):
+        x = self.norm1(src + self._sa_block(src))
+        x = self.norm2(x + self._ff_block(x))
+        return x
+
+
+class _SDPAEncoder(nn.Module):
+    """Stack of _SDPAEncoderLayer (mirrors nn.TransformerEncoder's `.layers`)."""
+
+    def __init__(self, d_model, nhead, num_layers, dim_feedforward, dropout, activation="relu"):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            _SDPAEncoderLayer(d_model, nhead, dim_feedforward, dropout, activation)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, src):
+        x = src
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+def _build_encoder(d_model, nhead, num_layers, dim_feedforward, dropout,
+                   attn_impl="torch"):
+    """Construct the transformer encoder for the chosen attention implementation.
+
+    attn_impl="flash"  → SDPA encoder (FlashAttention-2 on Ampere+; safe
+                         fallback elsewhere), compile-friendly.
+    attn_impl="torch"  → stock nn.TransformerEncoder (default; unchanged).
+
+    Both produce identical state_dict keys, so checkpoints are interchangeable.
+    """
+    if attn_impl == "flash":
+        return _SDPAEncoder(d_model, nhead, num_layers, dim_feedforward, dropout,
+                            activation="relu")
+    encoder_layer = nn.TransformerEncoderLayer(
+        d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+        dropout=dropout, activation="relu", batch_first=True)
+    return nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+
 class Q_network(nn.Module):
     def __init__(self,
                  state_dim=13,
                  action_dim=4,   # matches OrbitWarsEnv.ACTION_DIM
                  max_planets=40,
-                 max_fleets=100, 
+                 max_fleets=100,
                  d_model=128,
                  nhead=4,
                  num_layers=3,
                  dim_feedforward=512,
-                 dropout=0.1):
-        
+                 dropout=0.1,
+                 attn_impl="torch"):
+
         super(Q_network, self).__init__()
         self.max_planets = max_planets
         self.max_fleets = max_fleets
@@ -261,23 +386,14 @@ class Q_network(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.sep_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
-        #transformer - encoder only
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation='relu',
-            batch_first=True  # Recommended for easier tensor handling
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, 
-                                                 num_layers=num_layers, 
-        )
-        
-        self.d_model = d_model
-    
+        #transformer - encoder only (attn_impl="flash" routes attention through SDPA)
+        self.transformer = _build_encoder(
+            d_model, nhead, num_layers, dim_feedforward, dropout, attn_impl)
 
-    def forward(self, state, action):  
+        self.d_model = d_model
+
+
+    def forward(self, state, action):
         """
         Args:
             state: [batch_size, state_seq_len, d_model] or [state_seq_len, d_model]
@@ -347,12 +463,13 @@ class V_network(nn.Module):
                  state_dim=13,
                  max_planets=40,
                  max_fleets=100,
-                 d_model=128, 
-                 nhead=4, 
-                 num_layers=2,  
-                 dim_feedforward=128, 
-                 dropout=0.1):
-        
+                 d_model=128,
+                 nhead=4,
+                 num_layers=2,
+                 dim_feedforward=128,
+                 dropout=0.1,
+                 attn_impl="torch"):
+
         super(V_network, self).__init__()
         self.max_planets = max_planets
         self.max_fleets = max_fleets
@@ -376,21 +493,12 @@ class V_network(nn.Module):
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
-        #transformer - encoder only
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation='relu',
-            batch_first=True  # Recommended for easier tensor handling
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, 
-                                                 num_layers=num_layers, 
-        )
+        #transformer - encoder only (attn_impl="flash" routes attention through SDPA)
+        self.transformer = _build_encoder(
+            d_model, nhead, num_layers, dim_feedforward, dropout, attn_impl)
         self.d_model = d_model
 
-    def forward(self, state):  
+    def forward(self, state):
         
         planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
         planets_mask[:, :self.max_planets] = 1
@@ -441,11 +549,12 @@ class P_network(nn.Module):
                  action_dim=4,   # matches OrbitWarsEnv.ACTION_DIM
                  max_planets=40,
                  max_fleets=100, 
-                 nhead=4, 
-                 num_layers=3,  
-                 dim_feedforward=128, 
-                 dropout=0.1):
-        
+                 nhead=4,
+                 num_layers=3,
+                 dim_feedforward=128,
+                 dropout=0.1,
+                 attn_impl="torch"):
+
         super(P_network, self).__init__()
 
         self.max_planets = max_planets
@@ -469,19 +578,10 @@ class P_network(nn.Module):
         self.mu_head = nn.Linear(d_model, action_dim)
         self.sigma_head = nn.Linear(d_model, action_dim)
 
-        #transformer - encoder only
-        encoder_layer = nn.TransformerEncoderLayer(
-                            d_model=d_model, 
-                            nhead=nhead, 
-                            dim_feedforward=dim_feedforward,
-                            dropout=dropout,
-                            activation='relu',
-                            batch_first=True  # Recommended for easier tensor handling
-                        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, 
-                                                 num_layers=num_layers, 
-                        )
-        
+        #transformer - encoder only (attn_impl="flash" routes attention through SDPA)
+        self.transformer = _build_encoder(
+            d_model, nhead, num_layers, dim_feedforward, dropout, attn_impl)
+
         self.d_model = d_model
         self.action_dim = action_dim
 
