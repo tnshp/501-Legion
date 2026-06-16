@@ -1,37 +1,35 @@
 """
-Benchmark the JAX-vectorised SAC training inner loop.
+Light throughput check for the JAX-vectorised SAC training loop.
 
-Measures per-phase timing for the train_jax() hot path:
+Builds the env + trainer straight from a train config (same `num_envs`, model,
+opponent, reward, TD(λ), attn_impl, …) and runs **one** measured pass for a given
+number of vector-steps, then reports transitions/sec. The pass uses the
+`jax_env.actor` mode from the config (override with `--actor`):
 
-  select   — select_action_batch: network inference on (B, seq, 13)
-  envstep  — JaxVecEnvAdapter.step: JAX game step + obs extraction + reward
-  add      — replay_buffer.add_batch  (CPU numpy ReplayBuffer)
-  update   — SAC gradient updates (debt-scaled at num_envs/update_freq per vstep)
-
-Optionally sweeps over multiple num_envs values to plot scaling behaviour.
+  serial  — single-threaded select → step → add → update; also prints a per-phase
+            breakdown (select / envstep / add / update) so you can see where the
+            time goes.
+  thread  — actor-learner threads (overlap CPU rollout with GPU update).
+  mp_env  — env in a subprocess, pipelined with the learner's GPU update.
 
 Usage
 -----
-    python benchmark_jax_train_loop.py                              # default config
-    python benchmark_jax_train_loop.py --config train.json --num-envs 128
-    python benchmark_jax_train_loop.py --sweep 64,128,256,512      # scaling sweep
-    python benchmark_jax_train_loop.py --threaded                  # + actor-learner pass
-    python benchmark_jax_train_loop.py --mp-env                    # + subprocess-actor pass
+    python benchmark_jax_train_loop.py                       # config's actor, 100 vsteps
+    python benchmark_jax_train_loop.py --vsteps 200
+    python benchmark_jax_train_loop.py --actor serial        # force a mode
+    python benchmark_jax_train_loop.py --num-envs 256
 """
 from __future__ import annotations
 
 import argparse
-import copy
 import os
 import subprocess
 import threading
 import time
-from collections import deque
 
 # Grow VRAM on demand instead of JAX's default 75 % grab, so the main process
-# (torch) and the --mp-env actor subprocess (its own JAX env) can coexist on one
-# GPU.  Must be set BEFORE `import jax`.  Honoured if already set in the
-# environment.
+# (torch) and the mp_env actor subprocess (its own JAX env) can coexist on one
+# GPU.  Must be set BEFORE `import jax`.  Honoured if already set in the env.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
@@ -43,7 +41,7 @@ from sac_train import SACTrainer
 from jax_env import JaxVecEnvAdapter
 # NB: load_config is imported lazily inside main() — importing train_orbit_wars
 # at module scope pulls in agents.agent1, whose relative import breaks when the
-# --mp-env spawn child re-imports this module to reconstruct __main__.
+# mp_env spawn child re-imports this module to reconstruct __main__.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,19 +49,18 @@ from jax_env import JaxVecEnvAdapter
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GPUSampler(threading.Thread):
-    """Polls nvidia-smi at ~10 Hz and records gpu/mem utilization + mem used.
+    """Polls nvidia-smi at ~10 Hz for gpu/mem utilization + mem used.
 
-    Self-disables silently if nvidia-smi is not available.
+    Self-disables silently if nvidia-smi is unavailable.
     """
-    QUERY = ("--query-gpu=utilization.gpu,utilization.memory,memory.used,"
-             "memory.total", "--format=csv,noheader,nounits")
+    QUERY = ("--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits")
 
     def __init__(self, period=0.1):
         super().__init__(daemon=True)
         self.period = period
         self._stop_evt = threading.Event()
-        self.gpu_util, self.mem_util, self.mem_used = [], [], []
-        self.mem_total = None
+        self.gpu_util, self.mem_used, self.mem_total = [], [], None
         self.available = self._probe()
 
     def _probe(self):
@@ -74,20 +71,15 @@ class GPUSampler(threading.Thread):
         except Exception:
             return False
 
-    def _read(self):
-        out = subprocess.run(("nvidia-smi", *self.QUERY), capture_output=True,
-                             text=True, timeout=5, check=True).stdout
-        g, m, used, total = (float(x) for x in out.strip().splitlines()[0].split(","))
-        return g, m, used, total
-
     def run(self):
         if not self.available:
             return
         while not self._stop_evt.is_set():
             try:
-                g, m, used, total = self._read()
-                self.gpu_util.append(g); self.mem_util.append(m)
-                self.mem_used.append(used); self.mem_total = total
+                out = subprocess.run(("nvidia-smi", *self.QUERY), capture_output=True,
+                                     text=True, timeout=5, check=True).stdout
+                g, used, total = (float(x) for x in out.strip().splitlines()[0].split(","))
+                self.gpu_util.append(g); self.mem_used.append(used); self.mem_total = total
             except Exception:
                 pass
             self._stop_evt.wait(self.period)
@@ -99,63 +91,27 @@ class GPUSampler(threading.Thread):
 
     def report(self):
         if not self.available or not self.gpu_util:
-            print("  (nvidia-smi unavailable — GPU utilization not sampled)")
-            return None
-        gu  = np.array(self.gpu_util)
-        mu  = np.array(self.mem_util)
-        used = np.array(self.mem_used)
-        print(f"  samples            : {len(gu)}")
-        print(f"  GPU util  (compute): mean {gu.mean():5.1f}%   peak {gu.max():5.0f}%")
-        print(f"  GPU util  (memory) : mean {mu.mean():5.1f}%   peak {mu.max():5.0f}%")
-        print(f"  GPU memory  used   : mean {used.mean():6.0f} MiB  peak {used.max():6.0f}"
-              f" MiB  / {self.mem_total:.0f} MiB")
-        return float(gu.mean())
-
-
-def verdict(gpu_util_mean: float | None, cpu_ms: float, gpu_ms: float):
-    print("\n=== BOTTLENECK VERDICT ===")
-    total = cpu_ms + gpu_ms
-    if total <= 0:
-        return
-    cpu_label = "env rollout + buffer"
-    gpu_label = "network inference + SAC updates"
-    if cpu_ms > gpu_ms:
-        print(f"  CPU-bound: {cpu_label} = {cpu_ms:.3f} ms/vstep "
-              f"({cpu_ms/total*100:.0f}%) vs GPU {gpu_ms:.3f} ms/vstep.")
-        print("  JAX env.step() / obs extraction dominates.")
-        print("  → Increase num_envs to amortise per-step GPU calls.")
-    else:
-        print(f"  GPU-bound: {gpu_label} = {gpu_ms:.3f} ms/vstep "
-              f"({gpu_ms/total*100:.0f}%) vs CPU {cpu_ms:.3f} ms/vstep.")
-        print("  → Increase batch_size or use a bigger model to improve GPU utilisation.")
-    if gpu_util_mean is not None:
-        if gpu_util_mean < 35:
-            print(f"  GPU util mean {gpu_util_mean:.0f}% is LOW → GPU starved between kernels;")
-            print("  feed bigger/fewer batches and cut per-step CPU work.")
-        elif gpu_util_mean > 70:
-            print(f"  GPU util mean {gpu_util_mean:.0f}% is HIGH → genuinely compute-bound;")
-            print("  a faster GPU translates fairly directly into more transitions/s.")
-        else:
-            print(f"  GPU util mean {gpu_util_mean:.0f}% is MODERATE → partial starvation;")
-            print("  a faster GPU helps the compute portion but CPU caps the gains.")
+            print("  GPU util: (nvidia-smi unavailable)")
+            return
+        gu, used = np.array(self.gpu_util), np.array(self.mem_used)
+        print(f"  GPU util : mean {gu.mean():4.0f}%  peak {gu.max():4.0f}%   "
+              f"mem {used.max():.0f} / {self.mem_total:.0f} MiB")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Build env + trainer from a train config (mirrors train_orbit_wars.train_jax)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_env(config: dict, num_envs: int, num_players: int = 2) -> JaxVecEnvAdapter:
-    env_cfg    = config.get("environment", {})
-    jax_cfg    = config.get("jax_env",     {})
-    reward_cfg = config.get("reward",      [])
+    env_cfg = config.get("environment", {})
+    jax_cfg = config.get("jax_env",     {})
     return JaxVecEnvAdapter(
         num_envs        = num_envs,
         num_players     = num_players,
         episode_steps   = jax_cfg.get("episode_steps", 500),
         tanh_scale      = env_cfg.get("tanh_scale",    0.2),
         min_fleet_ships = env_cfg.get("min_fleet_ships", 3),
-        reward_cfg      = reward_cfg,
-        # fallback fields kept for compat when reward_cfg is empty
+        reward_cfg      = config.get("reward", []),
         reward_type     = jax_cfg.get("reward_type",  "ship_advantage"),
         reward_scale    = jax_cfg.get("reward_scale", 0.01),
         win_bonus       = jax_cfg.get("win_bonus",    100.0),
@@ -206,31 +162,17 @@ def _build_trainer(config: dict, env: JaxVecEnvAdapter, device: str) -> SACTrain
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Core benchmark runner
+# Serial pass (phase-profiled)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run(
-    trainer:       SACTrainer,
-    env:           JaxVecEnvAdapter,
-    num_envs:      int,
-    warmup_steps:  int,
-    update_freq:   int,
-    grad_steps:    int,
-    batch_size:    int,
-    device:        str,
-    n_vsteps:      int,
-    label:         str,
-    profile_update: bool = False,
-) -> dict:
-    """Run one benchmark pass and return timing statistics.
+def _run_serial(trainer, env, num_envs, warmup_steps, update_freq, grad_steps,
+                batch_size, device, n_vsteps):
+    """Single-threaded select→step→add→update loop. Returns (phases, wall, n_upds).
 
-    warmup_steps=0 means gradient updates start from the first vector step
-    (use this for the measured pass when the buffer is already pre-filled).
+    warmup_steps=0 means updates start from the first vstep (buffer pre-filled).
     """
-    is_cuda     = (device == "cuda")
-    phases      = {k: 0.0 for k in ("select", "envstep", "add", "update")}
-    _upd_phases = {k: 0.0 for k in ("sample", "q_target", "q1", "q2", "pi", "tail")}
-    _n_upd_calls = 0
+    is_cuda  = (device == "cuda")
+    phases   = {k: 0.0 for k in ("select", "envstep", "add", "update")}
     n_upds   = 0
     upd_debt = 0.0
 
@@ -240,7 +182,6 @@ def _run(
     wall0 = time.perf_counter()
 
     for _ in range(n_vsteps):
-        # ── select action ────────────────────────────────────────────────────
         t0 = time.perf_counter()
         if trainer.train_step < warmup_steps:
             actions = np.stack([env.action_space.sample() for _ in range(num_envs)])
@@ -250,35 +191,22 @@ def _run(
             torch.cuda.synchronize()
         t1 = time.perf_counter()
 
-        # ── env step ─────────────────────────────────────────────────────────
         next_obs, rewards, dones, _, _ = env.step(actions)
         t2 = time.perf_counter()
 
-        # ── buffer ───────────────────────────────────────────────────────────
         trainer.replay_buffer.add_batch(
-            obs, actions, rewards, next_obs, dones.astype(np.float32)
-        )
+            obs, actions, rewards, next_obs, dones.astype(np.float32))
         trainer.train_step += num_envs
         obs = next_obs
         t3 = time.perf_counter()
 
-        # ── gradient updates (debt mechanism) ────────────────────────────────
         if (trainer.train_step >= warmup_steps
                 and len(trainer.replay_buffer) >= batch_size):
             upd_debt += num_envs / update_freq
             while upd_debt >= 1.0:
                 for _ in range(grad_steps):
-                    # Sub-phase profiling inserts ~7 cuda.synchronize() per update,
-                    # which serialises the GPU and both inflates the update time and
-                    # tanks measured util — so it is OFF by default; the coarse
-                    # select/envstep/add/update timing below stays accurate.  Enable
-                    # with --profile-update only when you want the sub-phase split.
-                    _ures = trainer.update(_profile=(is_cuda and profile_update))
-                    if _ures and "_phases" in _ures:
-                        for _k, _v in _ures["_phases"].items():
-                            _upd_phases[_k] += _v
-                    _n_upd_calls += 1
-                n_upds   += 1
+                    trainer.update()
+                n_upds += 1
                 upd_debt -= 1.0
             if is_cuda:
                 torch.cuda.synchronize()
@@ -289,43 +217,41 @@ def _run(
         phases["add"]     += t3 - t2
         phases["update"]  += t4 - t3
 
-    wall   = time.perf_counter() - wall0
-    n_tr   = n_vsteps * num_envs
+    return phases, time.perf_counter() - wall0, n_upds
 
-    if label:
-        _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device,
-                      upd_phases=_upd_phases if is_cuda and _n_upd_calls > 0 else None,
-                      n_upd_calls=_n_upd_calls)
 
-    cpu_ms = (phases["envstep"] + phases["add"]) / n_vsteps * 1000
-    gpu_ms = (phases["select"]  + phases["update"]) / n_vsteps * 1000
-
-    return {"tps": n_tr / wall, "cpu_ms": cpu_ms, "gpu_ms": gpu_ms,
-            "wall": wall, "n_updates": n_upds, "upd_phases": _upd_phases,
-            "n_upd_calls": _n_upd_calls}
+def _report_serial(phases, wall, n_vsteps, num_envs, n_upds, device, env_backend):
+    n_tr = n_vsteps * num_envs
+    tps  = n_tr / wall
+    print(f"\n=== RESULT (serial) ===")
+    print(f"  {n_vsteps} vsteps × {num_envs} envs = {n_tr} transitions | "
+          f"{n_upds} updates | torch={device}")
+    print(f"  {'TOTAL wall':9s}: {wall*1000:8.1f} ms   "
+          f"({wall/n_tr*1000:.4f} ms/transition)   {tps:8.1f} trans/s")
+    # envstep = JAX game step (on env_backend) + host-side obs extraction (CPU),
+    # so it is tagged with the env's JAX backend rather than a flat "CPU".
+    tag = {"select": "GPU", "envstep": f"{env_backend}+host", "add": "CPU", "update": "GPU"}
+    for k in ("select", "envstep", "add", "update"):
+        print(f"  {k:9s}: {phases[k]*1000:8.1f} ms   "
+              f"({phases[k]/n_vsteps*1000:7.3f} ms/vstep)   "
+              f"{phases[k]/wall*100:5.1f}%   [{tag[k]}]")
+    dom = max(phases, key=phases.get)
+    print(f"  dominant : {dom} ({phases[dom]/wall*100:.0f}% of wall)")
+    return tps
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Threaded (actor-learner) throughput runner
-#
-# Mirrors train_orbit_wars.train_jax's threaded loop — env-rollout thread +
-# learner thread sharing the trainer/buffer with a separate actor net synced
-# every `actor_sync_every` UPDATES.  The serial _run() measures per-phase cost
-# but cannot show CPU/GPU overlap; this measures the real end-to-end throughput
-# the threaded training loop achieves, so the two trans/s numbers are directly
-# comparable.
+# Threaded (actor-learner) pass — overlaps CPU rollout with the GPU update
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_threaded(
-    trainer, env, num_envs, update_freq, grad_steps, batch_size, device,
-    n_vsteps, actor_sync_every, rollout_lead, label,
-) -> dict:
+def _run_threaded(trainer, env, num_envs, update_freq, grad_steps, batch_size,
+                  device, n_vsteps, actor_sync_every, rollout_lead, env_backend):
+    import copy
     is_cuda = (device == "cuda")
 
     def _orig(m):
         return getattr(m, "_orig_mod", m)
 
-    # Separate actor net (env thread reads it; learner syncs into it).
     actor_net = copy.deepcopy(_orig(trainer.policy_net)).to(device).eval()
     if is_cuda and hasattr(torch, "compile"):
         actor_net = torch.compile(actor_net)
@@ -338,18 +264,15 @@ def _run_threaded(
     sync_actor()
 
     def actor_select(states):
-        st = trainer._to(torch.FloatTensor(states))
-        st = trainer.state_preprocessor(st)
+        st = trainer.state_preprocessor(trainer._to(torch.FloatTensor(states)))
         with actor_lock, torch.no_grad(), trainer._autocast():
             a, _ = trainer._sample(actor_net, st)
         return a.float().cpu().numpy()
 
-    # Buffer is pre-filled by the warmup pass, so updates start immediately
-    # (warmup budget = 0 here).
     lead_cap = max(rollout_lead * num_envs, batch_size)
-    stop  = threading.Event()
-    prod  = {"v": 0}
-    upds  = {"n": 0}
+    stop = threading.Event()
+    prod = {"v": 0}
+    upds = {"n": 0}
 
     def env_worker():
         obs, _ = env.reset()
@@ -369,12 +292,10 @@ def _run_threaded(
     def learner_worker():
         upd = last_sync = 0
         while not stop.is_set():
-            ts = trainer.train_step
             if len(trainer.replay_buffer) < batch_size:
                 time.sleep(0.001)
                 continue
-            target = int(ts / update_freq * grad_steps)
-            if upd >= target:
+            if upd >= int(trainer.train_step / update_freq * grad_steps):
                 time.sleep(0.0005)
                 continue
             trainer.update()
@@ -384,55 +305,33 @@ def _run_threaded(
                 last_sync = upd
         upds["n"] = upd
 
-    # Reset both counters so the ratio math (env: _update_count→expected;
-    # learner: train_step→target) is measured over just this pass and not
-    # offset by the warmup/serial passes that ran before it.
-    trainer.train_step    = 0
-    trainer._update_count = 0
+    trainer.train_step = trainer._update_count = 0
     if is_cuda:
         torch.cuda.synchronize()
     wall0 = time.perf_counter()
-    learner_t = threading.Thread(target=learner_worker, daemon=True)
-    env_t     = threading.Thread(target=env_worker,     daemon=True)
-    learner_t.start(); env_t.start()
-    env_t.join()
-    stop.set()
-    learner_t.join()
+    lt = threading.Thread(target=learner_worker, daemon=True)
+    et = threading.Thread(target=env_worker, daemon=True)
+    lt.start(); et.start(); et.join(); stop.set(); lt.join()
     if is_cuda:
         torch.cuda.synchronize()
     wall = time.perf_counter() - wall0
 
     n_tr = n_vsteps * num_envs
     tps  = n_tr / wall
-    print(f"\n=== {label} ===")
-    print(f"  {n_vsteps} vsteps × {num_envs} envs = {n_tr} transitions"
-          f" | {upds['n']} gradient updates | device={device}  [actor-learner threads]")
-    print(f"  {'TOTAL wall':20s}: {wall*1000:9.1f} ms  "
-          f"({wall/n_tr*1000:.4f} ms/transition)  {tps:9.1f} trans/s")
-    return {"tps": tps, "wall": wall, "n_updates": upds["n"]}
+    print(f"\n=== RESULT (thread) ===")
+    print(f"  {n_vsteps} vsteps × {num_envs} envs = {n_tr} transitions | "
+          f"{upds['n']} updates | torch={device} env={env_backend}  [actor-learner threads]")
+    print(f"  {'TOTAL wall':9s}: {wall*1000:8.1f} ms   "
+          f"({wall/n_tr*1000:.4f} ms/transition)   {tps:8.1f} trans/s")
+    return tps
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Multiprocess actor (env in a subprocess) — REAL CPU/GPU overlap
-#
-# The threaded actor-learner above is ~5x SLOWER because the env's host-side
-# obs-extraction (np.asarray off ~20 device arrays = the ~35 ms 'envstep') holds
-# the GIL, so it cannot overlap the GPU update running in another thread.  A
-# separate PROCESS has its own GIL, so the env step truly runs concurrently with
-# the learner's gradient update.
-#
-# Pipeline (one transition lag): the learner dispatches update() for the data it
-# already has WHILE the actor subprocess steps the env for the actions just sent.
-# Critical path/vstep collapses from select+envstep+add+update (~92 ms) toward
-# max(envstep, update)+select+add+IPC.
+# Multiprocess actor (env in a subprocess) — real CPU/GPU overlap
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _mp_env_worker(conn, config, num_envs, num_players):
-    """Subprocess entry point: own the JAX env, serve step requests over `conn`.
-
-    Protocol: send initial reset obs once, then loop {recv actions → send
-    (next_obs, rewards, dones)} until a None sentinel arrives.
-    """
+    """Subprocess: own the JAX env, serve step requests over `conn`."""
     env = _build_env(config, num_envs, num_players)
     obs, _ = env.reset()
     conn.send(obs)
@@ -449,128 +348,69 @@ def _mp_env_worker(conn, config, num_envs, num_players):
 
 
 def _run_mp_env(trainer, config, num_envs, num_players, update_freq, grad_steps,
-                batch_size, device, n_vsteps, label):
+                batch_size, device, n_vsteps, env_backend):
     import multiprocessing as mp
-
     is_cuda = (device == "cuda")
     ctx = mp.get_context("spawn")            # fork is unsafe once CUDA is init'd
     parent_conn, child_conn = ctx.Pipe()
     proc = ctx.Process(target=_mp_env_worker,
-                       args=(child_conn, config, num_envs, num_players),
-                       daemon=True)
+                       args=(child_conn, config, num_envs, num_players), daemon=True)
     proc.start()
-    child_conn.close()                        # parent keeps only its end
+    child_conn.close()
+    obs = parent_conn.recv()
 
-    obs = parent_conn.recv()                  # initial reset obs from the actor
-
-    # ── Warmup: fill the buffer + JIT-compile env (worker) and update (here) ──
-    warmup_vsteps = trainer.batch_size // num_envs + 3
-    for _ in range(warmup_vsteps):
+    # Warmup: fill buffer + JIT-compile env (worker) and update (here).
+    for _ in range(trainer.batch_size // num_envs + 3):
         actions = trainer.select_action_batch(obs)
         parent_conn.send(actions)
         nobs, r, d = parent_conn.recv()
         trainer.replay_buffer.add_batch(obs, actions, r, nobs, d)
         trainer.train_step += num_envs
         obs = nobs
-    for _ in range(3):                        # compile the update graph
+    for _ in range(3):
         if len(trainer.replay_buffer) >= batch_size:
             trainer.update()
     if is_cuda:
         torch.cuda.synchronize()
 
-    # ── Measured pipelined pass ──────────────────────────────────────────────
+    # Measured pipelined pass: dispatch the next env step, then run the GPU update
+    # for the data already in the buffer WHILE the actor subprocess steps.
     trainer.train_step = 0
     n_upds = 0
-    # Prime: dispatch the first env step so the actor is busy during update #0.
     actions = trainer.select_action_batch(obs)
     parent_conn.send(actions)
     prev_obs, prev_actions = obs, actions
-
     if is_cuda:
         torch.cuda.synchronize()
     wall0 = time.perf_counter()
     for t in range(n_vsteps):
-        # GPU update overlaps the actor stepping `prev_actions` (CPU, other proc)
         if len(trainer.replay_buffer) >= batch_size:
             trainer.update()
             n_upds += 1
-        nobs, r, d = parent_conn.recv()       # result for prev_actions
+        nobs, r, d = parent_conn.recv()
         trainer.replay_buffer.add_batch(prev_obs, prev_actions, r, nobs, d)
         trainer.train_step += num_envs
         next_actions = trainer.select_action_batch(nobs)
         if t < n_vsteps - 1:
-            parent_conn.send(next_actions)    # actor starts the next step now
+            parent_conn.send(next_actions)
         prev_obs, prev_actions = nobs, next_actions
     if is_cuda:
         torch.cuda.synchronize()
     wall = time.perf_counter() - wall0
 
-    parent_conn.send(None)                    # stop the actor
+    parent_conn.send(None)
     proc.join(timeout=5)
     if proc.is_alive():
         proc.terminate()
 
     n_tr = n_vsteps * num_envs
     tps  = n_tr / wall
-    print(f"\n=== {label} ===")
-    print(f"  {n_vsteps} vsteps × {num_envs} envs = {n_tr} transitions"
-          f" | {n_upds} gradient updates | device={device}  [mp actor subprocess]")
-    print(f"  {'TOTAL wall':20s}: {wall*1000:9.1f} ms  "
-          f"({wall/n_tr*1000:.4f} ms/transition)  {tps:9.1f} trans/s")
-    return {"tps": tps, "wall": wall, "n_updates": n_upds}
-
-
-def _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device,
-                  upd_phases: dict | None = None, n_upd_calls: int = 0):
-    tps = n_tr / wall
-    print(f"\n=== {label} ===")
-    print(f"  {n_vsteps} vsteps × {n_tr//n_vsteps} envs = {n_tr} transitions"
-          f" | {n_upds} gradient updates | device={device}")
-    print(f"  {'TOTAL wall':20s}: {wall*1000:9.1f} ms  "
-          f"({wall/n_tr*1000:.4f} ms/transition)  {tps:9.1f} trans/s")
-    phase_device = {
-        "select":  "GPU",
-        "envstep": "CPU",
-        "add":     "CPU",
-        "update":  "GPU",
-    }
-    for k in ("select", "envstep", "add", "update"):
-        share = phases[k] / wall * 100
-        print(f"  {k:20s}: {phases[k]*1000:9.1f} ms  "
-              f"({phases[k]/n_vsteps*1000:7.3f} ms/vstep)  "
-              f"{share:5.1f}%  [{phase_device[k]}]")
-    cpu_ms = (phases["envstep"] + phases["add"]) / n_vsteps * 1000
-    gpu_ms = (phases["select"]  + phases["update"]) / n_vsteps * 1000
-    print(f"\n  CPU (envstep + add): {cpu_ms:.3f} ms/vstep")
-    print(f"  GPU (select + upd) : {gpu_ms:.3f} ms/vstep")
-    bot = "CPU-bound" if cpu_ms > gpu_ms else "GPU-bound"
-    print(f"  BOTTLENECK         : {bot}")
-    if cpu_ms > gpu_ms:
-        print("    → env.step() / obs extraction dominates. "
-              "Increase num_envs to amortise per-step GPU calls, "
-              "or reduce observation overhead.")
-    else:
-        print("    → network inference / SAC updates dominate. "
-              "Increase batch_size or use a bigger model to improve GPU utilisation.")
-
-    if upd_phases is not None and n_upd_calls > 0:
-        total = sum(upd_phases.values())
-        print(f"\n  update sub-phases  ({n_upd_calls} gradient calls; "
-              f"sync between phases adds ~5 µs overhead each):")
-        labels = {
-            "sample":   "sample+H2D",
-            "q_target": "q_target (no_grad)",
-            "q1":       "q1 fwd+bwd+optim",
-            "q2":       "q2 fwd+bwd+optim",
-            "pi":       "pi  fwd+bwd+optim",
-            "tail":     "polyak + alpha",
-        }
-        for k, v in upd_phases.items():
-            ms = v / n_upd_calls * 1000
-            pct = v / max(total, 1e-9) * 100
-            print(f"    {labels.get(k, k):22s}: {ms:7.3f} ms/call  ({pct:5.1f}%)")
-        print(f"    {'── total':22s}: {total/n_upd_calls*1000:.3f} ms/call  "
-              f"[actual update={phases['update']/n_vsteps*1000:.3f} ms/vstep]")
+    print(f"\n=== RESULT (mp_env) ===")
+    print(f"  {n_vsteps} vsteps × {num_envs} envs = {n_tr} transitions | "
+          f"{n_upds} updates | torch={device} env={env_backend}  [mp actor subprocess]")
+    print(f"  {'TOTAL wall':9s}: {wall*1000:8.1f} ms   "
+          f"({wall/n_tr*1000:.4f} ms/transition)   {tps:8.1f} trans/s")
+    return tps
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -579,150 +419,89 @@ def _print_report(label, phases, wall, n_vsteps, n_tr, n_upds, device,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Benchmark the JAX-vectorised SAC training loop")
-    ap.add_argument("--config",       default="train.json",
-                    help="path to train config JSON (default: train.json)")
-    ap.add_argument("--num-envs",     type=int, default=None,
-                    help="parallel envs (default: jax_env.num_envs from config)")
-    ap.add_argument("--num-players",  type=int, default=2,
-                    help="players per game (default: 2)")
-    ap.add_argument("--steps",        type=int, default=300,
-                    help="measured vector steps (default: 300)")
-    ap.add_argument("--sweep",        type=str, default=None,
-                    help="comma-separated num_envs values to sweep, e.g. 64,128,256,512")
-    ap.add_argument("--threaded",     action="store_true",
-                    help="also run an actor-learner THREADED pass and report its "
-                         "end-to-end trans/s next to the serial number (the serial "
-                         "phase profile cannot show CPU/GPU overlap)")
-    ap.add_argument("--mp-env",       action="store_true",
-                    help="also run a MULTIPROCESS-actor pass (env in a subprocess) "
-                         "that truly overlaps the CPU env.step with the GPU update, "
-                         "and report its end-to-end trans/s vs serial")
-    ap.add_argument("--profile-update", action="store_true",
-                    help="break the update into sub-phases (sample/q_target/q1/q2/pi/"
-                         "tail).  Adds ~7 cuda syncs/update that distort total time + "
-                         "util, so leave OFF for representative throughput numbers.")
+        description="Light single-pass throughput check for the JAX SAC train loop")
+    ap.add_argument("--config",      default="train.json",
+                    help="train config JSON (default: train.json)")
+    ap.add_argument("--vsteps",      type=int, default=100,
+                    help="measured vector-steps (default: 100)")
+    ap.add_argument("--num-envs",    type=int, default=None,
+                    help="override jax_env.num_envs from config")
+    ap.add_argument("--actor",       default=None, choices=["serial", "thread", "mp_env"],
+                    help="override jax_env.actor from config")
+    ap.add_argument("--num-players", type=int, default=2)
+    ap.add_argument("--no-gpu-sample", action="store_true",
+                    help="skip the nvidia-smi GPU-utilization sampler")
     args = ap.parse_args()
 
     from train_orbit_wars import load_config   # lazy: see module-top note
-    config  = load_config(args.config)
-    device  = ("cuda" if torch.cuda.is_available()
-                and not config.get("execution", {}).get("cpu_force") else "cpu")
-    t_cfg   = config.get("training", {})
-    jax_cfg = config.get("jax_env",  {})
+    config   = load_config(args.config)
+    t_cfg    = config.get("training", {})
+    jax_cfg  = config.get("jax_env",  {})
 
-    default_num_envs = args.num_envs or jax_cfg.get("num_envs", 256)
-    update_freq_cfg  = t_cfg.get("update_freq", None)
-    grad_steps       = t_cfg.get("gradient_steps", 1)
-    batch_size       = t_cfg.get("batch_size",     64)
-    warmup_steps     = t_cfg.get("warmup_steps",   500)
+    device      = ("cuda" if torch.cuda.is_available()
+                   and not config.get("execution", {}).get("cpu_force") else "cpu")
+    env_backend = jax.default_backend().upper()           # GPU / CPU / TPU
+    num_envs    = args.num_envs or jax_cfg.get("num_envs", 256)
+    actor       = args.actor or jax_cfg.get("actor", "serial")
+    update_freq = t_cfg.get("update_freq") or num_envs
+    grad_steps  = t_cfg.get("gradient_steps", 1)
+    batch_size  = t_cfg.get("batch_size",     64)
+    warmup_steps = t_cfg.get("warmup_steps",  500)
+    tdl_on      = config.get("td_lambda", {}).get("enabled", False)
+    attn_impl   = config.get("model", {}).get("attn_impl", "torch")
 
-    sweep_sizes = (
-        [int(x) for x in args.sweep.split(",")]
-        if args.sweep else [default_num_envs]
-    )
+    # ── Header ────────────────────────────────────────────────────────────────
+    print(f"Config        : {args.config}")
+    print(f"torch device  : {device}"
+          + (f"  ({torch.cuda.get_device_name(0)})" if device == "cuda" else ""))
+    print(f"JAX env backend: {env_backend}")
+    print(f"actor mode    : {actor}   opponent={config.get('environment', {}).get('opponent')}")
+    print(f"num_envs={num_envs}  vsteps={args.vsteps}  batch_size={batch_size}  "
+          f"update_freq={update_freq}  td_lambda={'on' if tdl_on else 'off'}  "
+          f"attn_impl={attn_impl}")
 
-    print(f"Config : {args.config}   device: {device}")
+    env     = _build_env(config, num_envs, args.num_players)
+    trainer = _build_trainer(config, env, device)
+
+    # ── Warmup (JIT compile + fill buffer) for the in-process modes ───────────
+    # mp_env runs its own warmup against its subprocess env, so skip it here.
+    if actor in ("serial", "thread"):
+        warmup_vsteps = max(2, warmup_steps // num_envs + 2)
+        print(f"Warming up ({warmup_vsteps} vsteps)...")
+        _run_serial(trainer, env, num_envs, warmup_steps, update_freq, grad_steps,
+                    batch_size, device, warmup_vsteps)
+
+    # ── Measured pass (single mode) ───────────────────────────────────────────
+    sampler = None if args.no_gpu_sample else GPUSampler()
+    if sampler:
+        sampler.start()
+
+    if actor == "serial":
+        phases, wall, n_upds = _run_serial(
+            trainer, env, num_envs, 0, update_freq, grad_steps,
+            batch_size, device, args.vsteps)
+        if sampler:
+            sampler.stop()
+        _report_serial(phases, wall, args.vsteps, num_envs, n_upds, device, env_backend)
+    elif actor == "thread":
+        _run_threaded(trainer, env, num_envs, update_freq, grad_steps, batch_size,
+                      device, args.vsteps, jax_cfg.get("actor_sync_every", 2),
+                      jax_cfg.get("rollout_lead", 8), env_backend)
+        if sampler:
+            sampler.stop()
+    else:  # mp_env
+        _run_mp_env(trainer, config, num_envs, args.num_players, update_freq,
+                    grad_steps, batch_size, device, args.vsteps, env_backend)
+        if sampler:
+            sampler.stop()
+
+    if sampler:
+        sampler.report()
     if device == "cuda":
-        print(f"GPU    : {torch.cuda.get_device_name(0)}")
-    reward_names = [c.get("scheme") for c in config.get("reward", [])]
-    print(f"Reward : {reward_names}")
-    print("Buffer : ReplayBuffer (CPU numpy)")
-    print(f"grad_steps={grad_steps}  warmup_steps={warmup_steps}  batch_size={batch_size}")
+        print(f"  torch mem: {torch.cuda.max_memory_allocated()/1024**2:.0f} MiB peak")
 
-    results = []
-
-    for num_envs in sweep_sizes:
-        update_freq = update_freq_cfg if update_freq_cfg is not None else num_envs
-        print(f"\n{'='*70}")
-        print(f"num_envs={num_envs}  num_players={args.num_players}  update_freq={update_freq}")
-        print(f"{'='*70}")
-
-        env     = _build_env(config, num_envs, args.num_players)
-        trainer = _build_trainer(config, env, device)
-
-        # ── Warmup: JIT compilation + fill buffer ─────────────────────────────
-        # JAX traces and compiles step() on the first call. We run enough vsteps
-        # to cross warmup_steps (so gradient updates also get compiled) plus a
-        # small margin.
-        warmup_vsteps = warmup_steps // num_envs + 2
-        print(f"Warming up ({warmup_vsteps} vsteps) — JIT compile + buffer fill...")
-        _run(trainer, env, num_envs, warmup_steps, update_freq, grad_steps,
-             batch_size, device, n_vsteps=warmup_vsteps, label="")
-
-        # ── Measured pass ─────────────────────────────────────────────────────
-        # warmup_steps=0 so updates start immediately (buffer already filled).
-        sampler = GPUSampler(); sampler.start()
-        res = _run(trainer, env, num_envs, warmup_steps=0,
-                   update_freq=update_freq, grad_steps=grad_steps,
-                   batch_size=batch_size, device=device,
-                   n_vsteps=args.steps,
-                   label=f"JAX  num_envs={num_envs}  {args.num_players}p",
-                   profile_update=args.profile_update)
-        sampler.stop()
-
-        print("\n=== GPU UTILIZATION (serial) ===")
-        gpu_util = sampler.report()
-        if device == "cuda":
-            print(f"  torch peak allocated: {torch.cuda.max_memory_allocated()/1024**2:6.0f} MiB")
-        verdict(gpu_util, res["cpu_ms"], res["gpu_ms"])
-
-        # ── Threaded (actor-learner) pass ─────────────────────────────────────
-        if args.threaded:
-            sync_every   = jax_cfg.get("actor_sync_every", 2)
-            rollout_lead = jax_cfg.get("rollout_lead", 8)
-            t_sampler = GPUSampler(); t_sampler.start()
-            tres = _run_threaded(
-                trainer, env, num_envs, update_freq, grad_steps, batch_size,
-                device, n_vsteps=args.steps, actor_sync_every=sync_every,
-                rollout_lead=rollout_lead,
-                label=f"JAX THREADED  num_envs={num_envs}  {args.num_players}p")
-            t_sampler.stop()
-            print("\n=== GPU UTILIZATION (threaded) ===")
-            t_gpu = t_sampler.report()
-            speedup = tres["tps"] / res["tps"] if res["tps"] else float("nan")
-            s_util = f"  (GPU util {gpu_util:.0f}%)" if gpu_util is not None else ""
-            t_util = f"  (GPU util {t_gpu:.0f}%)"    if t_gpu    is not None else ""
-            print("\n=== SERIAL vs THREADED ===")
-            print(f"  serial   : {res['tps']:9.1f} trans/s{s_util}")
-            print(f"  threaded : {tres['tps']:9.1f} trans/s{t_util}")
-            print(f"  speedup  : {speedup:.2f}x  (overlap of CPU env.step with GPU update)")
-
-        # ── Multiprocess actor pass (env subprocess, real CPU/GPU overlap) ────
-        if args.mp_env:
-            m_sampler = GPUSampler(); m_sampler.start()
-            mres = _run_mp_env(
-                trainer, config, num_envs, args.num_players, update_freq,
-                grad_steps, batch_size, device, n_vsteps=args.steps,
-                label=f"JAX MP-ENV  num_envs={num_envs}  {args.num_players}p")
-            m_sampler.stop()
-            print("\n=== GPU UTILIZATION (mp-env) ===")
-            m_gpu = m_sampler.report()
-            speedup = mres["tps"] / res["tps"] if res["tps"] else float("nan")
-            s_util = f"  (GPU util {gpu_util:.0f}%)" if gpu_util is not None else ""
-            m_util = f"  (GPU util {m_gpu:.0f}%)"    if m_gpu    is not None else ""
-            print("\n=== SERIAL vs MP-ENV ===")
-            print(f"  serial : {res['tps']:9.1f} trans/s{s_util}")
-            print(f"  mp-env : {mres['tps']:9.1f} trans/s{m_util}")
-            print(f"  speedup: {speedup:.2f}x  (CPU env.step overlapped with GPU update)")
-
-        results.append((num_envs, res))
-        env.close()
-        trainer.close()
-
-    # ── Sweep summary ─────────────────────────────────────────────────────────
-    if len(results) > 1:
-        print(f"\n{'='*70}")
-        print("SCALING SWEEP SUMMARY")
-        print(f"{'='*70}")
-        baseline_tps = results[0][1]["tps"]
-        print(f"  {'num_envs':>10}  {'trans/s':>12}  {'speedup':>9}  "
-              f"{'cpu ms/vs':>12}  {'gpu ms/vs':>12}")
-        for n, r in results:
-            speedup = r["tps"] / baseline_tps
-            print(f"  {n:>10}  {r['tps']:>12.1f}  {speedup:>9.2f}x  "
-                  f"{r['cpu_ms']:>12.3f}  {r['gpu_ms']:>12.3f}")
-        print(f"  (baseline = num_envs={results[0][0]})")
+    env.close()
+    trainer.close()
 
 
 if __name__ == "__main__":

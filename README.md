@@ -1,43 +1,163 @@
 # 501-Legion
 
 
-## Benchmarking the training loop
+## Benchmarking
 
-`benchmark_train_loop.py` profiles the per-step cost of the SAC inner loop from a
-real train config and locates the bottleneck (CPU env / host→device transfer /
-GPU compute). It reports steps/sec, **transitions/sec**, a per-phase breakdown
-tagged CPU vs GPU, GPU utilization (sampled from `nvidia-smi`), and a
-transfer-vs-compute split of `update()`.
+Two scripts measure performance on the JAX backend. Both print the active JAX
+backend (`CPU`/`GPU`) up top, so a CPU run and a GPU run are unambiguous — run the
+same command on each machine (or force CPU with `JAX_PLATFORMS=cpu`) to compare.
+
+### `benchmark_jax_env_step.py` — env step only (CPU vs GPU)
+
+Isolates the **environment** cost from the learner to answer "does the JAX env run
+faster on GPU?". Times two phases per `num_envs`:
+
+- **engine** — `VectorizedEnv.step` only: the pure JAX/XLA game step (vmapped +
+  jitted), timed with `jax.block_until_ready`. This is the part a GPU accelerates.
+- **full** — `JaxVecEnvAdapter.step`: the engine step **plus** host-side obs
+  extraction (a device→host copy each step on GPU), the numpy opponent, and the
+  reward computation — i.e. what the training loop actually pays per vector-step.
+
+The split is the point: a GPU can make `engine` much faster while `full` barely
+moves, because the per-step obs copy and the opponent run on the CPU regardless —
+so `full` only pulls ahead at large `num_envs`.
 
 ```bash
-python benchmark_train_loop.py --config train.json                       # single env
-python benchmark_train_loop.py --config train.json --num-envs 8 --vec-mode async
-python benchmark_train_loop.py --config train.json --num-envs 4 --vec-mode sync
+python benchmark_jax_env_step.py                          # default sweep (64,256,1024)
+python benchmark_jax_env_step.py --sweep 256,1024,4096    # scaling
+python benchmark_jax_env_step.py --opponent agent1        # heavier opponent in 'full'
+JAX_PLATFORMS=cpu python benchmark_jax_env_step.py        # force the CPU baseline
 ```
 
-**Parallel (vectorized) environments.** With `--num-envs N > 1` the loop collects
-`N` environments per step via a gymnasium vector env, mirroring `SACTrainer`'s own
-VecEnv path (`select_action_batch` + `add_batch`). The update-to-data ratio is
-held identical to the single-env run (1 update per `update_freq` transitions), so
-the printed **speedup** is an apples-to-apples transitions/sec comparison.
+Flags: `--sweep`, `--steps`, `--warmup`, `--num-players`, `--episode-steps`,
+`--opponent {random,greedy,agent1}`, `--mode {engine,full,both}`.
 
-- `--vec-mode async` (default): one **worker process per env** (fork start
-  method) → the pure-Python game sim runs in true parallel across CPU cores. Use
-  this on a fast GPU where the env is the bottleneck.
-- `--vec-mode sync`: envs stepped sequentially in-process; the only win is
-  batching the GPU calls (one forward for `N` envs).
+### `benchmark_jax_train_loop.py` — full SAC inner loop
 
-On a small, update-compute-bound GPU (e.g. RTX 3050 Ti) the speedup is modest
-(~1.2×) because `update()` dominates and is UTD-matched; on a fast GPU (e.g. A30)
-`update()` shrinks, the parallel-env collection and batched action-selection
-dominate the savings, and async vectorization gives a much larger speedup. The
-`OrbitWarsEnv.step` return (`won` instead of a gym `info` dict) is bridged by a
-thin `OrbitGymAdapter` so the env plugs into gymnasium's `Sync/AsyncVectorEnv`.
+A **light, single-pass** throughput check: builds the env + trainer straight from
+the train config (same `num_envs`, model, opponent, reward, TD(λ), `attn_impl`, …)
+and runs **one** measured pass for `--vsteps` vector-steps using the config's
+`jax_env.actor` mode, then reports **transitions/sec**. In `serial` mode it also
+prints a per-phase breakdown (`select` / `envstep` / `add` / `update`) — `envstep`
+is tagged with the actual **JAX backend** (`GPU+host` / `CPU+host`), so a GPU env
+shows up as GPU.
+
+```bash
+python benchmark_jax_train_loop.py                       # config's actor, 100 vsteps
+python benchmark_jax_train_loop.py --vsteps 200          # longer measured pass
+python benchmark_jax_train_loop.py --actor serial        # force a mode (serial|thread|mp_env)
+python benchmark_jax_train_loop.py --num-envs 256        # override jax_env.num_envs
+```
+
+It runs **only** the configured (or `--actor`-overridden) mode — no sweep, no
+stacking of serial + threaded + mp_env — so a check is quick. `--actor` mirrors the
+`jax_env.actor` modes (see
+[JAX environment config](#jax-environment-config-jax_env)); run it once per mode to
+compare end-to-end transitions/sec and pick the fastest for a given machine. The
+model honours `model.attn_impl`, so set `"flash"` in the config to benchmark the
+FlashAttention path. Add `--no-gpu-sample` to skip the `nvidia-smi` poller.
 
 
 ## JSON train args
 
 mixed_random_ratio_decay = None -> spawn all training episodes
+
+
+## JAX environment config (`jax_env`)
+
+The `jax_env` block configures the **parallel JAX environment backend** used by
+`train_orbit_wars.py` (the only backend on this branch). `train_jax()` reads it via
+`config["jax_env"]`. Each **vector-step** advances all `num_envs` environments one
+game tick and writes `num_envs` transitions to the replay buffer.
+
+The committed `train.json` keeps only the keys that change behaviour for its
+`mp_env` setup; every other key in the table below is optional and falls back to
+its default:
+
+```json
+"jax_env": {
+  "num_envs":         64,
+  "actor":            "mp_env",
+  "actor_sync_every": 2,
+  "rollout_lead":     8,
+  "episode_steps":    500
+}
+```
+
+### Keys
+
+| key | default | what it controls |
+|---|---|---|
+| `num_envs` | `256` | Number of JAX environments stepped in parallel per vector-step; each vector-step adds `num_envs` transitions to the buffer. Larger = higher throughput (especially on a GPU `jaxlib`) and more decorrelated batches, at the cost of more VRAM/RAM and more env compute per step. Also sets the replay buffer's **per-env stride** for TD(λ), and — when `training.update_freq` is `null` — the update cadence defaults to one gradient update per vector-step (`update_freq = num_envs`). |
+| `episode_steps` | `training.max_steps` | Game ticks before an episode is truncated and that env resets. |
+| `actor` | `"thread"` if `threaded` else `"serial"` | Rollout/learner execution mode: `"serial"` \| `"thread"` \| `"mp_env"` — see **Actor modes** below. Takes precedence over `threaded`. |
+| `threaded` | `true` | **Legacy bool**, only consulted to pick the default `actor` when `actor` is absent. Ignored once `actor` is set. |
+| `actor_sync_every` | `2` | **`thread` mode only.** Gradient updates between copying the freshly-trained policy weights into the rollout actor net (larger = staler rollout policy, less locking). |
+| `rollout_lead` | `8` | **`thread` mode only.** Backpressure cap — the env rollout may run at most `rollout_lead × num_envs` transitions ahead of the learner's update budget, so the intended number of gradient steps actually runs. |
+| `ship_speed` | `6.0` | Engine physics: max fleet speed. |
+| `comet_speed` | `4.0` | Engine physics: comet drift speed. |
+| `reward_type` | `"ship_advantage"` | **Fallback reward only** (see precedence note). `"ship_advantage"` = `reward_scale × [(Δmy − Δopp) ships]`; `"native"` = terminal ±1 result only. |
+| `reward_scale` | `0.01` | **Fallback only.** Multiplier for `reward_type="ship_advantage"`. |
+| `win_bonus` | `100.0` | **Fallback only.** Terminal win/loss bonus magnitude. |
+| `num_players` | — | **Ignored by the trainer.** 2p/4p is driven by `environment.ratio_4p`, not this key (see **2-player vs 4-player**). Kept only because the `JaxVecEnvAdapter`/benchmark constructors accept it. |
+
+> The committed `train.json` drops two **redundant** keys: `threaded` (dead once
+> `actor` is set explicitly) and `num_players` (never read by the trainer). Don't
+> re-add them. `actor_sync_every` / `rollout_lead` are kept but only do anything in
+> `thread` mode.
+
+### Actor modes (`actor`)
+
+How the CPU/host work (env step, obs extraction, action selection) is scheduled
+against the GPU gradient update:
+
+- **`serial`** — single thread: `select → step → add → update` inline each
+  vector-step. Simplest and fully deterministic; no CPU/GPU overlap. A good
+  baseline, and competitive when the env runs on a GPU `jaxlib` (the step is async
+  JAX dispatch, so there is little CPU work to hide).
+- **`thread`** — an env-rollout thread and a learner thread share the trainer,
+  buffer, and a separate **actor network** (synced every `actor_sync_every`
+  updates, backpressured by `rollout_lead`). Designed to overlap a **CPU-bound**
+  env rollout with GPU updates; because it shares one GIL, it historically lost
+  to `mp_env` when obs extraction is heavy. Required for `self_play` (the opponent
+  policy lives in-process).
+- **`mp_env`** — the env runs in a **separate subprocess** (spawn) and the learner
+  stays in the main process; a one-transition-lag pipeline dispatches `update()`
+  for the data already in the buffer **while** the actor subprocess steps the env,
+  giving true overlap. Action selection and the player-0 action decode stay in the
+  learner so the rollout policy is always current. **Not supported with
+  `opponent="self_play"`** (auto-falls back to `thread`). This is the committed
+  default in `train.json`.
+
+### Reward precedence (important)
+
+If the top-level **`reward`** list is non-empty (the normal case — see
+[Reward schemes](#reward-schemes)), the env computes reward from those composable
+components and **`reward_type` / `reward_scale` / `win_bonus` are ignored**. Those
+three only take effect as a fallback when `reward` is empty. So in a config that
+already has a `reward` list, editing `reward_scale`/`win_bonus` here does nothing.
+
+### 2-player vs 4-player
+
+`jax_env.num_players` is **not** read by training. The trainer always builds a
+2-player env set and, when `environment.ratio_4p > 0`, an additional 4-player set
+holding `int(num_envs × ratio_4p)` of the envs; both sets share one replay buffer
+and policy. Set the mix via `environment.ratio_4p` (`0.0` = all 2-player).
+
+### CPU vs GPU placement
+
+There is **no `jax_env.device` key** — the env runs on JAX's default backend:
+**GPU when a CUDA-enabled `jaxlib` is installed, CPU otherwise** (nothing in the
+code pins a device). `XLA_PYTHON_CLIENT_PREALLOCATE=false` is set before
+`import jax` so the JAX env can share one GPU with PyTorch. Notes:
+
+- `execution.cpu_force` only moves **PyTorch** to CPU; it does **not** affect JAX.
+- To force the **env** onto CPU (e.g. to free the GPU for the learner), launch with
+  `JAX_PLATFORMS=cpu python train_orbit_wars.py`.
+- In `mp_env` mode the env subprocess will also use the GPU and contend with the
+  learner for compute, so the best `actor` mode is hardware-dependent — benchmark
+  it per machine with `benchmark_jax_env_step.py` (pure env step, CPU vs GPU) and
+  `benchmark_jax_train_loop.py` (full loop).
 
 
 ## Action decoder launch mask
