@@ -42,9 +42,7 @@
   },
   "jax_env": {
     "num_envs":     64,
-    "actor": "mp_env",
-    "actor_sync_every": 2,
-    "rollout_lead": 8,
+    "actor": "serial",
     "episode_steps": 500
   },
   "curriculum": {

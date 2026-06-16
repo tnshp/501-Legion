@@ -1,9 +1,11 @@
 """
 Vectorised heuristic opponents for the JAX Orbit Wars environment.
 
-These are the built-in *training* opponents the env plays the learning agent
-against — fully vectorised over all B parallel environments with numpy (no JAX,
-no torch, no kaggle import), so they stay cheap even in the mp_env worker.
+These are the NumPy *fallback / parity-oracle* opponents.  The training fast path
+runs JAX ports of these on-device (see jax_env/jax_opponents.py); these NumPy
+versions are used when the fast path is off (self_play, or a reward using
+LaunchDistancePenalty) and as the parity reference in test_jax_port.py.  Fully
+vectorised over all B parallel environments with numpy (no JAX/torch/kaggle).
 
   greedy_opponent  — each owned planet (with > MIN_SRC_SHIPS ships) sends a
                      fraction of its garrison at the single best enemy/neutral

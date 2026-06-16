@@ -66,6 +66,10 @@ class VectorizedEnv:
         )
         self._step_jit  = jax.jit(_step_bound)
         self._step_vmap = jax.jit(jax.vmap(_step_bound))
+        # Un-jitted single-env step (statics already bound) so callers can fuse it
+        # with on-device opponent/reward into one jitted function — see
+        # jax_env.adapter's fast path.
+        self._step_bound = _step_bound
 
     # ------------------------------------------------------------------
     # Reset

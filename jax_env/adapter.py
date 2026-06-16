@@ -32,14 +32,22 @@ except ImportError:
 
 from .vec_env import VectorizedEnv
 from .constants import MAX_PLANETS as _JAX_MP, MAX_FLEETS as _JAX_MF
+# On-device (JAX) opponent / reward / obs — the "fast path" that fuses these with
+# the engine step into one jitted, vmapped function so they run on the GPU instead
+# of in host NumPy.  The NumPy versions below stay as the fallback (self_play /
+# LaunchDistancePenalty) and the parity oracle.
+from .jax_opponents import make_opponent_fn as _make_opponent_fn
+from .jax_reward import build_reward_fn as _build_reward_fn, SUPPORTED as _JAX_REWARD_OK
+from .jax_obs import make_extract_obs as _make_extract_obs
 
-# The vectorised heuristic opponents live in agents/vec_opponents.py so the
+_FAST_OPPONENTS = ("random", "greedy", "rule_based", "agent1", "mixed")
+
+# The NumPy fallback/parity opponents live in agents/vec_opponents.py so the
 # strategy logic is easy to find and edit.  Load them by explicit FILE PATH, not
 # `import agents.vec_opponents`: kaggle_environments puts a different top-level
 # `agents` module on sys.path (envs/lux_ai_s3/agents.py) that would shadow the
 # project package and crash on its own relative import (see the note in
-# train_orbit_wars.py).  Path loading sidesteps the name collision and works in
-# the mp_env spawn worker too (numpy-only — no torch/jax/kaggle pulled in).
+# train_orbit_wars.py).  Path loading sidesteps the name collision.
 import importlib.util as _ilu
 import os as _os
 _vo_path = _os.path.join(
@@ -274,6 +282,46 @@ class JaxVecEnvAdapter:
         self.last_fleets_sent = 0
         self.last_n_fleets    = 0
 
+        # ── On-device fast path ───────────────────────────────────────────────
+        # When the opponent is a vectorised heuristic and every reward component is
+        # JAX-portable, the opponent + engine step + reward run as ONE jitted,
+        # vmapped function and obs extraction is jitted too — so per step the host
+        # only does the done-env auto-reset and one obs copy, not the agent1 sweep
+        # / reward / obs in NumPy.  self_play (torch opponent), LaunchDistancePenalty
+        # (per-tick sim) and the reward_type fallback stay on the NumPy path.
+        self._jax_fast = (
+            opponent in _FAST_OPPONENTS
+            and self._reward_cfg is not None
+            and self._reward_names <= _JAX_REWARD_OK
+        )
+        if self._jax_fast:
+            self._key          = jax.random.PRNGKey(0)
+            self._extract_obs_jax = _make_extract_obs(0)
+            self._fused        = self._build_fused()
+
+    def _build_fused(self):
+        """Build the jitted, vmapped (opponent + engine step + reward) function:
+        ``(state, p0_engine[NET_MP,2], key, mix_ratio) -> (new_state, reward, done, won)``
+        vmapped over the batch.  Statics (opponent, reward composition, num_players,
+        engine config) are captured closures, so the whole thing compiles once.
+        """
+        NP         = self.num_players
+        NET        = _NET_MP
+        step_bound = self._jax._step_bound                      # single-env engine step
+        opp_fn     = _make_opponent_fn(self.opponent, NP, self.mixed_send_prob)
+        reward_fn  = _build_reward_fn(self._reward_cfg, self._episode_steps, NP)
+
+        def _single(state, p0_engine, key, mix_ratio):
+            opp  = opp_fn(state, key, mix_ratio)                # [NP, JAMP, 2] opp seats
+            full = opp.at[0, :NET, :].set(p0_engine)            # add player-0 seat
+            new_state = step_bound(state, full)
+            reward = reward_fn(state, new_state)                # scalar (player 0)
+            done   = new_state.done
+            won    = (new_state.rewards[0] > 0) & done
+            return new_state, reward, done, won
+
+        return jax.jit(jax.vmap(_single, in_axes=(0, 0, 0, None)))
+
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
@@ -342,6 +390,8 @@ class JaxVecEnvAdapter:
         actions_np : float32[num_envs, NET_MP, ACTION_DIM] — player-0 policy output.
         Returns (obs_next, rewards, dones, truncateds, wons).
         """
+        if self._jax_fast:
+            return self._post_step_jax(self._decode_p0_numpy(actions_np))
         jax_acts = self._decode_actions_batch(actions_np)
         return self._post_step(jax_acts)
 
@@ -353,6 +403,8 @@ class JaxVecEnvAdapter:
         still generated here (they are env-side heuristics that need live state).
         Returns (obs_next, rewards, dones, truncateds, wons).
         """
+        if self._jax_fast:
+            return self._post_step_jax(p0_engine)
         jax_acts = self._build_engine_actions(p0_engine)
         return self._post_step(jax_acts)
 
@@ -385,14 +437,17 @@ class JaxVecEnvAdapter:
 
         player0_wons = (r_jax_np[:, 0] > 0) & dones_np
 
-        # ── auto-reset done environments ───────────────────────────────────────
-        # Reset only the finished envs and scatter them back into the batched
-        # state with a single device-side `.at[idx].set()` per leaf.  The previous
-        # implementation split ALL num_envs states into Python pytrees and
-        # re-stacked every step any env finished — O(num_envs) host work and
-        # device→host slices that starved the GPU.  reset_single is still Python
-        # (rejection sampling can't be JIT-compiled), but now runs only for the
-        # done envs, and the merge is a vectorised scatter.
+        new_state  = self._auto_reset(new_state, dones_np)
+        self._state = new_state
+        obs_next   = self._extract_obs(new_state)
+        truncateds = np.zeros(self.num_envs, dtype=bool)
+        return obs_next, player0_rewards, dones_np, truncateds, player0_wons
+
+    def _auto_reset(self, new_state, dones_np):
+        """Reset only the finished envs and scatter them back into the batched
+        state with a single device-side ``.at[idx].set()`` per leaf.  reset_single
+        is still Python (rejection sampling can't be JIT-compiled), but runs only
+        for the done envs; the merge is a vectorised scatter."""
         done_idxs = np.where(dones_np)[0]
         if len(done_idxs) > 0:
             n_done = len(done_idxs)
@@ -408,11 +463,47 @@ class JaxVecEnvAdapter:
             )
             if self.reward_type != "native" and self._reward_cfg is None:
                 self._prev_scores = self._compute_scores(new_state)
+        return new_state
 
+    def _post_step_jax(self, p0_engine: np.ndarray):
+        """Fast path: opponent + engine step + reward fused on-device (one jitted,
+        vmapped call), then host auto-reset + jitted obs extraction.  Used when
+        ``self._jax_fast`` (heuristic opponent + JAX-portable reward)."""
+        B  = self.num_envs
+        p0 = np.asarray(p0_engine, dtype=np.float32)
+        self.last_fleets_sent = int((p0[:, :, 1] > 0).sum(axis=1).mean())
+
+        self._key, k = jax.random.split(self._key)
+        keys = jax.random.split(k, B)
+        new_state, reward_j, dones_j, wons_j = self._fused(
+            self._state, jnp.asarray(p0), keys, jnp.float32(self.mixed_random_ratio))
+
+        dones_np   = np.asarray(dones_j,   dtype=bool)
+        rewards_np = np.asarray(reward_j,  dtype=np.float32)
+        wons_np    = np.asarray(wons_j,    dtype=bool)
+        self.last_n_fleets = int(np.asarray(new_state.fleets.active).sum(axis=-1).mean())
+
+        new_state   = self._auto_reset(new_state, dones_np)
         self._state = new_state
-        obs_next   = self._extract_obs(new_state)
-        truncateds = np.zeros(self.num_envs, dtype=bool)
-        return obs_next, player0_rewards, dones_np, truncateds, player0_wons
+        obs_next    = np.asarray(self._extract_obs_jax(new_state))
+        truncateds  = np.zeros(B, dtype=bool)
+        return obs_next, rewards_np, dones_np, truncateds, wons_np
+
+    def _decode_p0_numpy(self, actions_np: np.ndarray) -> np.ndarray:
+        """Player-0 wedge → engine action [B, NET_MP, 2], for the convenience
+        ``step(raw)`` entry on the fast path (mirrors ``_decode_actions_batch``)."""
+        state   = self._state
+        p_owner = np.asarray(state.planets.owner,  dtype=np.int32)
+        p_x     = np.asarray(state.planets.x,      dtype=np.float32)
+        p_y     = np.asarray(state.planets.y,      dtype=np.float32)
+        p_ships = np.asarray(state.planets.ships,  dtype=np.float32)
+        p_act   = np.asarray(state.planets.active, dtype=bool)
+        p_comet = np.asarray(state.planets.is_comet, dtype=bool)
+        valid    = p_act[:, :_NET_MP] & ~p_comet[:, :_NET_MP]
+        owned_p0 = (p_owner[:, :_NET_MP] == 0) & valid
+        tmp = np.zeros((self.num_envs, self.num_players, _JAX_MP, 2), dtype=np.float32)
+        self._decode_for_player(actions_np, tmp, 0, owned_p0, valid, p_x, p_y, p_ships)
+        return tmp[:, 0, :_NET_MP, :]
 
     # -------------------------------------------------------------------------
     # Observation extraction — GameState → (num_envs, seq_len, STATE_DIM)

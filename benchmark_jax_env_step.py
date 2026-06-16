@@ -165,10 +165,11 @@ def main():
         print(row)
 
     print()
-    print("  Read: 'engine' is the GPU-accelerable compute; 'full' is the real")
-    print("  per-step training cost. If GPU lifts 'engine' a lot but 'full' barely")
-    print("  moves, the device→host obs copy / numpy opponent is the bottleneck —")
-    print("  keep the env on CPU (mp_env actor) or move obs extraction on-device.")
+    print("  Read: 'engine' is the pure on-device game step; 'full' here uses the")
+    print("  adapter's NumPy fallback (no reward_cfg), so it still pays the host")
+    print("  opponent + obs copy.  In training the adapter's on-device FAST PATH")
+    print("  (heuristic opponent + JAX-portable reward) runs the opponent + reward")
+    print("  + obs on the GPU fused with the step — closing most of this gap.")
 
 
 if __name__ == "__main__":
