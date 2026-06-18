@@ -1,18 +1,18 @@
 {
   "model": {
     "d_model": 128,
-    "num_layers": 2,
+    "num_layers": 4,
     "num_heads": 4,
-    "ff_dim": 768,
-    "dropout": 0.15,
+    "ff_dim": 512,
+    "dropout": 0.1,
     "compile_mode": "default",
     "attn_impl": "flash"
   },
   "training": {
-    "num_episodes": 1000,
-    "warmup_steps": 500,
+    "num_episodes": 250000,
+    "warmup_steps": 1000,
     "batch_size": 512,
-    "buffer_size": 100000,
+    "buffer_size": 200000,
     "update_freq": null,
     "gradient_steps": 1,
     "lr": 3e-4,
@@ -28,41 +28,34 @@
     "enabled": true,
     "lambda": 0.9,
     "cache_size": 8000,
-    "block_size": 50,
+    "block_size": 30,
     "refresh_freq": 1000
   },
   "environment": {
     "backend": "jax",
     "opponent": "agent1",
     "n_players_default": 2,
-    "ratio_4p": 0.3,
-    "mixed_send_prob": 0.3,
-    "tanh_scale": 0.2,
-    "min_fleet_ships": 3
+    "ratio_4p": 0.0,
+    "mixed_send_prob": 0.5,
+    "tanh_scale": 0.6,
+    "min_fleet_ships": 8
   },
   "jax_env": {
-    "num_envs":     64,
+    "num_envs": 512,
     "actor": "serial",
     "episode_steps": 500
   },
-  "curriculum": {
-    "mixed_random_ratio_start": 1.0,
-    "mixed_random_ratio_end": 0.0,
-    "mixed_random_ratio_decay": null,
-    "mixed_random_ratio_schedule": "linear"
-  },
   "reward": [
-    { "scheme": "ShipGrowth",     "ship_scale": 0.2},
-    { "scheme": "ProductionPlanetDelta", "planet_scale": 4.0 },
-    { "scheme": "ProximityCaptureBonus",    "scale": 2 }
+    {"scheme": "ShipGrowth", "ship_scale": 0.02,  "loss_scale": 3.0},
+    {"scheme": "ProductionPlanetDelta", "planet_scale": 1.0, "loss_scale": 5.0},
+    {"scheme": "TimeDecayWinBonus", "win_bonus": 5.0}
   ],
   "io": {
-    "log_dir": "runs/latest",
-    "tb_log_every": 25,
-    "ckpt_dir": "checkpoints",
-    "render_dir": "replays",
-    "render_interval": 100,
-    "save_interval": 100,
+    "log_dir": "runs/v13_st2",
+    "ckpt_dir": "checkpoints/v13_st2",
+    "render_dir": "replays/v13_st2",
+    "render_interval": 500,
+    "save_interval": 500,
     "log_interval": 100
   },
   "execution": {

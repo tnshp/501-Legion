@@ -19,6 +19,7 @@ Opponent modes (set via ``opponent`` constructor arg):
 """
 from __future__ import annotations
 
+import functools
 from typing import Callable, Optional
 
 import jax
@@ -32,6 +33,7 @@ except ImportError:
 
 from .vec_env import VectorizedEnv
 from .constants import MAX_PLANETS as _JAX_MP, MAX_FLEETS as _JAX_MF
+from .reset import batch_reset as _batch_reset
 # On-device (JAX) opponent / reward / obs — the "fast path" that fuses these with
 # the engine step into one jitted, vmapped function so they run on the GPU instead
 # of in host NumPy.  The NumPy versions below stay as the fallback (self_play /
@@ -221,6 +223,7 @@ class JaxVecEnvAdapter:
         reward_cfg:      Optional[list] = None,
         mixed_random_ratio: float = 0.5,
         mixed_send_prob:    float = 0.3,
+        reset_pool_size: int   = 2048,
     ):
         self.num_envs        = num_envs
         self.num_players     = num_players
@@ -297,30 +300,45 @@ class JaxVecEnvAdapter:
         if self._jax_fast:
             self._key          = jax.random.PRNGKey(0)
             self._extract_obs_jax = _make_extract_obs(0)
+            self._reset_pool_size = reset_pool_size
+            self._reset_pool = _batch_reset(
+                np.arange(reset_pool_size) + 1_000_000,
+                num_players=num_players,
+                episode_steps=episode_steps,
+                ship_speed=ship_speed,
+                comet_speed=comet_speed,
+            )
+            self._pool_cursor = 0
             self._fused        = self._build_fused()
 
     def _build_fused(self):
-        """Build the jitted, vmapped (opponent + engine step + reward) function:
-        ``(state, p0_engine[NET_MP,2], key, mix_ratio) -> (new_state, reward, done, won)``
-        vmapped over the batch.  Statics (opponent, reward composition, num_players,
-        engine config) are captured closures, so the whole thing compiles once.
+        """Build the jitted, vmapped (opponent + engine step + reward + auto-reset)
+        function.  When a done env is detected after the engine step, the post-step
+        state is replaced on-device with a pre-generated pool state — no host
+        roundtrip.
+
+        Signature (vmapped over batch dim 0):
+        ``(state, p0_engine, key, mix_ratio, pool_state) -> (new_state, reward, done, won)``
         """
         NP         = self.num_players
         NET        = _NET_MP
-        step_bound = self._jax._step_bound                      # single-env engine step
+        step_bound = self._jax._step_bound
         opp_fn     = _make_opponent_fn(self.opponent, NP, self.mixed_send_prob)
         reward_fn  = _build_reward_fn(self._reward_cfg, self._episode_steps, NP)
 
-        def _single(state, p0_engine, key, mix_ratio):
-            opp  = opp_fn(state, key, mix_ratio)                # [NP, JAMP, 2] opp seats
-            full = opp.at[0, :NET, :].set(p0_engine)            # add player-0 seat
+        def _single(state, p0_engine, key, mix_ratio, pool_state):
+            opp  = opp_fn(state, key, mix_ratio)
+            full = opp.at[0, :NET, :].set(p0_engine)
             new_state = step_bound(state, full)
-            reward = reward_fn(state, new_state)                # scalar (player 0)
+            reward = reward_fn(state, new_state)
             done   = new_state.done
             won    = (new_state.rewards[0] > 0) & done
+            new_state = jax.lax.cond(done,
+                                     lambda: pool_state,
+                                     lambda: new_state)
             return new_state, reward, done, won
 
-        return jax.jit(jax.vmap(_single, in_axes=(0, 0, 0, None)))
+        return jax.jit(jax.vmap(_single, in_axes=(0, 0, 0, None, 0)))
 
     # -------------------------------------------------------------------------
     # Public API
@@ -465,25 +483,41 @@ class JaxVecEnvAdapter:
                 self._prev_scores = self._compute_scores(new_state)
         return new_state
 
+    @functools.cached_property
+    def _gather_pool(self):
+        """JIT-compiled pool gather: (pool, idxs) -> batched GameState."""
+        @jax.jit
+        def _gather(pool, idxs):
+            return jax.tree_util.tree_map(lambda x: x[idxs], pool)
+        return _gather
+
+    def _next_pool_batch(self):
+        """Pick B pre-generated reset states from the circular pool (device-side gather)."""
+        B = self.num_envs
+        idxs = (self._pool_cursor + jnp.arange(B)) % self._reset_pool_size
+        self._pool_cursor = int((self._pool_cursor + B) % self._reset_pool_size)
+        return self._gather_pool(self._reset_pool, idxs)
+
     def _post_step_jax(self, p0_engine: np.ndarray):
-        """Fast path: opponent + engine step + reward fused on-device (one jitted,
-        vmapped call), then host auto-reset + jitted obs extraction.  Used when
-        ``self._jax_fast`` (heuristic opponent + JAX-portable reward)."""
+        """Fast path: opponent + engine step + reward + on-device auto-reset, all
+        in one jitted vmapped call.  Done envs are replaced with pre-generated pool
+        states entirely on-device — no host-side Python reset loop."""
         B  = self.num_envs
         p0 = np.asarray(p0_engine, dtype=np.float32)
         self.last_fleets_sent = int((p0[:, :, 1] > 0).sum(axis=1).mean())
 
         self._key, k = jax.random.split(self._key)
         keys = jax.random.split(k, B)
+        pool_batch = self._next_pool_batch()
         new_state, reward_j, dones_j, wons_j = self._fused(
-            self._state, jnp.asarray(p0), keys, jnp.float32(self.mixed_random_ratio))
+            self._state, jnp.asarray(p0), keys,
+            jnp.float32(self.mixed_random_ratio), pool_batch)
 
         dones_np   = np.asarray(dones_j,   dtype=bool)
         rewards_np = np.asarray(reward_j,  dtype=np.float32)
         wons_np    = np.asarray(wons_j,    dtype=bool)
         self.last_n_fleets = int(np.asarray(new_state.fleets.active).sum(axis=-1).mean())
 
-        new_state   = self._auto_reset(new_state, dones_np)
         self._state = new_state
         obs_next    = np.asarray(self._extract_obs_jax(new_state))
         truncateds  = np.zeros(B, dtype=bool)

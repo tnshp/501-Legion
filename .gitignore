@@ -6,6 +6,11 @@ settings.json
 *:Zone.Identifier
 *.pt
 *.npz
+*.ipynb
 
 # TensorBoard event files
 runs/
+
+# Generated docs
+benchmark_execution_flow.md
+profile_benchmark.py

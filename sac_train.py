@@ -466,7 +466,7 @@ class SACTrainer:
         Vectorised action — takes (n_envs, *obs_shape) and returns
         (n_envs, *act_shape).  Used by the VecEnv training loop.
         """
-        states_t = self._to(torch.FloatTensor(states))
+        states_t = self._to(torch.FloatTensor(states.copy()))
         states_t = self.state_preprocessor(states_t)
         with torch.no_grad(), self._autocast():
             actions, _ = self._sample(self.policy_net, states_t)
