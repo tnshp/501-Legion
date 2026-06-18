@@ -1,7 +1,8 @@
 """
 JaxVecEnvAdapter — vectorised JAX environment adapter for SAC training.
 
-Observations : float32[num_envs, MAX_PLANETS + MAX_FLEETS, STATE_DIM=13]
+Observations : float32[num_envs, NET_MP + 1, TOKEN_DIM=35]  (hybrid fleet-into-
+               planet decoder: NET_MP planet tokens + 1 meta row; see jax_obs.py)
 Actions      : float32[num_envs, NET_MAX_PLANETS=40, ACTION_DIM=4]
 
 Action decoding is fully vectorised across all envs via batched einsum
@@ -38,7 +39,11 @@ from .constants import MAX_PLANETS as _JAX_MP, MAX_FLEETS as _JAX_MF
 # LaunchDistancePenalty) and the parity oracle.
 from .jax_opponents import make_opponent_fn as _make_opponent_fn
 from .jax_reward import build_reward_fn as _build_reward_fn, SUPPORTED as _JAX_REWARD_OK
-from .jax_obs import make_extract_obs as _make_extract_obs
+from .jax_obs import (
+    make_extract_obs as _make_extract_obs,
+    TOKEN_DIM as _TOKEN_DIM,
+    SEQ_LEN as _SEQ_LEN,
+)
 
 _FAST_OPPONENTS = ("random", "greedy", "rule_based", "agent1", "mixed")
 
@@ -62,8 +67,9 @@ random_opponent = _vec_opponents.random_opponent
 
 # Network / observation shape constants (must match OrbitWarsEnv)
 _NET_MP    = 40
-_NET_MF    = 100
-_STATE_DIM = 13
+_NET_MF    = 100        # kept for the legacy fast-path opponent fleet sweep; obs no
+                        # longer emits per-fleet tokens (hybrid fleet-into-planet decoder)
+_STATE_DIM = _TOKEN_DIM     # 35 — width of the hybrid planet token (see jax_obs.py)
 _ACT_DIM   = 4
 
 _CENTER     = 50.0
@@ -267,7 +273,7 @@ class JaxVecEnvAdapter:
         self._seed_counter = 0
         self._prev_scores  = None
 
-        seq_len = _NET_MP + _NET_MF
+        seq_len = _SEQ_LEN                      # NET_MP planet tokens + 1 meta row
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(seq_len, _STATE_DIM), dtype=np.float32,
@@ -294,10 +300,15 @@ class JaxVecEnvAdapter:
             and self._reward_cfg is not None
             and self._reward_names <= _JAX_REWARD_OK
         )
+        # Observation extraction is on-device (JAX) on EVERY path — the hybrid
+        # fleet-into-planet decoder is the single obs implementation.  One jitted
+        # extractor per perspective (pid); pid 0 is the acting player, pid≥1 are
+        # built lazily for self_play opponent observations.
+        self._obs_extractors  = {0: _make_extract_obs(0)}
+        self._extract_obs_jax = self._obs_extractors[0]
         if self._jax_fast:
-            self._key          = jax.random.PRNGKey(0)
-            self._extract_obs_jax = _make_extract_obs(0)
-            self._fused        = self._build_fused()
+            self._key   = jax.random.PRNGKey(0)
+            self._fused = self._build_fused()
 
     def _build_fused(self):
         """Build the jitted, vmapped (opponent + engine step + reward) function:
@@ -506,111 +517,24 @@ class JaxVecEnvAdapter:
         return tmp[:, 0, :_NET_MP, :]
 
     # -------------------------------------------------------------------------
-    # Observation extraction — GameState → (num_envs, seq_len, STATE_DIM)
+    # Observation extraction — GameState → (num_envs, NET_MP+1, TOKEN_DIM)
     #
-    # Mirrors model.SAC.Encoder.encode layout exactly:
-    #   Planet: [owner_oh×4, radius, ships, production, moving, ang_vel, 0, x, y, ts]
-    #   Fleet:  [owner_oh×4, angle,  ships, speed,      0,      0,       1, x, y, ts]
+    # Hybrid fleet-into-planet decoder (jax_env/jax_obs.py): fleets are folded
+    # into the planet tokens they relate to (incoming-hostile / outgoing-friendly
+    # slots + pooled summary), and a trailing meta row carries the per-player
+    # aggregate.  The on-device JAX builder is the single implementation; its
+    # live-game NumPy equivalent for submission is model.SAC.Encoder.encode.
     #
-    # When pid != 0, owner IDs are swapped (0 ↔ pid) so the acting player
-    # always appears as owner 0 — matching the Python env's _swap_perspective.
+    # When pid != 0, owner IDs are swapped (0 ↔ pid) so the acting player always
+    # appears as owner 0 (self_play opponent observations).
     # -------------------------------------------------------------------------
 
     def _extract_obs(self, state, pid: int = 0) -> np.ndarray:
-        B   = self.num_envs
-        NMP = _NET_MP
-        NMF = _NET_MF
-
-        p_owner_raw = np.asarray(state.planets.owner,      dtype=np.int32)
-        p_x         = np.asarray(state.planets.x,          dtype=np.float32)
-        p_y         = np.asarray(state.planets.y,          dtype=np.float32)
-        p_ix        = np.asarray(state.planets.init_x,     dtype=np.float32)
-        p_iy        = np.asarray(state.planets.init_y,     dtype=np.float32)
-        p_rad       = np.asarray(state.planets.radius,     dtype=np.float32)
-        p_ships     = np.asarray(state.planets.ships,      dtype=np.float32)
-        p_prod      = np.asarray(state.planets.production, dtype=np.float32)
-        p_act       = np.asarray(state.planets.active,     dtype=bool)
-        p_comet     = np.asarray(state.planets.is_comet,   dtype=bool)
-
-        f_owner_raw = np.asarray(state.fleets.owner,  dtype=np.int32)
-        f_x         = np.asarray(state.fleets.x,      dtype=np.float32)
-        f_y         = np.asarray(state.fleets.y,      dtype=np.float32)
-        f_angle     = np.asarray(state.fleets.angle,  dtype=np.float32)
-        f_ships     = np.asarray(state.fleets.ships,  dtype=np.float32)
-        f_act       = np.asarray(state.fleets.active, dtype=bool)
-
-        ang_vel = np.asarray(state.angular_velocity, dtype=np.float32)  # [B]
-        t_step  = np.asarray(state.step,             dtype=np.float32)  # [B]
-
-        # Perspective swap: remap owners so pid's planets appear as owner 0
-        if pid != 0:
-            p_owner = p_owner_raw.copy()
-            p_owner[p_owner_raw == 0]   = pid
-            p_owner[p_owner_raw == pid] = 0
-
-            f_owner = f_owner_raw.copy()
-            f_owner[f_owner_raw == 0]   = pid
-            f_owner[f_owner_raw == pid] = 0
-        else:
-            p_owner = p_owner_raw
-            f_owner = f_owner_raw
-
-        # ── Planet tokens ─────────────────────────────────────────────────────
-        po   = p_owner[:, :NMP]
-        ocl  = np.clip(po, 0, 3)
-        p_oh = np.eye(4, dtype=np.float32)[ocl]     # [B, NMP, 4]
-        p_oh[po == -1] = 0.0
-
-        dx    = p_ix[:, :NMP] - _CENTER
-        dy    = p_iy[:, :NMP] - _CENTER
-        p_mov = ((np.sqrt(dx**2 + dy**2) + p_rad[:, :NMP]) < _ROT_LIMIT
-                 ).astype(np.float32)
-
-        p_ang = np.repeat(ang_vel[:, None], NMP, axis=1)
-        p_ts  = np.repeat(t_step[:, None],  NMP, axis=1)
-
-        p_tokens = np.stack([
-            p_oh[:, :, 0], p_oh[:, :, 1], p_oh[:, :, 2], p_oh[:, :, 3],
-            p_rad[:, :NMP], p_ships[:, :NMP], p_prod[:, :NMP],
-            p_mov, p_ang,
-            np.zeros((B, NMP), dtype=np.float32),   # is_fleet = 0
-            p_x[:, :NMP], p_y[:, :NMP], p_ts,
-        ], axis=-1)  # [B, NMP, 13]
-
-        valid_p = (p_act[:, :NMP] & ~p_comet[:, :NMP]).astype(np.float32)
-        p_tokens *= valid_p[:, :, None]
-
-        # ── Fleet tokens ──────────────────────────────────────────────────────
-        sort_ships = np.where(f_act, f_ships, -1.0)
-        top_idx    = np.argsort(-sort_ships, axis=1)[:, :NMF]
-        bi = np.arange(B)[:, None]
-
-        fo   = f_owner[bi, top_idx]
-        fx_s = f_x    [bi, top_idx]
-        fy_s = f_y    [bi, top_idx]
-        fa_s = f_angle[bi, top_idx]
-        fs   = f_ships[bi, top_idx]
-        fv   = f_act  [bi, top_idx].astype(np.float32)
-
-        fo_cl = np.clip(fo, 0, 3)
-        f_oh  = np.eye(4, dtype=np.float32)[fo_cl]   # [B, NMF, 4]
-        f_oh[fo == -1] = 0.0
-
-        f_spd = _fleet_speed_np(fs)
-        f_ts  = np.repeat(t_step[:, None], NMF, axis=1)
-
-        f_tokens = np.stack([
-            f_oh[:, :, 0], f_oh[:, :, 1], f_oh[:, :, 2], f_oh[:, :, 3],
-            fa_s, fs, f_spd,
-            np.zeros((B, NMF), dtype=np.float32),
-            np.zeros((B, NMF), dtype=np.float32),
-            np.ones ((B, NMF), dtype=np.float32),   # is_fleet = 1
-            fx_s, fy_s, f_ts,
-        ], axis=-1)  # [B, NMF, 13]
-
-        f_tokens *= fv[:, :, None]
-
-        return np.concatenate([p_tokens, f_tokens], axis=1).astype(np.float32)
+        fn = self._obs_extractors.get(pid)
+        if fn is None:
+            fn = _make_extract_obs(pid)
+            self._obs_extractors[pid] = fn
+        return np.asarray(fn(state))
 
     # -------------------------------------------------------------------------
     # Action decoding helpers
