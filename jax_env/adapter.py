@@ -313,14 +313,15 @@ class JaxVecEnvAdapter:
             self._key          = jax.random.PRNGKey(0)
             self._extract_obs_jax = _make_extract_obs(0)
             self._reset_pool_size = reset_pool_size
+            # Distinct random seeds (not a sequential arange) so the pool's board
+            # layouts carry no correlation from adjacent seed values.
             self._reset_pool = _batch_reset(
-                np.arange(reset_pool_size) + 1_000_000,
+                np.random.randint(0, 2**31 - 1, size=reset_pool_size, dtype=np.int64),
                 num_players=num_players,
                 episode_steps=episode_steps,
                 ship_speed=ship_speed,
                 comet_speed=comet_speed,
             )
-            self._pool_cursor = 0
             self._fused        = self._build_fused()
 
     def _build_fused(self):
@@ -504,10 +505,14 @@ class JaxVecEnvAdapter:
         return _gather
 
     def _next_pool_batch(self):
-        """Pick B pre-generated reset states from the circular pool (device-side gather)."""
+        """Pick B random pre-generated reset states from the pool (device-side gather).
+
+        Sampling B fresh indices each step (rather than a contiguous circular
+        slice) avoids replaying the same pool states in the same order on
+        consecutive steps."""
         B = self.num_envs
-        idxs = (self._pool_cursor + jnp.arange(B)) % self._reset_pool_size
-        self._pool_cursor = int((self._pool_cursor + B) % self._reset_pool_size)
+        self._key, k = jax.random.split(self._key)
+        idxs = jax.random.randint(k, (B,), 0, self._reset_pool_size)
         return self._gather_pool(self._reset_pool, idxs)
 
     def _post_step_jax(self, p0_engine: np.ndarray):
