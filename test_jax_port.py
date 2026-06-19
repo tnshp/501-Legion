@@ -148,22 +148,6 @@ def _check_reward(reward_cfg, label):
     return diff < 1e-3
 
 
-def _check_obs():
-    state, _ = _busy_state()
-    adapter = JaxVecEnvAdapter(num_envs=state.planets.x.shape[0], num_players=2,
-                               opponent="agent1")
-    obs_np = adapter._extract_obs(state)                          # [B, seq, 13]
-    obs_jx = np.asarray(JOBS.make_extract_obs(0)(state))
-    # planet tokens (first NMP) are positional → compare exactly
-    p_diff = np.abs(obs_np[:, :NMP] - obs_jx[:, :NMP]).max()
-    # fleet tokens carry no positional meaning → compare as sorted-by-ships rows
-    f_np = np.sort(obs_np[:, NMP:], axis=1)
-    f_jx = np.sort(obs_jx[:, NMP:], axis=1)
-    f_diff = np.abs(f_np - f_jx).max()
-    print(f"  obs: max|Δ planets|={p_diff:.3g}   max|Δ fleets(sorted)|={f_diff:.3g}")
-    return p_diff < 1e-3 and f_diff < 1e-3
-
-
 if __name__ == "__main__":
     print(f"JAX backend: {jax.default_backend()}")
     ok = True
@@ -174,7 +158,8 @@ if __name__ == "__main__":
     print("Reward parity:")
     ok &= _check_reward(REWARD, "train_st2")
     ok &= _check_reward(REWARD_ALL, "all-components")
-    print("Obs parity:")
-    ok &= _check_obs()
+    # Obs parity for the hybrid fleet-into-planet decoder lives in test_jax_decoder.py
+    # (jax_env/jax_obs.py vs the NumPy submission Encoder).
+    print("Obs parity: see test_jax_decoder.py")
     print("\n" + ("ALL PARITY CHECKS PASSED" if ok else "*** PARITY FAILURES ***"))
     raise SystemExit(0 if ok else 1)
