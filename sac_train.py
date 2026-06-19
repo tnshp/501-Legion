@@ -655,8 +655,7 @@ class SACTrainer:
             q1_loss = nn.MSELoss()(q1_pred, q_target)
         self.q1_optimizer.zero_grad()
         q1_loss.backward()
-        if self.max_grad_norm is not None:
-            nn.utils.clip_grad_norm_(self.q1_net.parameters(), self.max_grad_norm)
+        self._clip_grads_(self.q1_net.parameters())
         self.q1_optimizer.step()
         t3 = _ck()
 
@@ -666,8 +665,7 @@ class SACTrainer:
             q2_loss = nn.MSELoss()(q2_pred, q_target)
         self.q2_optimizer.zero_grad()
         q2_loss.backward()
-        if self.max_grad_norm is not None:
-            nn.utils.clip_grad_norm_(self.q2_net.parameters(), self.max_grad_norm)
+        self._clip_grads_(self.q2_net.parameters())
         self.q2_optimizer.step()
         t4 = _ck()
 
@@ -681,8 +679,7 @@ class SACTrainer:
             policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
-        if self.max_grad_norm is not None:
-            nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.max_grad_norm)
+        self._clip_grads_(self.policy_net.parameters())
         self.policy_optimizer.step()
         t5 = _ck()
 
@@ -767,24 +764,25 @@ class SACTrainer:
     #     so at λ=0 this reduces exactly to the standard SAC 1-step target.
     # =========================================================================
 
-    def _soft_value(self, next_states_np: np.ndarray) -> np.ndarray:
+    def _soft_value(self, next_states_np: np.ndarray) -> torch.Tensor:
         """Batched soft state-value V(s') for the cache bootstrap, computed in
-        chunks under no_grad. Returns a 1-D numpy array (NaN/Inf → 0)."""
+        chunks under no_grad. Returns a 1-D GPU tensor (NaN/Inf → 0).
+        """
         out   = []
         chunk = max(self.batch_size, 256)
         with torch.no_grad(), self._autocast():
             for i in range(0, len(next_states_np), chunk):
                 ns = torch.from_numpy(next_states_np[i:i + chunk])
                 ns = self.state_preprocessor(self._to(ns))
-                a, lp = self._sample(self.policy_net, ns)          # a:[c,...], lp:[c,1]
-                # clone() q1 so the q2_net call can't overwrite it in the shared
-                # CUDA-graph buffer before torch.min (reduce-overhead mode).
-                q1 = self.q1_net(ns, a).unsqueeze(-1).clone()      # [c,1]
-                q2 = self.q2_net(ns, a).unsqueeze(-1)              # [c,1]
-                v  = torch.min(q1, q2) - self.alpha * lp           # [c,1]
-                out.append(v.squeeze(-1).float().cpu().numpy())
-        v_all = np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
-        return np.nan_to_num(v_all, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                a, lp = self._sample(self.policy_net, ns)
+                q1 = self.q1_net(ns, a).unsqueeze(-1).clone()
+                q2 = self.q2_net(ns, a).unsqueeze(-1)
+                v  = torch.min(q1, q2) - self.alpha * lp
+                out.append(v.squeeze(-1).float())
+        if not out:
+            return torch.zeros(0, device=self.device)
+        v_all = torch.cat(out)
+        return torch.nan_to_num(v_all, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _build_lambda_cache(self) -> bool:
         """Promote per-env temporally-contiguous blocks into the cache and fill it
@@ -840,23 +838,25 @@ class SACTrainer:
         # ── soft-value bootstrap for every transition's next-state ────────────
         v_next = self._soft_value(next_states_np).reshape(n_blocks, B)
 
-        # ── backward λ-return recursion (vectorised across blocks) ────────────
+        # ── backward λ-return recursion (vectorised across blocks, on GPU) ────
         #   Rλ_t = r_t + γ(1−d_t)[λ·Rλ_{t+1} + (1−λ)·V(s_{t+1})]
         # The last transition in a block has no in-block successor, so its
         # bootstrap falls back to V(s') (a plain 1-step target there).
-        targets = np.empty((n_blocks, B), dtype=np.float32)
+        rewards_t = self._to(torch.from_numpy(rewards_np))
+        dones_t   = self._to(torch.from_numpy(dones_np))
         lam, gam = self.lambda_return, self.gamma
-        g = v_next[:, B - 1].copy()
+        targets = torch.empty((n_blocks, B), dtype=torch.float32, device=self.device)
+        g = v_next[:, B - 1].clone()
         for t in range(B - 1, -1, -1):
-            d    = dones_np[:, t]
+            d    = dones_t[:, t]
             vt   = v_next[:, t]
             boot = vt if t == B - 1 else g
-            g = rewards_np[:, t] + gam * (1.0 - d) * (lam * boot + (1.0 - lam) * vt)
+            g = rewards_t[:, t] + gam * (1.0 - d) * (lam * boot + (1.0 - lam) * vt)
             targets[:, t] = g
 
-        self._cache_states  = states_np
-        self._cache_actions = actions_np
-        self._cache_targets = targets.reshape(-1, 1).astype(np.float32)
+        self._cache_states  = self._to(torch.from_numpy(states_np))
+        self._cache_actions = self._to(torch.from_numpy(actions_np))
+        self._cache_targets = targets.reshape(-1, 1)
         self._cache_n       = self._cache_targets.shape[0]
         return True
 
@@ -877,49 +877,40 @@ class SACTrainer:
         if self._cache_targets is None:
             return None
 
-        idx     = np.random.randint(0, self._cache_n, size=self.batch_size)
-        states  = self.state_preprocessor (self._to(torch.from_numpy(self._cache_states[idx])))
-        actions = self.action_preprocessor(self._to(torch.from_numpy(self._cache_actions[idx])))
-        targets = self._to(torch.from_numpy(self._cache_targets[idx]))
+        idx     = torch.randint(self._cache_n, (self.batch_size,), device=self.device)
+        states  = self.state_preprocessor (self._cache_states[idx])
+        actions = self.action_preprocessor(self._cache_actions[idx])
+        targets = self._cache_targets[idx]
 
         targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
 
         # ── Q updates toward the precomputed λ-return (shared by Q1 & Q2) ─────
         with self._autocast():
             q1_pred = self.q1_net(states, actions).unsqueeze(-1)
-            q1_loss = nn.MSELoss()(q1_pred, targets)
+            q1_loss = nn.functional.mse_loss(q1_pred, targets)
         self.q1_optimizer.zero_grad()
         q1_loss.backward()
-        if self.max_grad_norm is not None:
-            nn.utils.clip_grad_norm_(self.q1_net.parameters(), self.max_grad_norm)
+        self._clip_grads_(self.q1_net.parameters())
         self.q1_optimizer.step()
 
         with self._autocast():
             q2_pred = self.q2_net(states, actions).unsqueeze(-1)
-            q2_loss = nn.MSELoss()(q2_pred, targets)
+            q2_loss = nn.functional.mse_loss(q2_pred, targets)
         self.q2_optimizer.zero_grad()
         q2_loss.backward()
-        if self.max_grad_norm is not None:
-            nn.utils.clip_grad_norm_(self.q2_net.parameters(), self.max_grad_norm)
+        self._clip_grads_(self.q2_net.parameters())
         self.q2_optimizer.step()
 
-        # ── Policy update — identical SAC actor objective ─────────────────────
         with self._autocast():
             a_tilde, lp = self._sample(self.policy_net, states)
-            # clone(): q1_pi must survive the q2_net call before torch.min, since
-            # reduce-overhead returns views into a reused CUDA-graph buffer.
             q1_pi = self.q1_net(states, a_tilde).unsqueeze(-1).clone()
             q2_pi = self.q2_net(states, a_tilde).unsqueeze(-1).clone()
             policy_loss = (self.alpha * lp - torch.min(q1_pi, q2_pi)).mean()
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
-        if self.max_grad_norm is not None:
-            nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.max_grad_norm)
+        self._clip_grads_(self.policy_net.parameters())
         self.policy_optimizer.step()
 
-        # NB: no target-network Polyak update — the cache is the stable target.
-
-        # ── Auto-alpha (unchanged) ────────────────────────────────────────────
         if self.auto_alpha:
             alpha_loss = -(self.log_alpha.exp() * (lp.detach() + self.target_entropy)).mean()
             self.alpha_optimizer.zero_grad()
@@ -927,7 +918,6 @@ class SACTrainer:
             self.alpha_optimizer.step()
             self.alpha = self.log_alpha.exp().item()
 
-        # ── TensorBoard (throttled — see update() for rationale) ───────────────
         s = self._update_count
         if self.writer is not None and (s % self._tb_log_every == 0):
             with torch.no_grad():
