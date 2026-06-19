@@ -1,8 +1,7 @@
 """
 Gymnasium wrapper for the Kaggle Orbit Wars environment.
 
-Observation space : Box(shape=(MAX_PLANETS + 1, STATE_DIM=35), float32)
-                    (hybrid fleet-into-planet decoder; +1 = trailing meta row)
+Observation space : Box(shape=(MAX_PLANETS + MAX_FLEETS, STATE_DIM), float32)
 Action space      : Box(shape=(MAX_PLANETS, ACTION_DIM), float32)  in [-1, 1]
 
 Per-planet action encoding  (ACTION_DIM = 4)
@@ -166,7 +165,7 @@ def _swap_perspective(planets: np.ndarray, fleets: np.ndarray, player_id: int):
 def encode_obs_as_player(encoder, obs, initial_planets: np.ndarray,
                          player_id: int = 0, time_step: int = 0) -> np.ndarray:
     """
-    Encode a kaggle orbit_wars observation as [MAX_PLANETS+1, STATE_DIM].
+    Encode a kaggle orbit_wars observation as [MAX_PLANETS+MAX_FLEETS, STATE_DIM].
 
     Parameters
     ----------
@@ -178,7 +177,7 @@ def encode_obs_as_player(encoder, obs, initial_planets: np.ndarray,
 
     Returns
     -------
-    state : np.ndarray [MAX_PLANETS + 1, STATE_DIM], dtype float32
+    state : np.ndarray [MAX_PLANETS + MAX_FLEETS, STATE_DIM], dtype float32
     """
     planets_np, fleets_np, angular_velocity, _, _ = _obs_to_arrays(obs)
     s_planets, s_fleets = _swap_perspective(planets_np, fleets_np, player_id)
@@ -1110,13 +1109,9 @@ class OrbitWarsEnv(gym.Env):
     """
 
     MAX_PLANETS: int = 40
-    MAX_FLEETS:  int = 100   # legacy cap (fleet truncation); obs no longer emits
-                             # per-fleet tokens (hybrid fleet-into-planet decoder)
-    STATE_DIM:   int = 35    # width of the hybrid planet token (model.SAC.TOKEN_DIM)
+    MAX_FLEETS:  int = 100
+    STATE_DIM:   int = 13
     ACTION_DIM:  int = 4
-
-    # Observation sequence length: MAX_PLANETS planet tokens + 1 trailing meta row.
-    OBS_SEQ_LEN: int = MAX_PLANETS + 1
 
     metadata = {"render_modes": ["human", "ansi"]}
 
@@ -1168,7 +1163,7 @@ class OrbitWarsEnv(gym.Env):
 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
-            shape=(self.OBS_SEQ_LEN, self.STATE_DIM),
+            shape=(self.MAX_PLANETS + self.MAX_FLEETS, self.STATE_DIM),
             dtype=np.float32,
         )
         self.action_space = spaces.Box(

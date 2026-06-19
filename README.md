@@ -160,82 +160,11 @@ into one jitted, vmapped function and extracts the **observation** on-device too
 ([jax_env/jax_opponents.py](jax_env/jax_opponents.py),
 [jax_env/jax_reward.py](jax_env/jax_reward.py),
 [jax_env/jax_obs.py](jax_env/jax_obs.py)). So per step the host only does the
-done-env auto-reset and a single obs copy. `self_play` (a torch-policy opponent) and
+done-env auto-reset and a single obs copy — the agent1 fleet sweep / reward /
+obs no longer run in host NumPy. `self_play` (a torch-policy opponent) and
 `LaunchDistancePenalty` automatically fall back to the NumPy path; the NumPy
 implementations remain as that fallback and as the parity oracle
 (`test_jax_port.py`).
-
-The obs builder itself uses the **hybrid fleet-into-planet decoder** (see
-[Hybrid decoder](#hybrid-fleet-into-planet-decoder-approach-e) below): the full
-`[MAX_FLEETS=1024, NET_MP=40]` fleet sweep runs on-device fused into the obs step,
-so the sequence arriving at the transformer is only 41 tokens instead of 140.
-
-
-## Hybrid fleet-into-planet decoder (Approach E)
-
-Instead of emitting a separate fleet token per in-flight fleet (the old layout: 40
-planet tokens + 100 fleet tokens = **140** tokens), each fleet's information is
-**folded into the planet token it relates to**. The transformer sequence becomes:
-
-> **40 planet tokens + 1 meta row = 41 tokens**  (`NET_MP + 1`)
-
-Attention complexity scales with sequence length squared, so 41 vs 140 tokens is
-roughly **12× less attention work**. On the A30 this is expected to roughly halve
-model forward/backward time.
-
-### Token layout — width 35 (`TOKEN_DIM`)
-
-Each of the 40 planet token rows:
-
-| idx | field | note |
-|-----|-------|------|
-| 0:4 | owner one-hot (×4) | perspective-swapped: acting player = owner 0 |
-| 4 | radius | |
-| 5 | garrison ships | fed through `LearnedFourierScalarEncoding` |
-| 6 | production | |
-| 7 | moving flag | 1 if planet orbits (within rotation radius) |
-| 8 | angular velocity | |
-| 9–10 | x, y | fed to `LearnedFourierPosEncoding` |
-| 11 | time step | |
-| 12:15 | **incoming slot 0** = [ships, eta, opp_owner] | soonest hostile inbound fleet |
-| 15:18 | **incoming slot 1** | 2nd soonest hostile inbound fleet |
-| 18:22 | **outgoing slot 0** = [ships, sinθ, cosθ, speed] | largest friendly outgoing fleet |
-| 22:26 | **outgoing slot 1** | 2nd largest friendly outgoing fleet |
-| 26:31 | **incoming pooled** = [log1p cnt, log1p Σships, soonest_eta, wmean_eta, log1p maxships] | all hostile inbound |
-| 31:35 | **outgoing pooled** = [log1p cnt, log1p Σships, wmean sinθ, wmean cosθ] | all friendly outgoing |
-
-Row 40 (index `NET_MP`) is the **meta row** — carries `[4 × planet_count, 4 × log1p production, 4 × log1p total_ships]` (12 values, rest padded to 35). The model reads it off before the transformer and projects it into a single metadata token.
-
-### Binding
-
-- **Outgoing** — exact: a fleet is "outgoing from planet p" iff its `from_planet` slot equals p's index **and** its owner matches p's owner (after perspective swap).
-- **Incoming** — geometric: the swept-segment look-ahead `_fleet_planet_sweep` over the full `[MAX_FLEETS=1024, NET_MP=40]` matrix; runs on-device, one call per env-step. A fleet is incoming-hostile to p iff its straight-line path (60-tick horizon) passes within p's radius **and** its owner differs from p's owner.
-- A fleet aimed at planet p from planet q appears in **both** p's incoming slots (threat to p) and q's outgoing slots (asset from q) — this is correct: both planets are genuinely affected.
-- The top-k explicit slots (k=2 per type) are complemented by pooled summaries so long-tail fleets beyond k are never silently dropped.
-
-### Knobs
-
-| constant | default | effect |
-|----------|---------|--------|
-| `K_IN` | 2 | explicit incoming slots per planet |
-| `K_OUT` | 2 | explicit outgoing slots per planet |
-| `TOKEN_DIM` | 35 | computed: `12 + K_IN×3 + K_OUT×4 + 5 + 4` |
-
-`K_IN` and `K_OUT` are defined in both [jax_env/jax_obs.py](jax_env/jax_obs.py) and [model/SAC.py](model/SAC.py); the parity test `test_jax_decoder.py` will catch any drift between them.
-
-### Breaking change — retrain required
-
-`TOKEN_DIM` changed from 13 → 35 and `SEQ_LEN` from 140 → 41. Old checkpoints and
-replay buffers are incompatible. Set `execution.resume = null` and clear any old
-`replay_buffer.npz` before training.
-
-### Files
-
-| file | role |
-|------|------|
-| [jax_env/jax_obs.py](jax_env/jax_obs.py) | Training-time obs builder (JAX, on-device) |
-| [model/SAC.py `Encoder`](model/SAC.py) | Submission-time obs builder (NumPy, live game) |
-| [test_jax_decoder.py](test_jax_decoder.py) | Binding unit test + JAX↔Encoder parity (max diff ~1e-7) |
 
 
 ## Action decoder launch mask
@@ -258,9 +187,9 @@ kept in the signatures and config so existing callers don't break.
 
 ## Metadata token (global summary)
 
-The transformer is fed an extra **metadata token** prepended to the planet sequence.
-It encodes a per-player global summary so the model doesn't have to reconstruct the
-overall picture by attending across individual tokens.
+The transformer is fed an extra **metadata token** prepended to the planet/fleet
+sequence. It encodes a per-player global summary so the model doesn't have to
+reconstruct the overall picture by attending across individual tokens.
 
 For each of the 4 player slots (player 0 = our agent after the perspective swap,
 1–3 = opponents) it carries:
@@ -269,20 +198,19 @@ For each of the 4 player slots (player 0 = our agent after the perspective swap,
 - **total production** (`log1p`-compressed)
 - **total ships** — planets **and** in-flight fleets (`log1p`-compressed)
 
-= a 12-dim vector packed into the **trailing meta row** (index 40) of the
-observation by the obs builder ([jax_env/jax_obs.py](jax_env/jax_obs.py) for
-training, `Encoder.encode` for submission), projected by a learned
-`nn.Linear(12, d_model)` (`meta_proj`), and prepended as token 0 inside the
-transformer. Because the encoder is full self-attention, every planet token (and the
-`cls` value token) can read it directly.
+= a 12-dim vector (`_aggregate_meta_features` in [model/SAC.py](model/SAC.py)),
+computed inside `forward` from the encoded state, projected by a learned
+`nn.Linear(12, d_model)` (`meta_proj`), and prepended as token 0. Because the
+encoder is full self-attention, every planet/fleet token (and the `cls` value
+token) can read it directly.
 
 Implementation notes:
-- Built in the obs layer rather than derived from the state tensor inside `forward`,
-  so the meta row accounts for **in-flight fleet ships** (which are no longer
-  represented as their own token rows in the hybrid decoder).
-- `Q`/`V` read the `cls` token at position 0 (followed by the metadata token);
-  `P` reads per-planet outputs at `out[:, 1:1+max_planets]`.
-- Players absent in a 2-player game contribute zero to all three totals.
+- Derived in-network from the state tensor, so the **state interface (140×13) and
+  the replay buffer are unchanged** — nothing to migrate.
+- `Q`/`V` read the `cls` token at position 0 (now followed by the metadata token);
+  `P` reads per-planet outputs, which shift to `out[:, 1:1+max_planets]`.
+- Neutral planets and padding rows have an all-zero owner one-hot, so they
+  contribute to no player's totals.
 
 
 ## Comets removed from the pipeline
@@ -302,11 +230,12 @@ The engine still simulates comets internally; we simply never expose them to the
 agent. The opponent `RuleBasedAgent` already ignored comets as targets, so it is
 unchanged.
 
-> **Breaking change — retrain from scratch.** The state width changed (14 → 13
-> when comets were stripped, then 13 → 35 with the hybrid fleet-into-planet
-> decoder). **Old checkpoints and replay buffers are incompatible.** Set
-> `execution.resume = null` and clear any old `replay_buffer.npz` before training.
-> `STATE_DIM` now equals `TOKEN_DIM = 35`; the networks default to `state_dim=TOKEN_DIM`.
+> **Breaking change — retrain from scratch.** The state width changed (14 → 13),
+> so the networks' input projection shape changed. **Old checkpoints and saved
+> replay buffers (`replay_buffer.npz`) are incompatible** and cannot be resumed.
+> Set `execution.resume = null` and delete/relocate any old `replay_buffer.npz`
+> in the checkpoint dir before training. (`STATE_DIM` lives on `OrbitWarsEnv`;
+> the networks default to `state_dim=13`.)
 
 
 ## Reward schemes

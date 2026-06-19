@@ -11,49 +11,13 @@ from utils.pos_encoding import (
     FourierAngleEncoding,
 )
 
-# ── Hybrid decoder geometry (NumPy, submission path) ─────────────────────────
-# These constants MUST match jax_env/jax_obs.py / jax_opponents.py (the training
-# obs builder); test_jax_decoder.py asserts the two implementations agree.
-_ENC_CENTER   = 50.0
-_ENC_HORIZON  = 60.0     # fleet look-ahead horizon (ticks)
-_ENC_MAXSPEED = 6.0
-_K_IN  = 2               # incoming-hostile slots per planet
-_K_OUT = 2               # outgoing-friendly slots per planet
-
-
-def _np_fleet_speed(ships):
-    s = np.maximum(ships, 1.0)
-    return np.minimum(_ENC_MAXSPEED,
-                      1.0 + (_ENC_MAXSPEED - 1.0) * (np.log(s) / np.log(1000.0)) ** 1.5)
-
-
-def _np_seg_point_dist(cx, cy, ax, ay, bx, by):
-    """Distance from point (cx,cy) to segment (ax,ay)->(bx,by) and the clamped t."""
-    vx = bx - ax; vy = by - ay
-    wx = cx - ax; wy = cy - ay
-    vv = vx * vx + vy * vy
-    t  = np.where(vv > 1e-9, (wx * vx + wy * vy) / np.where(vv > 1e-9, vv, 1.0), 0.0)
-    t  = np.clip(t, 0.0, 1.0)
-    qx = ax + t * vx; qy = ay + t * vy
-    return np.sqrt((cx - qx) ** 2 + (cy - qy) ** 2), t
-
-
 class Encoder:
-    """Live-game (submission) observation encoder — hybrid fleet-into-planet decoder.
-
-    Single-env NumPy mirror of jax_env/jax_obs.py: each fleet is folded into the
-    planet token it relates to (incoming-hostile / outgoing-friendly explicit
-    slots + pooled summary) instead of emitting separate fleet tokens, and a
-    trailing meta row carries the per-player aggregate.  Output:
-    ``[max_planets + 1, TOKEN_DIM=35]`` (see the layout note above the networks).
-
-      planets - [id, owner, x, y, radius, ships, production]
-      fleets  - [id, owner, x, y, angle, from_planet_id, ships] or empty
-    Owners are already perspective-swapped upstream (player 0 = acting player);
-    comets are stripped upstream.  Outgoing binding maps fleet.from_planet_id to
-    the planet ROW via the planet id, the live-game analogue of the engine's
-    from_planet SLOT index used in training.
-    """
+    # planets - [id, owner, x, y, radius, ships, production]
+    # out - [owner[4], radius, ships, production, moving/static, angular_velocity, is_planet, x, y, time_step]
+    # fleets - [id, owner, x, y, angle, from_planet_id, ships] or empty array
+    # out - [owner[4], angle, ships, speed, dummy[2], is_planet, x, y, time_step] or empty array
+    # (Comets are stripped from the observation upstream in env._obs_to_arrays, so
+    #  there is no comet feature here — state width is 13.)
 
     def __init__(self, max_planets=40, max_fleets=100, max_speed=6.0):
         self.max_planets = max_planets
@@ -92,156 +56,79 @@ class Encoder:
 
         return padded_arr, mask
 
-    def encode(self, planets, fleets, initial_planets, angular_velocity, time_step,
-               apply_padding=True):
-        """Encode one live state → ``[max_planets + 1, TOKEN_DIM]`` (hybrid decoder).
+    def encode(self, planets, fleets, initial_planets, angular_velocity, time_step, apply_padding=True):
 
-        ``apply_padding`` is accepted for signature compatibility; the output is
-        always fixed-size (planet rows are padded to ``max_planets`` and the meta
-        row appended).  Returns ``(state, mask)`` where mask is 1 on real planet
-        rows + the meta row.
-        """
-        assert planets.shape[-1] == 7, f"Expected planets to have 7 features, got {planets.shape[-1]}"
-        NMP = self.max_planets
-        n   = min(planets.shape[0], NMP)
-        planets = planets[:n]
 
-        if fleets is None or fleets.size == 0:
-            fleets = np.empty((0, 7), dtype=np.float32)
+        #assert the shape of planets
+        assert planets.shape[-1] == 7, f"Expected planets to have 7 features, but got {planets.shape[-1]}"
+
+        # Handle empty fleets array
+        if fleets.size == 0:
+            fleets = np.empty((0, 7))
         else:
-            assert fleets.shape[-1] == 7, f"Expected fleets to have 7 features, got {fleets.shape[-1]}"
+            assert fleets.shape[-1] == 7, f"Expected fleets to have 7 features, but got {fleets.shape[-1]}"
+            # Sort by ship count descending so truncation to max_fleets keeps the largest fleets.
+            fleets = fleets[np.argsort(fleets[:, 6])[::-1]]
 
-        # ── Planet base fields ───────────────────────────────────────────────
-        po  = planets[:, 1].astype(int)                  # owner (already swapped)
-        pid = planets[:, 0].astype(int)                  # planet id (for outgoing binding)
-        px  = planets[:, 2].astype(np.float32)
-        py  = planets[:, 3].astype(np.float32)
-        pr  = planets[:, 4].astype(np.float32)
-        psh = planets[:, 5].astype(np.float32)
-        ppr = planets[:, 6].astype(np.float32)
+        planets_owner = planets[:, 1].astype(int)
+        planet_pos = planets[:, 2:4]
 
-        p_oh = np.zeros((n, 4), dtype=np.float32)
-        ok   = po != -1
-        p_oh[ok] = np.eye(4, dtype=np.float32)[np.clip(po[ok], 0, 3)]
+        angular_velocity = np.array([angular_velocity for _ in range(planets.shape[0])]).reshape(-1, 1)
 
-        pmap   = self.get_planet_mapping(initial_planets)
-        p_mov  = np.array([pmap.get(int(i), 0) for i in pid], dtype=np.float32)
-        p_mov  = np.nan_to_num(p_mov)
-        ang    = np.float32(angular_velocity)
-        ts     = np.float32(time_step)
+        planets_mapping = self.get_planet_mapping(initial_planets)
+        moving_planets = np.array([planets_mapping.get(planet_id, 0) for planet_id in planets[:, 0]]).reshape(-1, 1)
+        #replace nan with 0
+        moving_planets = np.nan_to_num(moving_planets)
 
-        base = np.column_stack([
-            p_oh[:, 0], p_oh[:, 1], p_oh[:, 2], p_oh[:, 3],
-            pr, psh, ppr, p_mov, np.full(n, ang, np.float32),
-            px, py, np.full(n, ts, np.float32),
-        ]).astype(np.float32)                            # [n, 12]
+        planets_owner_one_hot = np.zeros((planets_owner.shape[0], 4))
+        for i in range(planets_owner.shape[0]):
+            if planets_owner[i] != -1:
+                planets_owner_one_hot[i] = np.eye(4)[planets_owner[i]]
+        
+        #adding time step as feature to planets and fleets
+        times_step_array = np.array([time_step for _ in range(planets.shape[0])]).reshape(-1, 1)
+        is_planet = np.zeros((planets.shape[0], 1))
+        planets_encoded = np.hstack((planets_owner_one_hot, planets[:, 4:], moving_planets, angular_velocity,
+                             is_planet, planet_pos,  times_step_array))
 
-        # ── Fleet arrays ─────────────────────────────────────────────────────
-        m = fleets.shape[0]
-        if m > 0:
-            fo    = fleets[:, 1].astype(int)
-            fx    = fleets[:, 2].astype(np.float32)
-            fy    = fleets[:, 3].astype(np.float32)
-            fa    = fleets[:, 4].astype(np.float32)
-            ffrom = fleets[:, 5].astype(int)
-            fsh   = fleets[:, 6].astype(np.float32)
-
-            fsp = _np_fleet_speed(fsh)
-            fex = fx + np.cos(fa) * fsp * _ENC_HORIZON
-            fey = fy + np.sin(fa) * fsp * _ENC_HORIZON
-            d, t = _np_seg_point_dist(px[None, :], py[None, :],
-                                      fx[:, None], fy[:, None], fex[:, None], fey[:, None])
-            hit     = d <= pr[None, :]                   # [m, n]
-            eta     = t                                  # arrive/HORIZON = t ∈ [0,1], [m,n]
-            hostile = hit & (fo[:, None] != -1) & (fo[:, None] != po[None, :])
-            out_mask = (ffrom[:, None] == pid[None, :]) & (fo[:, None] == po[None, :])
-            fsh_c = fsh[:, None]
+        # Handle empty fleets
+        if fleets.shape[0] == 0:
+            # Create empty fleets_encoded with correct feature dimension (13 features)
+            fleets_encoded = np.empty((0, 13))
         else:
-            hostile  = np.zeros((0, n), dtype=bool)
-            out_mask = np.zeros((0, n), dtype=bool)
-            eta = np.zeros((0, n), np.float32)
-            fsh = fa = fo = np.zeros((0,), np.float32)
-            fsh_c = np.zeros((0, 1), np.float32)
+            #fleets
+            fleets_owner = fleets[:, 1].astype(int)
+            fleets_angle = fleets[:, 4].reshape(-1, 1)
+            # fleets_from_planet_id = fleets[:, 5].reshape(-1, 1)
+            fleets_ships = fleets[:, 6].reshape(-1, 1)
+            fleets_speed = np.array([self.get_speed(ships) for ships in fleets_ships[:, 0]]).reshape(-1, 1)
 
-        cols = np.arange(n)
+            fleets_owner_one_hot = np.zeros((fleets_owner.shape[0], 4))
+            for i in range(fleets_owner.shape[0]):
+                if fleets_owner[i] != -1:
+                    fleets_owner_one_hot[i] = np.eye(4)[fleets_owner[i]]
 
-        # ── Incoming explicit slots (K_IN soonest-arriving hostile) ──────────
-        cols2 = np.arange(n)
-        in_score = np.where(hostile, eta, np.inf)        # [m, n]
-        in_slots = np.zeros((n, _K_IN * 3), np.float32)
-        s = in_score.copy()
-        for k in range(_K_IN):
-            if m == 0:
-                break
-            idx = np.argmin(s, axis=0)                   # [n]
-            sel = hostile[idx, cols2]
-            in_slots[:, 3 * k + 0] = np.where(sel, fsh[idx], 0.0)
-            in_slots[:, 3 * k + 1] = np.where(sel, eta[idx, cols2], 0.0)
-            in_slots[:, 3 * k + 2] = np.where(sel, fo[idx].astype(np.float32), 0.0)
-            s[idx, cols2] = np.inf
+            dummy = np.zeros((fleets.shape[0], 2))
+            is_fleet = np.ones((fleets.shape[0], 1))
+            fleet_pos = fleets[:, 2:4]
+            times_step_array_fleet = np.array([time_step for _ in range(fleets.shape[0])]).reshape(-1, 1)
 
-        # ── Incoming pooled ──────────────────────────────────────────────────
-        in_cnt   = hostile.sum(0).astype(np.float32)
-        in_shsum = (fsh_c * hostile).sum(0)
-        eta_h    = np.where(hostile, eta, np.inf)
-        in_soon  = eta_h.min(0) if m else np.zeros(n, np.float32)
-        in_soon  = np.where(np.isfinite(in_soon), in_soon, 0.0)
-        den_i    = np.where(in_shsum > 0, in_shsum, 1.0)
-        in_wmean = np.where(in_shsum > 0, (eta * fsh_c * hostile).sum(0) / den_i, 0.0)
-        in_maxsh = (np.where(hostile, fsh_c, 0.0).max(0) if m else np.zeros(n, np.float32))
-        in_pool  = np.column_stack([
-            np.log1p(in_cnt), np.log1p(in_shsum), in_soon, in_wmean, np.log1p(in_maxsh),
-        ]).astype(np.float32)                            # [n, 5]
+            fleets_encoded = np.hstack((fleets_owner_one_hot, fleets_angle, fleets_ships, fleets_speed, dummy,
+                                is_fleet,  fleet_pos, times_step_array_fleet))
 
-        # ── Outgoing explicit slots (K_OUT largest-by-ships friendly) ────────
-        out_score = np.where(out_mask, fsh_c, -1.0)
-        out_slots = np.zeros((n, _K_OUT * 4), np.float32)
-        s = out_score.copy()
-        for k in range(_K_OUT):
-            if m == 0:
-                break
-            idx   = np.argmax(s, axis=0)
-            sel   = out_mask[idx, cols] & (fsh[idx] > 0.0)
-            ships = np.where(sel, fsh[idx], 0.0)
-            angk  = fa[idx]
-            out_slots[:, 4 * k + 0] = ships
-            out_slots[:, 4 * k + 1] = np.where(sel, np.sin(angk), 0.0)
-            out_slots[:, 4 * k + 2] = np.where(sel, np.cos(angk), 0.0)
-            out_slots[:, 4 * k + 3] = np.where(sel, _np_fleet_speed(np.maximum(ships, 1.0)), 0.0)
-            s[idx, cols] = -1.0
-
-        # ── Outgoing pooled ──────────────────────────────────────────────────
-        out_cnt   = out_mask.sum(0).astype(np.float32)
-        out_shsum = (fsh_c * out_mask).sum(0)
-        den_o     = np.where(out_shsum > 0, out_shsum, 1.0)
-        if m:
-            out_wsin = np.where(out_shsum > 0, (np.sin(fa)[:, None] * fsh_c * out_mask).sum(0) / den_o, 0.0)
-            out_wcos = np.where(out_shsum > 0, (np.cos(fa)[:, None] * fsh_c * out_mask).sum(0) / den_o, 0.0)
+        # Apply padding if requested
+        if apply_padding:
+            planets_encoded, planets_mask = self._pad_array(planets_encoded, self.max_planets)
+            fleets_encoded, fleets_mask = self._pad_array(fleets_encoded, self.max_fleets)
+            
+            # Combine masks
+            mask = np.concatenate([planets_mask, fleets_mask])
+            
+            state = np.vstack((planets_encoded, fleets_encoded))
+            return state, mask
         else:
-            out_wsin = np.zeros(n, np.float32); out_wcos = np.zeros(n, np.float32)
-        out_pool = np.column_stack([
-            np.log1p(out_cnt), np.log1p(out_shsum), out_wsin, out_wcos,
-        ]).astype(np.float32)                            # [n, 4]
-
-        tokens = np.concatenate([base, in_slots, out_slots, in_pool, out_pool], axis=1)  # [n, 35]
-
-        # ── Meta row: per-player [planet_count, log1p production, log1p ships] ─
-        meta = np.zeros(12, np.float32)
-        for player in range(4):
-            pm = (po == player)
-            fm = (fo == player) if m else np.zeros(0, bool)
-            meta[player]     = pm.sum()
-            meta[4 + player] = np.log1p(ppr[pm].sum())
-            meta[8 + player] = np.log1p(psh[pm].sum() + (fsh[fm].sum() if m else 0.0))
-
-        state = np.zeros((NMP + 1, TOKEN_DIM), np.float32)
-        state[:n] = tokens
-        state[NMP, :12] = meta
-
-        mask = np.zeros(NMP + 1, np.float32)
-        mask[:n] = 1.0
-        mask[NMP] = 1.0
-        return state, (mask if apply_padding else None)
+            state = np.vstack((planets_encoded, fleets_encoded))
+            return state, None
     
     def encode_batch(self, batched_planets, batched_fleets, batched_initial_planets, batched_angular_velocity,
                      batch_time_steps=None, apply_padding=True):
@@ -295,55 +182,46 @@ class Encoder:
 
 
     
-_META_DIM = 12  # 4 players × [planet_count, log1p production, log1p ships]
-
-# ── Hybrid fleet-into-planet token layout (TOKEN_DIM = 35) ───────────────────
-# Built by jax_env/jax_obs.py (training) and model.SAC.Encoder.encode (submission):
-#   0:4 owner one-hot | 4 radius | 5 ships | 6 production | 7 moving | 8 ang_vel
-#   9 x | 10 y | 11 time_step
-#   12:18  incoming-hostile slots  (K_IN=2  × [ships, eta, owner])
-#   18:26  outgoing-friendly slots (K_OUT=2 × [ships, sinθ, cosθ, speed])
-#   26:31  incoming pooled [log1p cnt, log1p Σships, soonest_eta, wmean_eta, log1p maxships]
-#   31:35  outgoing pooled [log1p cnt, log1p Σships, wmean sinθ, wmean cosθ]
-# The obs has NET_MP planet tokens followed by ONE meta row (per-player aggregate);
-# the model splits it off and projects it into a single "metadata" token.
-TOKEN_DIM  = 35
-_SHIP_COLS = [5, 12, 15, 18, 22]   # ship-magnitude columns → shared LearnedFourierScalarEncoding
-_POS_COLS  = [9, 10]               # (x, y) → positional encoder
-_TIME_COL  = 11                    # time_step → positional encoder
-# Everything else fed raw to the token projection (owner, radius, prod, flags, slot
-# angles/eta/owner, pooled summaries):
-_RAW_COLS  = [0, 1, 2, 3, 4, 6, 7, 8,
-              13, 14, 16, 17,
-              19, 20, 21, 23, 24, 25,
-              26, 27, 28, 29, 30, 31, 32, 33, 34]
+_META_DIM = 12  # 4 players × [planet_count, production, ships]
 
 
-def _embed_tokens(state, max_planets, ship_encoder, proj, pos_encoder):
-    """Shared input embedding for the hybrid decoder.
+def _aggregate_meta_features(state):
+    """Per-player global summary derived from an encoded state batch.
 
-    Splits the trailing meta row off, projects the NET_MP planet tokens (rich
-    Fourier encoding of every ship-magnitude column, the rest raw) to d_model,
-    and adds the learned positional encoding.
+    A learned projection of this vector is prepended to the transformer as a
+    single "metadata" token, so every token can read the overall picture
+    (how many planets / how much production / how many ships each player holds)
+    directly, instead of having to reconstruct it by attending over the
+    individual planet/fleet tokens.
 
-    Returns (token_emb [B, max_planets, d_model], meta_raw [B, _META_DIM]).
+    Parameters
+    ----------
+    state : [B, seq, 13] — encoder layout: owner one-hot at 0:4, ships at 5,
+            production at 6 (planets only; fleets carry speed there), is_fleet
+            flag at 9. Neutral planets and padding rows have an all-zero owner
+            one-hot, so they contribute to no player's totals.
+
+    Returns
+    -------
+    [B, 12] — concat over players 0..3 of [planet_count, log1p(production),
+    log1p(ships)]. After the perspective swap player 0 is our agent and 1..3 are
+    opponents; players absent in a 2-player game are simply zero. Ships include
+    in-flight fleets, so it is the player's *total* ship strength. Ship and
+    production totals are log1p-compressed (they reach into the thousands).
     """
-    tokens = state[:, :max_planets, :]                 # [B, NMP, TOKEN_DIM]
-    meta   = state[:, max_planets, :_META_DIM]         # [B, 12]
+    owner     = state[:, :, 0:4]                 # [B, seq, 4] one-hot (neutral/pad = 0)
+    ships     = state[:, :, 5:6]                 # [B, seq, 1]
+    prod      = state[:, :, 6:7]                 # [B, seq, 1] (planets only)
+    is_fleet  = state[:, :, 9:10]                # [B, seq, 1] 1 = fleet, 0 = planet/pad
+    is_planet = 1.0 - is_fleet
 
-    ship_blocks = [ship_encoder(tokens[:, :, c:c + 1]) for c in _SHIP_COLS]
-    raw         = tokens[:, :, _RAW_COLS]
-    token_feats = torch.cat([raw, *ship_blocks], dim=-1)
-    emb = proj(token_feats)                            # [B, NMP, d_model]
+    planet_cnt = (owner * is_planet).sum(dim=1)              # [B, 4]
+    ships_tot  = (owner * ships).sum(dim=1)                  # [B, 4] (planets + fleets)
+    prod_tot   = (owner * prod * is_planet).sum(dim=1)       # [B, 4]
 
-    pos  = tokens[:, :, _POS_COLS]                     # [B, NMP, 2]
-    time = tokens[:, :, _TIME_COL]                     # [B, NMP]
-    emb = emb + pos_encoder(pos, time)
-    return emb, meta
-
-
-def _proj_in_dim(ship_encoder):
-    return len(_RAW_COLS) + len(_SHIP_COLS) * ship_encoder.out_dim
+    ships_tot = torch.log1p(ships_tot.clamp(min=0.0))
+    prod_tot  = torch.log1p(prod_tot.clamp(min=0.0))
+    return torch.cat([planet_cnt, prod_tot, ships_tot], dim=-1)  # [B, 12]
 
 
 # ============================================================
@@ -472,7 +350,7 @@ def _build_encoder(d_model, nhead, num_layers, dim_feedforward, dropout,
 
 class Q_network(nn.Module):
     def __init__(self,
-                 state_dim=TOKEN_DIM,
+                 state_dim=13,
                  action_dim=4,   # matches OrbitWarsEnv.ACTION_DIM
                  max_planets=40,
                  max_fleets=100,
@@ -487,16 +365,20 @@ class Q_network(nn.Module):
         self.max_planets = max_planets
         self.max_fleets = max_fleets
 
-        # Each ship-magnitude column (planet garrison + incoming/outgoing slot
-        # ships) is encoded with the SAME learned Fourier scalar encoder.
         self.ship_encoder  = LearnedFourierScalarEncoding()
-        self.P = nn.Linear(_proj_in_dim(self.ship_encoder), d_model)
+        self.angle_encoder = FourierAngleEncoding()
+        # +ship & angle fourier dims, -1 for the raw ship slot ship_encoder replaces
+        _proj_in = ((state_dim - 4) - 1
+                    + self.ship_encoder.out_dim
+                    + self.angle_encoder.out_dim)
+        self.P = nn.Linear(_proj_in, d_model)
+        self.F = nn.Linear(_proj_in, d_model)
         self.A = nn.Linear(action_dim, d_model)
 
         self.pos_encoder = LearnedFourierPosEncoding(d_model)
 
-        # Projects the per-player aggregate (the obs meta row, built in
-        # jax_env/jax_obs.py / Encoder.encode) into a single "metadata" token.
+        # Projects the per-player aggregate summary into a single "metadata" token
+        # (see _aggregate_meta_features) that is prepended to the transformer.
         self.meta_proj = nn.Linear(_META_DIM, d_model)
 
         self.value_head = nn.Linear(d_model, 1)
@@ -514,32 +396,71 @@ class Q_network(nn.Module):
     def forward(self, state, action):
         """
         Args:
-            state : [B, NET_MP + 1, TOKEN_DIM]  (planet tokens + trailing meta row)
-            action: [B, max_planets, action_dim]
-
+            state: [batch_size, state_seq_len, d_model] or [state_seq_len, d_model]
+            action: [batch_size, action_seq_len, d_model] or [action_seq_len, d_model]
+        
         Returns:
-            value: [batch_size]
+            value: [batch_size] or [1] (scalar if unbatched)
         """
-        emb, meta = _embed_tokens(state, self.max_planets,
-                                  self.ship_encoder, self.P, self.pos_encoder)
-        meta_token = self.meta_proj(meta).unsqueeze(1)        # [B, 1, d_model]
-        action = self.A(action)                               # [B, max_planets, d_model]
+        #true for seq length upto max_planets
+        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        planets_mask[:, :self.max_planets] = 1
+
+        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
+
+        # print(planets_mask[0]) 
+        # print(fleets_mask[0])
+
+        # print(f"planets mask shape {planets_mask.shape}, fleets mask shape {fleets_mask.shape}")
+        #Usable dimension upto 10 
+        # Replace the raw ship count (index 5) with a log-normalized + learnable
+        # Fourier encoding so the model can finely resolve ship magnitudes and the
+        # ratios that decide a capture (see LearnedFourierScalarEncoding).
+        ship_block  = self.ship_encoder(state[:, :, 5:6])
+        # Fleet heading (index 4 = angle): periodic Fourier code so the model can
+        # judge precisely whether a fleet's trajectory will strike a target planet.
+        # (For planets index 4 is radius; self.P simply learns to downweight it.)
+        angle_block = self.angle_encoder(state[:, :, 4:5])
+        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:9],
+                                 ship_block, angle_block], dim=-1)
+        planets = self.P(token_feats * planets_mask.unsqueeze(-1))
+        fleets  = self.F(token_feats * fleets_mask.unsqueeze(-1))
+
+        time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
+        pos = state[:, :, 10:12]  # position is at indices 10 and 11 (13-wide state)
+        pos_encoding = self.pos_encoder(pos, time_step)
+
+        # Global summary token, built from the raw input state (before it is
+        # overwritten below) and prepended to the transformer sequence.
+        meta_token = self.meta_proj(_aggregate_meta_features(state)).unsqueeze(1)
+
+        action = self.A(action)
+
+        state = planets + fleets
+        state = state + pos_encoding
 
         batch_size = state.shape[0]
-        cls_token = self.cls_token.expand(batch_size, -1, -1)
-        sep_token = self.sep_token.expand(batch_size, -1, -1)
+        # state_n = state.shape[1]
+        # action_n = action.shape[1]
 
-        src = torch.cat((cls_token, meta_token, emb, sep_token, action), dim=1)
+        # Expand cls and sep tokens for batch
+        cls_token = self.cls_token.expand(batch_size, -1, -1)  # [1, batch_size, d_model]
+        sep_token = self.sep_token.expand(batch_size, -1, -1)  # [1, batch_size, d_model]
+
+        # Concatenate: [batch_size, seq_len, d_model]
+        src = torch.cat((cls_token, meta_token, state,  sep_token, action), dim=1)
 
         out_ = self.transformer(src)
-        out_cls = out_[:, 0, :]
-        value = self.value_head(out_cls)
+        out_cls = out_[:, 0, :]  # [batch_size, 1, d_model]
+        value = self.value_head(out_cls)  # [batch_size, 1]
+        
         return value.squeeze(-1)  # [batch_size]
     
 
 class V_network(nn.Module):
     def __init__(self, 
-                 state_dim=TOKEN_DIM,
+                 state_dim=13,
                  max_planets=40,
                  max_fleets=100,
                  d_model=128,
@@ -552,14 +473,20 @@ class V_network(nn.Module):
         super(V_network, self).__init__()
         self.max_planets = max_planets
         self.max_fleets = max_fleets
-
+        
         self.ship_encoder  = LearnedFourierScalarEncoding()
-        self.P = nn.Linear(_proj_in_dim(self.ship_encoder), d_model)
+        self.angle_encoder = FourierAngleEncoding()
+        # +ship & angle fourier dims, -1 for the raw ship slot ship_encoder replaces
+        _proj_in = ((state_dim - 4) - 1
+                    + self.ship_encoder.out_dim
+                    + self.angle_encoder.out_dim)
+        self.P = nn.Linear(_proj_in, d_model)
+        self.F = nn.Linear(_proj_in, d_model)
 
         self.pos_encoder = LearnedFourierPosEncoding(d_model)
 
-        # Projects the per-player aggregate (the obs meta row, built in
-        # jax_env/jax_obs.py / Encoder.encode) into a single "metadata" token.
+        # Projects the per-player aggregate summary into a single "metadata" token
+        # (see _aggregate_meta_features) that is prepended to the transformer.
         self.meta_proj = nn.Linear(_META_DIM, d_model)
 
         self.value_head = nn.Linear(d_model, 1)
@@ -572,24 +499,53 @@ class V_network(nn.Module):
         self.d_model = d_model
 
     def forward(self, state):
-        emb, meta = _embed_tokens(state, self.max_planets,
-                                  self.ship_encoder, self.P, self.pos_encoder)
-        meta_token = self.meta_proj(meta).unsqueeze(1)
+        
+        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        planets_mask[:, :self.max_planets] = 1
 
+        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
+
+        # Replace the raw ship count (index 5) with a log-normalized + learnable
+        # Fourier encoding so the model can finely resolve ship magnitudes and the
+        # ratios that decide a capture (see LearnedFourierScalarEncoding).
+        ship_block  = self.ship_encoder(state[:, :, 5:6])
+        # Fleet heading (index 4 = angle): periodic Fourier code so the model can
+        # judge precisely whether a fleet's trajectory will strike a target planet.
+        # (For planets index 4 is radius; self.P simply learns to downweight it.)
+        angle_block = self.angle_encoder(state[:, :, 4:5])
+        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:9],
+                                 ship_block, angle_block], dim=-1)
+        planets = self.P(token_feats * planets_mask.unsqueeze(-1))
+        fleets  = self.F(token_feats * fleets_mask.unsqueeze(-1))
+
+        time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
+        pos = state[:, :, 10:12]  # position is at indices 10 and 11 (13-wide state)
+        pos_encoding = self.pos_encoder(pos, time_step)
+
+        # Global summary token, built from the raw input state (before it is
+        # overwritten below) and prepended to the transformer sequence.
+        meta_token = self.meta_proj(_aggregate_meta_features(state)).unsqueeze(1)
+
+        state = planets + fleets
+        state = state + pos_encoding
+    
+        # Expand cls token for batch
         batch_size = state.shape[0]
-        cls_token = self.cls_token.expand(batch_size, -1, -1)
+        cls_token = self.cls_token.expand(batch_size, -1,  -1)  # [1, batch_size, d_model]
 
-        src = torch.cat((cls_token, meta_token, emb), dim=1)
+        src = torch.cat((cls_token, meta_token, state), dim=1)
         out_ = self.transformer(src)
-        out_cls = out_[:, 0, :]
-        value = self.value_head(out_cls)
+        out_cls = out_[:, 0, :]  # [batch_size, 1, d_model]
+        value = self.value_head(out_cls)  # [batch_size, 1]
+        
         return value.squeeze(-1)  # [batch_size]
     
 
 class P_network(nn.Module):
     def __init__(self,
                  d_model=128,
-                 state_dim=TOKEN_DIM,
+                 state_dim=13,
                  action_dim=4,   # matches OrbitWarsEnv.ACTION_DIM
                  max_planets=40,
                  max_fleets=100, 
@@ -605,12 +561,18 @@ class P_network(nn.Module):
         self.max_fleets = max_fleets
 
         self.ship_encoder  = LearnedFourierScalarEncoding()
-        self.P = nn.Linear(_proj_in_dim(self.ship_encoder), d_model)
+        self.angle_encoder = FourierAngleEncoding()
+        # +ship & angle fourier dims, -1 for the raw ship slot ship_encoder replaces
+        _proj_in = ((state_dim - 4) - 1
+                    + self.ship_encoder.out_dim
+                    + self.angle_encoder.out_dim)
+        self.P = nn.Linear(_proj_in, d_model)
+        self.F = nn.Linear(_proj_in, d_model)
 
         self.pos_encoder = LearnedFourierPosEncoding(d_model)
 
-        # Projects the per-player aggregate (the obs meta row, built in
-        # jax_env/jax_obs.py / Encoder.encode) into a single "metadata" token.
+        # Projects the per-player aggregate summary into a single "metadata" token
+        # (see _aggregate_meta_features) that is prepended to the transformer.
         self.meta_proj = nn.Linear(_META_DIM, d_model)
 
         self.mu_head = nn.Linear(d_model, action_dim)
@@ -624,14 +586,40 @@ class P_network(nn.Module):
         self.action_dim = action_dim
 
     def forward(self, state):
-        emb, meta = _embed_tokens(state, self.max_planets,
-                                  self.ship_encoder, self.P, self.pos_encoder)
-        meta_token = self.meta_proj(meta).unsqueeze(1)
+        planets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        planets_mask[:, :self.max_planets] = 1
+
+        fleets_mask = torch.zeros(state.shape[0], state.shape[1], device=state.device)
+        fleets_mask[:, self.max_planets:self.max_planets + self.max_fleets] = 1
+
+        # Replace the raw ship count (index 5) with a log-normalized + learnable
+        # Fourier encoding so the model can finely resolve ship magnitudes and the
+        # ratios that decide a capture (see LearnedFourierScalarEncoding).
+        ship_block  = self.ship_encoder(state[:, :, 5:6])
+        # Fleet heading (index 4 = angle): periodic Fourier code so the model can
+        # judge precisely whether a fleet's trajectory will strike a target planet.
+        # (For planets index 4 is radius; self.P simply learns to downweight it.)
+        angle_block = self.angle_encoder(state[:, :, 4:5])
+        token_feats = torch.cat([state[:, :, :5], state[:, :, 6:9],
+                                 ship_block, angle_block], dim=-1)
+        planets = self.P(token_feats * planets_mask.unsqueeze(-1))
+        fleets  = self.F(token_feats * fleets_mask.unsqueeze(-1))
+
+        time_step = state[:, :, -1]  # Assuming time step is the last feature of the first token (planet)
+        pos = state[:, :, 10:12]  # position is at indices 10 and 11 (13-wide state)
+        pos_encoding = self.pos_encoder(pos, time_step)
+
+        # Global summary token, built from the raw input state (before it is
+        # overwritten below) and prepended to the transformer sequence.
+        meta_token = self.meta_proj(_aggregate_meta_features(state)).unsqueeze(1)
+
+        state = planets + fleets
+        state = state + pos_encoding
 
         # Process through transformer. The metadata token sits at position 0, so
         # the planet tokens (which drive the per-planet action heads) start at 1.
-        src = torch.cat((meta_token, emb), dim=1)  # [B, 1 + max_planets, d_model]
-        out_ = self.transformer(src)
+        src = torch.cat((meta_token, state), dim=1)  # [batch_size, 1 + seq_len, d_model]
+        out_ = self.transformer(src)  # [batch_size, 1 + seq_len, d_model]
 
         #only pass num planets tokens through heads, as action is only for planets
         mu = self.mu_head(out_[:, 1:1 + self.max_planets, :])

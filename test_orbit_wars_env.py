@@ -233,14 +233,14 @@ class TestEncodeObsAsPlayer(unittest.TestCase):
         obs = _make_obs()
         init_p = self._initial_planets(obs)
         state = encode_obs_as_player(self.encoder, obs, init_p, player_id=0)
-        self.assertEqual(state.shape, (MAX_PLANETS + 1, STATE_DIM))
+        self.assertEqual(state.shape, (MAX_PLANETS + MAX_FLEETS, STATE_DIM))
         self.assertEqual(state.dtype, np.float32)
 
     def test_output_shape_player1(self):
         obs = _make_obs()
         init_p = self._initial_planets(obs)
         state = encode_obs_as_player(self.encoder, obs, init_p, player_id=1)
-        self.assertEqual(state.shape, (MAX_PLANETS + 1, STATE_DIM))
+        self.assertEqual(state.shape, (MAX_PLANETS + MAX_FLEETS, STATE_DIM))
 
     def test_padded_rows_are_zero(self):
         obs = _make_obs(n_planets=2, n_fleets=0)
@@ -618,13 +618,13 @@ class TestOrbitWarsEnv(unittest.TestCase):
 
     def test_spaces(self):
         env = self._make_env()
-        self.assertEqual(env.observation_space.shape, (MAX_PLANETS + 1, STATE_DIM))
+        self.assertEqual(env.observation_space.shape, (MAX_PLANETS + MAX_FLEETS, STATE_DIM))
         self.assertEqual(env.action_space.shape, (MAX_PLANETS, ACTION_DIM))
 
     def test_reset_returns_correct_shape(self):
         env = self._make_env()
         obs, info = env.reset()
-        self.assertEqual(obs.shape, (MAX_PLANETS + 1, STATE_DIM))
+        self.assertEqual(obs.shape, (MAX_PLANETS + MAX_FLEETS, STATE_DIM))
         self.assertIsInstance(info, dict)
 
     def test_reset_dtype(self):
@@ -637,7 +637,7 @@ class TestOrbitWarsEnv(unittest.TestCase):
         env.reset()
         action = env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
-        self.assertEqual(obs.shape, (MAX_PLANETS + 1, STATE_DIM))
+        self.assertEqual(obs.shape, (MAX_PLANETS + MAX_FLEETS, STATE_DIM))
         self.assertIsInstance(reward, float)
         self.assertIsInstance(terminated, bool)
         self.assertIsInstance(truncated, bool)
@@ -662,7 +662,7 @@ class TestOrbitWarsEnv(unittest.TestCase):
         env = self._make_env()
         for _ in range(3):
             obs, _ = env.reset()
-            self.assertEqual(obs.shape, (MAX_PLANETS + 1, STATE_DIM))
+            self.assertEqual(obs.shape, (MAX_PLANETS + MAX_FLEETS, STATE_DIM))
 
     def test_action_space_sample_valid(self):
         env = self._make_env()
@@ -688,7 +688,7 @@ class TestOrbitWarsEnv(unittest.TestCase):
     def test_player1_perspective(self):
         env = OrbitWarsEnv(opponent="random", player_id=1, encoder=self.encoder)
         obs, _ = env.reset()
-        self.assertEqual(obs.shape, (MAX_PLANETS + 1, STATE_DIM))
+        self.assertEqual(obs.shape, (MAX_PLANETS + MAX_FLEETS, STATE_DIM))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
