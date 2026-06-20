@@ -222,6 +222,7 @@ class JaxVecEnvAdapter:
         comet_speed:     float = 4.0,
         tanh_scale:      float = 0.2,
         min_fleet_ships: int   = 3,
+        launch_mask:     str   = "capture",
         reward_type:     str   = "ship_advantage",
         reward_scale:    float = 0.01,
         win_bonus:       float = 100.0,
@@ -235,6 +236,7 @@ class JaxVecEnvAdapter:
         self.num_players     = num_players
         self.tanh_scale      = tanh_scale
         self.min_fleet_ships = min_fleet_ships
+        self.launch_mask     = launch_mask
         self.reward_type     = reward_type
         self.reward_scale    = reward_scale
         self.win_bonus       = win_bonus
@@ -639,12 +641,13 @@ class JaxVecEnvAdapter:
 
         frac      = np.clip(best_s, 0.0, 1.0)
         num_ships = (frac * p_ships[:, :NMP]).astype(np.int32)  # [B, NMP]
-        tgt_ships = p_ships[bi, best_j].astype(np.int32)        # [B, NMP]
 
-        launch = (owned
-                  & (best_s > 0.0)
-                  & (num_ships > tgt_ships)
-                  & (num_ships > 0))  # [B, NMP]
+        base_ok = owned & (best_s > 0.0) & (num_ships > 0)
+        if self.launch_mask == "capture":
+            tgt_ships = p_ships[bi, best_j].astype(np.int32)
+            launch = base_ok & (num_ships > tgt_ships)
+        else:
+            launch = base_ok & (num_ships >= self.min_fleet_ships)
 
         b_idx, slot_idx = np.where(launch)
         jax_acts[b_idx, pid, slot_idx, 0] = angles[b_idx, slot_idx]

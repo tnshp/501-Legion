@@ -378,14 +378,10 @@ def compute_launch_angle(planet_by_id: dict, omega: float,
 
 
 def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float,
-                  tanh_scale: float = 0.2, min_fleet_ships: int = 3) -> list:
+                  tanh_scale: float = 0.2, min_fleet_ships: int = 3,
+                  launch_mask: str = "capture") -> list:
     """
     Convert policy output to kaggle orbit_wars moves via pairwise bivector attention.
-
-    Each planet's action row interacts with every other planet's row through a
-    wedge product.  The resulting (n, n) score matrix selects a target planet
-    and fleet fraction for each owned source planet.  `compute_launch_angle`
-    then aims the fleet accounting for the target planet's orbital motion.
 
     Parameters
     ----------
@@ -394,21 +390,9 @@ def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float,
                       [id, owner, x, y, radius, ships, production]
     omega           : float — angular velocity of the planet system
     tanh_scale      : float — scales the tanh input; smaller = flatter saturation
-                      (e.g. 0.2 saturates at ~±10 instead of ~±3)
-    min_fleet_ships : int — DEPRECATED / unused. The fixed minimum-size mask has
-                      been replaced by a capture-feasibility mask: a fleet is only
-                      launched if it is LARGER than the target planet's current
-                      garrison (see below). Kept in the signature so existing
-                      callers / configs don't break.
-
-    Launch mask
-    -----------
-    A move is emitted only if the fleet would be bigger than the number of ships
-    currently on the TARGET planet, i.e. `num_ships > target_planet_ships`. This
-    suppresses fleets too small to take their target (against a 0-ship neutral any
-    non-empty fleet qualifies; against a defended planet the fleet must exceed the
-    defender). Note this uses the target's ship count at LAUNCH time and does not
-    model production / reinforcement accrued during the fleet's flight.
+    min_fleet_ships : int — minimum fleet size (only when launch_mask="min_ships")
+    launch_mask     : str — ``"capture"``: only launch if fleet > target garrison;
+                      ``"min_ships"``: launch if fleet >= min_fleet_ships.
 
     Returns
     -------
@@ -445,12 +429,13 @@ def decode_action(action_np: np.ndarray, planets: np.ndarray, omega: float,
 
         frac      = float(scores[idx])
         num_ships = min(int(frac * ships), ships - 1)
-        # Capture-feasibility mask: only launch a fleet that is LARGER than the
-        # target planet's current garrison — i.e. only send fleets that could
-        # actually take the target. (Replaces the old fixed min_fleet_ships floor.)
-        target_ships = int(planets[idx, 5])
-        if num_ships <= target_ships:
-            continue
+        if launch_mask == "capture":
+            target_ships = int(planets[idx, 5])
+            if num_ships <= target_ships:
+                continue
+        else:
+            if num_ships < min_fleet_ships:
+                continue
 
         angle_rad = compute_launch_angle(
             planet_by_id, omega, from_planet_id, to_planet_id, num_ships)
@@ -1128,7 +1113,8 @@ class OrbitWarsEnv(gym.Env):
                  max_steps: int = 500,
                  reward_scheme=None,
                  tanh_scale: float = 0.2,
-                 min_fleet_ships: int = 3):
+                 min_fleet_ships: int = 3,
+                 launch_mask: str = "capture"):
         super().__init__()
 
         if reward_scheme is None:
@@ -1152,6 +1138,7 @@ class OrbitWarsEnv(gym.Env):
         self.reward_scheme    = reward_scheme
         self.tanh_scale       = tanh_scale
         self.min_fleet_ships  = min_fleet_ships
+        self.launch_mask      = launch_mask
         # Number of fleets our agent actually launched on the most recent step
         # (after decode_action's thresholds). Read by the training loop for the
         # moving-average "fleets sent" metric.
@@ -1249,7 +1236,8 @@ class OrbitWarsEnv(gym.Env):
         )
         moves = decode_action(action, s_planets, omega,
                               tanh_scale=self.tanh_scale,
-                              min_fleet_ships=self.min_fleet_ships)
+                              min_fleet_ships=self.min_fleet_ships,
+                              launch_mask=self.launch_mask)
         self.last_fleets_sent = len(moves)
 
         # Snapshot pre-step state as plain numpy arrays.  The kaggle environment

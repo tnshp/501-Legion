@@ -156,6 +156,11 @@ def train_jax(config: dict, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> lis
     os.makedirs(ckpt_dir, exist_ok=True)
     buffer_path = os.path.join(ckpt_dir, "replay_buffer.npz")
 
+    import json as _json
+    with open(os.path.join(ckpt_dir, "train_config.json"), "w") as _f:
+        _json.dump(config, _f, indent=2)
+    print(f"Config saved → {ckpt_dir}/train_config.json")
+
     num_episodes   = train_cfg.get("num_episodes",   250)
     max_steps      = train_cfg.get("max_steps",      500)
     warmup_steps   = train_cfg.get("warmup_steps",   500)
@@ -192,8 +197,9 @@ def train_jax(config: dict, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> lis
     reward_type   = jax_cfg.get("reward_type",   "ship_advantage")
     reward_scale  = jax_cfg.get("reward_scale",  0.01)
     win_bonus     = jax_cfg.get("win_bonus",     100.0)
-    tanh_scale    = env_cfg.get("tanh_scale",    0.2)
+    tanh_scale      = env_cfg.get("tanh_scale",    0.2)
     min_fleet_ships = env_cfg.get("min_fleet_ships", 3)
+    launch_mask     = env_cfg.get("launch_mask", "capture")
     # Rollout/learner overlap mode (jax_env.actor, default falls back to the
     # legacy jax_env.threaded bool).  The JAX env now runs the opponent + reward +
     # obs on-device fused with the engine step (see jax_env.adapter fast path), so
@@ -243,6 +249,7 @@ def train_jax(config: dict, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> lis
         comet_speed=comet_speed,
         tanh_scale=tanh_scale,
         min_fleet_ships=min_fleet_ships,
+        launch_mask=launch_mask,
         reward_type=reward_type,
         reward_scale=reward_scale,
         win_bonus=win_bonus,
@@ -289,6 +296,7 @@ def train_jax(config: dict, MAX_PLANETS: int = 40, MAX_FLEETS: int = 100) -> lis
             torch.as_tensor(dstate["active"], device=device),
             torch.as_tensor(dstate["omega"],  dtype=torch.float32, device=device),
             player=0, tanh_scale=tanh_scale,
+            launch_mask=launch_mask, min_fleet_ships=min_fleet_ships,
         )
         p0 = torch.stack([out["angle"], out["num_ships"].float()], dim=-1)
         return p0.detach().cpu().numpy().astype(np.float32)

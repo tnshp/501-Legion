@@ -137,32 +137,35 @@ def wedge_scores(action: torch.Tensor, tanh_scale: float = 0.2) -> torch.Tensor:
     return torch.tanh(tanh_scale * wedge)
 
 
-def _select_targets(action, owned, valid, p_ships, tanh_scale):
+def _select_targets(action, owned, valid, p_ships, tanh_scale,
+                    launch_mask="capture", min_fleet_ships=3):
     """Per source planet: pick the argmax-scored valid target and ship count.
 
     Returns (prelim, tgt_idx, num_ships, frac) where `prelim` [B, P] bool marks
     sources that pass every gate EXCEPT the launch-angle verify:
       source owned & ships > 1, best target valid & not self & score > 0,
-      num_ships = min(⌊frac·ships⌋, ships−1) and num_ships > target garrison.
+      then either ``num_ships > target garrison`` (launch_mask="capture") or
+      ``num_ships >= min_fleet_ships`` (launch_mask="min_ships").
     """
     B, P, _ = action.shape
     scores = wedge_scores(action, tanh_scale)       # [B, P, P]
 
     eye = torch.eye(P, dtype=torch.bool, device=action.device)
-    # Restrict targets to real planets and exclude self; argmax then needs > 0.
     col_ok = valid[:, None, :] & ~eye[None]         # [B, P, P]
     masked = torch.where(col_ok, scores, scores.new_full((), float("-inf")))
 
     best_score, tgt_idx = masked.max(dim=2)         # [B, P]
     frac = best_score.clamp(0.0, 1.0)
 
-    # The reference int()s garrisons before the ship math; floor to match exactly.
     ships = torch.floor(p_ships)
     num_ships = torch.minimum(torch.floor(frac * ships), ships - 1.0)
-    tgt_ships = torch.floor(torch.gather(p_ships, 1, tgt_idx))
 
-    src_ok = owned & (ships > 1.0)
-    prelim = src_ok & (best_score > 0.0) & (num_ships > tgt_ships)
+    src_ok = owned & (ships > 1.0) & (best_score > 0.0)
+    if launch_mask == "capture":
+        tgt_ships = torch.floor(torch.gather(p_ships, 1, tgt_idx))
+        prelim = src_ok & (num_ships > tgt_ships)
+    else:
+        prelim = src_ok & (num_ships >= min_fleet_ships)
     return prelim, tgt_idx, num_ships, frac
 
 
@@ -267,7 +270,8 @@ def _verify_connects(angle, mx, my, mr, speed, tgt_col,
 
 @torch.no_grad()
 def decode(action, p_owner, p_x, p_y, p_r, p_ships, p_active, omega,
-           *, player: int = 0, tanh_scale: float = 0.2):
+           *, player: int = 0, tanh_scale: float = 0.2,
+           launch_mask: str = "capture", min_fleet_ships: int = 3):
     """Decode a batch of policy outputs into per-planet launches.
 
     Parameters
@@ -282,6 +286,10 @@ def decode(action, p_owner, p_x, p_y, p_r, p_ships, p_active, omega,
     omega    : [B] float    — system angular velocity (rad/tick).
     player   : int          — owner id allowed to launch from `action`.
     tanh_scale : float      — wedge score saturation (matches env decode).
+    launch_mask : str       — ``"capture"``: only launch if fleet > target
+                  garrison; ``"min_ships"``: launch if fleet >= min_fleet_ships.
+    min_fleet_ships : int   — minimum ships to launch (only when
+                  ``launch_mask="min_ships"``).
 
     Returns a dict of [B, P] tensors:
       launch    : bool — a fleet is launched from this planet this step
@@ -294,7 +302,8 @@ def decode(action, p_owner, p_x, p_y, p_r, p_ships, p_active, omega,
     owned = (p_owner == player) & p_active
 
     prelim, tgt_idx, num_ships, _frac = _select_targets(
-        action, owned, p_active, p_ships, tanh_scale)
+        action, owned, p_active, p_ships, tanh_scale,
+        launch_mask=launch_mask, min_fleet_ships=min_fleet_ships)
 
     launch = torch.zeros(B, P, dtype=torch.bool, device=dev)
     angle = torch.zeros(B, P, dtype=action.dtype, device=dev)
